@@ -31,7 +31,7 @@ def check_person_segmentation() -> None:
     _native_modules()
 
 
-def _copy_mask(quartz, buffer):
+def _copy_mask(quartz, buffer, *, allow_empty=False):
     import numpy as np
 
     if (buffer is None or quartz.CVPixelBufferIsPlanar(buffer)
@@ -52,8 +52,8 @@ def _copy_mask(quartz, buffer):
         pixels = data.reshape(height, stride)[:, :width].copy()
     finally:
         quartz.CVPixelBufferUnlockBaseAddress(buffer, flags)
-    # Uniform extremes cannot establish a reliable lecturer silhouette.
-    if not pixels.any() or (pixels == 255).all():
+    # A successful empty mask can mean no person; full coverage remains uncertain.
+    if (not allow_empty and not pixels.any()) or (pixels == 255).all():
         return None
     return pixels.astype(np.float32) / 255.0
 
@@ -61,7 +61,8 @@ def _copy_mask(quartz, buffer):
 class PersonSegmenter:
     """Reuse an accurate request within one video; return None on native failures."""
 
-    def __init__(self):
+    def __init__(self, *, allow_empty_masks=False):
+        self.allow_empty_masks = allow_empty_masks
         self.objc, self.vision, self.quartz, self.foundation = _native_modules()
         self.request = (
             self.vision.VNGeneratePersonSegmentationRequest.alloc()
@@ -104,7 +105,8 @@ class PersonSegmenter:
                 results = self.request.results() if success and error is None else None
                 if not results:
                     return None
-                mask = _copy_mask(self.quartz, results[0].pixelBuffer())
+                mask = _copy_mask(self.quartz, results[0].pixelBuffer(),
+                                  allow_empty=self.allow_empty_masks)
                 if mask is None:
                     return None
                 # Image buffers remain top-down; no Core Image coordinate transform.

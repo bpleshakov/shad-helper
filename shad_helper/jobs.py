@@ -67,6 +67,9 @@ def evidence_index(evidence: dict) -> dict[str, str]:
             source = next((s for s in evidence.get("sources", [])
                            if s["id"] == visual.get("source_id")), {})
             description = f"{source.get('source', 'Материал')}: {source.get('location', '')}"
+        elif visual.get("page_id"):
+            description = (f"Видео {timestamp(visual['page_start'])}–{timestamp(visual['page_end'])}; "
+                           f"итог страницы доски, кадр {timestamp(visual['timestamp'])}")
         else:
             description = f"Видео {timestamp(visual['timestamp'])}"
         index[visual["id"]] = description

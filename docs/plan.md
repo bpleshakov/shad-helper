@@ -106,3 +106,67 @@ Enable this by default for **new jobs**. Leave existing jobs, including the curr
 - Validate against annotated whiteboard, slide, and notebook samples. **Any lost meaningful content fails acceptance.** Conservative extra analyses are acceptable; report measured savings without promising a fixed speedup.
 
 Changed-crop reasoning, reconstructed board images, and smaller vision models remain deferred.
+
+# Select final whiteboard pages before expensive processing
+
+## Summary
+
+This policy supersedes intermediate handwriting-state preservation only in the new `pages` mode. Keep the previous plans above for the existing modes.
+
+- Make `pages` the default for new jobs. Preserve existing jobs' saved behavior.
+- Analyze completed whiteboard pages rather than every writing pause.
+- Ignore intermediate additions, local corrections, and partial erasures. Preserve the final state before a major reset.
+- Allow extra evidence when page boundaries or visibility are uncertain.
+- Keep the current models, full-resolution analysis images, and handling of slides and notebooks.
+
+## Selection and worker flow
+
+- Run page selection inside the existing vision worker. Pass the video, clip bounds, metadata, and source-image items into that worker instead of exporting all video candidates first. Reuse its existing lazy Qwen loader throughout selection and final analysis.
+- Export a separately named bootstrap image at the beginning and after substantial scene/layout changes. Use the existing Qwen prompt and validation to identify the media type and whole lecture surface. Bootstrap images have separate paths and checkpoint IDs; they are excluded from lecture evidence unless independently selected.
+- For confirmed whiteboards, stream RGB previews at native cadence and 384-pixel width. Keep bounded image state and lightweight timestamps; do not save every preview as a PNG.
+- Compute spatial ink additions/removals using local background contrast across RGB channels, supporting black and colored markers. Compare positions rather than net ink count, so simultaneous additions cannot cancel removals.
+- Request fresh Apple Vision masks for decision snapshots, normally every two seconds and immediately when a possible reset or visible content change is detected. The content-change fast path protects brief pages and faint late additions. Covered pixels remain unknown. Do not use stale masks to authorize removals or clip moving lecturers to their initial bounding box.
+- Maintain the latest readable board state. Additions and confirmed corrections replace that candidate without emitting earlier states. Prefer later content over a sharper but incomplete earlier board.
+
+Initial reset defaults are at least **70% of reference ink disappearing**, at least **90% of reference ink observable**, and two observations confirming the reset over at least **one second**.
+
+Freeze the last readable pre-erasure candidate when an erasure sequence begins. Measure cumulative removal against that reference, including pauses, so a gradual wipe does not select an almost-empty board.
+
+A confirmed writing phase without further removal ends a local correction and replaces the frozen candidate with the corrected state. Mixed writing/erasing, unreliable masks, or an erase-only pause exceeding 30 seconds make the interval uncertain; use the existing state selector for that interval and record a review issue.
+
+Finalize a page on a major reset, board replacement, scene/layout exit, or clip ending. At clip end without a confirmed reset, select the latest current state rather than an older pre-correction candidate. Omit confirmed blank pages.
+
+For each reliable page, export one original-resolution frame. Select the latest readable state, then the sharpest frame within that same state; verify full-resolution content before substituting an earlier sharper frame. Analyze selected frames through the already loaded Qwen worker, then reuse the current grouping and OCR cache.
+
+Slides, notebooks, uncertain media classification, and unsupported board conditions retain the existing selector. No reconstructed board images or new models are introduced.
+
+## Interfaces, provenance, and compatibility
+
+- Extend CLI and Python `vision_mode` choices to `pages|content|baseline`. `pages` combines final-page selection with existing content reuse; the other modes retain their current semantics.
+- Persist `page_selection_version=1` only for `pages` jobs. Keep `grouping_version=1`. Include the selector version, video digest, clip bounds, bootstrap prompt/model, and policy settings in relevant fingerprints.
+- Existing `content` and `baseline` configuration files remain unchanged. Jobs without configuration remain legacy baseline jobs. Switching policy requires a new output directory.
+- Checkpoint bootstrap analyses, selected timestamps, exported images, and final analyses. Missing images regenerate from their recorded timestamps. Resuming must reuse completed selection and inference work.
+- Add trusted selector metadata: `page_id`, `page_start`, and `page_end`. Preserve it through image export, grouping, crop preparation, and evidence. Qwen cannot supply or override these fields.
+- Keep the selected frame's actual capture timestamp. Record page intervals separately; never assign the final image an earlier capture time.
+- Include a consolidated page in chapters whose core intervals intersect its page interval. Exclude subsequent pages and ended pages, and prevent an older slide from becoming the predecessor across a whiteboard interval.
+- Add page-specific prompt guidance to both automatic notes and manual handoff: the image summarizes a page's final state and does not establish when each symbol appeared. Include page intervals in outline context and citations. Legacy prompts and checkpoint inputs remain unchanged.
+- Produce `whiteboard-pages.json` with page boundaries, selected timestamps, bootstrap images, fallback reasons, candidate/export counts, native-mask calls, Qwen/OCR calls, and stage timings.
+
+## Verification and acceptance
+
+- Test one page growing through many writing pauses: intermediate states produce no separate evidence frames.
+- Test partial erasures and corrected equations: the selected image contains the latest corrected state.
+- Test gradual wipes, pauses, and simultaneous additions/removals: confirmed resets preserve the readable pre-wipe state; ambiguity retains extra evidence.
+- Test lecturer movement, failed masks, glare, faint colored writing, camera changes, mixed slides/notebooks, and clip endings during writing or wiping.
+- Test tiny late additions and sharp earlier frames: final symbols survive representative selection.
+- Test fresh-job defaults, unchanged legacy jobs, policy-switch rejection, interruption/resume, missing artifacts, and bootstrap/final-image ID separation.
+- Test a page spanning chapters: its later final image reaches earlier relevant chapters, while the following page remains excluded. Verify identical behavior in automatic synthesis, manual handoff, and reply validation.
+- Run an annotated pilot outside this session's sandbox with at least one complete reset and one partial correction. Compare against `content` mode using saved-image count, total model calls—including bootstrap calls—runtime, memory, and final-page content coverage.
+
+Acceptance requires preservation of the readable final content of every annotated page, explicit uncertainty handling, unchanged non-whiteboard behavior, and fewer exports/model calls on additive-writing footage. Earlier material intentionally erased within a page is excluded by the chosen policy.
+
+## Assumptions and deferred work
+
+A page is the current visible lecture surface; a major reset clears most of its current content. Static, reliably detected boards are the initial optimized case; uncertainty uses existing selection.
+
+Keep the inexpensive native-cadence scan. Lower sampling rates and exponential search are deferred until measurements show scanning is a meaningful bottleneck.

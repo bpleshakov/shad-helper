@@ -248,7 +248,9 @@ def _frames(video: Path, out: Path, selections: list[dict]) -> list[dict]:
             # A final PTS can round just beyond the last decodable frame.
             continue
         items.append({"id": identifier, "timestamp": selection["timestamp"], "image": str(path.resolve()),
-                      "sha256": sha256_file(path)})
+                      "sha256": sha256_file(path),
+                      **{key: selection[key] for key in
+                         ("page_id", "page_start", "page_end", "selection_issues") if key in selection}})
     return items
 
 
@@ -264,6 +266,7 @@ def _prepare_visuals(raw_visuals: list[dict], out: Path) -> tuple[list[dict], li
                   "sha256": sha256_file(path),
                   "summary": str(raw.get("summary", "")), "kind": raw.get("kind", "other"),
                   "diagram": str(raw.get("diagram", "")), "issues": list(raw.get("issues", [])), "regions": []}
+        visual.update({key: raw[key] for key in ("page_id", "page_start", "page_end") if key in raw})
         if raw.get("analysis_id"):
             original = Path(raw.get("original_image", raw["image"]))
             visual.update(analysis_id=analysis_id,
@@ -337,7 +340,7 @@ def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru"
     from .vision_mode import resolve_vision_mode
 
     config = resolve_vision_mode(out, vision_mode)
-    if config["vision_mode"] == "content":
+    if config["vision_mode"] in {"content", "pages"}:
         from .person_segmentation import check_person_segmentation
 
         check_person_segmentation()
@@ -345,7 +348,7 @@ def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru"
     out.mkdir(parents=True, exist_ok=True)
     video_hash = sha256_file(video)
     run_inputs = {"video": video_hash, "start": start, "end": end}
-    if config["vision_mode"] == "content":
+    if config["vision_mode"] in {"content", "pages"}:
         run_inputs["vision"] = config
     source_inputs = {"format": 2, "files": [
         {"path": str(Path(path).resolve()), "sha256": sha256_file(Path(path))} for path in sources]}
@@ -359,10 +362,17 @@ def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru"
     segments = stitch_segments(asr["items"])
     write_json(out / "transcript.json", segments)
     write_subtitles(segments, out)
-    selections = checkpoint(out, "keyframes", run_inputs, lambda: _scan_video(video, metadata, start, end - start))
-    images = _artifact_checkpoint(out, "frames", {**run_inputs, "selections": selections},
-                                  lambda: _frames(video, out, selections),
-                                  lambda records: [record["image"] for record in records])
+    video_request = {}
+    if config["vision_mode"] == "pages":
+        images = []
+        video_request = {"video": str(video), "video_sha256": video_hash,
+                         "metadata": metadata, "start": start, "end": end}
+    else:
+        selections = checkpoint(out, "keyframes", run_inputs,
+                                lambda: _scan_video(video, metadata, start, end - start))
+        images = _artifact_checkpoint(out, "frames", {**run_inputs, "selections": selections},
+                                      lambda: _frames(video, out, selections),
+                                      lambda records: [record["image"] for record in records])
     images.extend({"id": f"visual_{record['id']}", "source_id": record["id"], "timestamp": None,
                    "image": str(out / record["rendered_image"])} for record in records if record.get("rendered_image"))
     # Notebook raster outputs are already exact assets; parse them for meaning.
@@ -371,8 +381,9 @@ def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru"
             images.extend({"id": f"visual_{record['id']}_{position}", "source_id": record["id"], "timestamp": None,
                            "image": str(out / image)} for position, image in enumerate(record["images"])
                           if Path(image).suffix.lower() in (".png", ".jpg", ".jpeg"))
-    visual_settings = config if config["vision_mode"] == "content" else {}
-    raw_visuals = _worker(out, "vision", {"model": vlm_model, "items": images, **visual_settings})["items"]
+    visual_settings = config if config["vision_mode"] in {"content", "pages"} else {}
+    raw_visuals = _worker(out, "vision", {"model": vlm_model, "items": images,
+                                        **visual_settings, **video_request})["items"]
     visuals, crops = _prepare_visuals(raw_visuals, out)
     resolved_ocr = ocr_model
     if crops and ocr_model == OCR_MODEL:

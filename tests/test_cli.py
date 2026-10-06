@@ -38,7 +38,7 @@ def test_login_forwards_proxy_flag_or_none(monkeypatch, tmp_path, capsys, proxy,
     assert capsys.readouterr().err == ""
 
 
-@pytest.mark.parametrize("vision_mode", [None, "content", "baseline"])
+@pytest.mark.parametrize("vision_mode", [None, "pages", "content", "baseline"])
 def test_extract_forwards_vision_mode_without_resolving_or_writing(monkeypatch, tmp_path, vision_mode):
     extract = Mock(return_value=tmp_path / "evidence.json")
     monkeypatch.setitem(sys.modules, "shad_helper.extraction", SimpleNamespace(extract=extract))
@@ -50,6 +50,15 @@ def test_extract_forwards_vision_mode_without_resolving_or_writing(monkeypatch, 
     extract.assert_called_once_with(video, [], out, language="ru", start=0, duration=None,
                                     vision_mode=vision_mode)
     assert not out.exists()
+
+
+def test_vision_mode_help_describes_pages_default(capsys):
+    with pytest.raises(SystemExit) as stopped:
+        main(["extract", "--help"])
+    assert stopped.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "new jobs: pages" in help_text
+    assert "--vision-mode {pages,content,baseline}" in help_text
 
 
 def test_extract_rejects_unknown_vision_mode_before_any_work(monkeypatch, tmp_path):

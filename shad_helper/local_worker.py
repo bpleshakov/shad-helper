@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from .jobs import checkpoint, read_json, sha256_file, write_json
-from .vision_mode import GROUPING_VERSION
+from .vision_mode import GROUPING_VERSION, PAGE_SELECTION_VERSION
 
 GENERATION_SETTINGS = {"max_tokens": 4096, "temperature": 0.0, "enable_thinking": False}
 OCR_PROMPTS = {"formula": "Formula Recognition:", "table": "Table Recognition:",
@@ -185,9 +185,13 @@ def run(request: dict, task: str) -> dict:
             write_json(marker, {"source": model_id, "dtype": "bfloat16"})
         return {"model": str(destination.resolve())}
 
-    content = request.get("vision_mode") == "content" and task in {"vision", "ocr"}
+    pages = request.get("vision_mode") == "pages" and task in {"vision", "ocr"}
+    content = request.get("vision_mode") in {"content", "pages"} and task in {"vision", "ocr"}
     if content and request.get("grouping_version", GROUPING_VERSION) != GROUPING_VERSION:
         raise ValueError("Unsupported visual grouping version; use a new output directory.")
+    if pages and (type(request.get("page_selection_version")) is not int
+                  or request["page_selection_version"] != PAGE_SELECTION_VERSION):
+        raise ValueError("Unsupported page selection version; use a new output directory.")
     prompt = CONTENT_VISION_PROMPT if content else VISION_PROMPT
     loaded = None
     generated = 0
@@ -262,6 +266,11 @@ def run(request: dict, task: str) -> dict:
                     parsed = {"kind": "other", "summary": "", "diagram": "", "regions": [],
                               "issues": [reason + " Полное изображение передано OCR; смысл схем требует ручной проверки."]}
                 write_json(job / "raw" / "vision" / f"{item['id']}.json", artifact)
+                if pages:
+                    # Timing comes from the selector, never from a model's extra JSON keys.
+                    for key in ("page_id", "page_start", "page_end", "selection_issues"):
+                        parsed.pop(key, None)
+                    parsed["issues"].extend(item.get("selection_issues", []))
                 return {**parsed, **item}
             if content:
                 from .jobs import fingerprint
@@ -304,16 +313,63 @@ def run(request: dict, task: str) -> dict:
         from .person_segmentation import PersonSegmenter
         from .visual_grouping import group_visuals
 
-        items, audit = group_visuals(request["items"], process, PersonSegmenter())
+        video_items = []
+        page_audit = None
+        if pages:
+            from .page_pipeline import fallback_page_items, prepare_page_images
+
+            video_items, page_audit = prepare_page_images(
+                request, process, PersonSegmenter(allow_empty_masks=True), prompt, GENERATION_SETTINGS,
+            )
+            page_audit["bootstrap_generated_calls"] = generated
+            checked = []
+            fallback_pages = []
+            for item in video_items:
+                if "page_id" in item:
+                    analysis = process(item)
+                    if analysis["kind"] != "whiteboard":
+                        checked.extend(fallback_page_items(request, item, analysis))
+                        fallback_pages.append(item["page_id"])
+                        continue
+                checked.append(item)
+            video_items = checked
+            page_audit["final_type_fallback_pages"] = fallback_pages
+            page_audit["selected_video_frames"] = len(video_items)
+            page_audit["exports"] = [{key: item[key] for key in
+                                     ("id", "image", "timestamp", "page_id", "page_start", "page_end",
+                                      "selection_issues") if key in item} for item in video_items]
+        # Stateful native requests must start a new chronological sequence after selection.
+        native = PersonSegmenter()
+        mask_calls = 0
+
+        def segment(rgb):
+            nonlocal mask_calls
+            mask_calls += 1
+            return native(rgb)
+
+        items, audit = group_visuals(video_items + request["items"], process, segment)
         audit.update(model=model_id, generated_calls=generated,
                      processing_seconds=time.monotonic() - started)
         write_json(job / "visual-grouping.json", audit)
+        if pages:
+            page_audit.update(qwen_generated_calls=generated,
+                              grouping_native_mask_calls=mask_calls,
+                              selection_native_mask_calls_this_run=(
+                                  0 if page_audit["selection_reused"] else
+                                  page_audit.get("segmentation_calls", 0)),
+                              vision_seconds=time.monotonic() - started)
+            write_json(job / "whiteboard-pages.json", page_audit)
         return {"items": items}
     items = [process(item) for item in request["items"]]
     if content:
         write_json(job / "ocr-reuse.json", {"items": len(items), "generated_calls": generated,
                                            "reused_results": len(items) - generated,
                                            "processing_seconds": time.monotonic() - started})
+        if pages and (job / "whiteboard-pages.json").exists():
+            audit = read_json(job / "whiteboard-pages.json")
+            audit.update(ocr_generated_calls=generated, ocr_items=len(items),
+                         ocr_seconds=time.monotonic() - started)
+            write_json(job / "whiteboard-pages.json", audit)
     return {"items": items}
 
 

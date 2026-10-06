@@ -57,8 +57,9 @@ def test_default_mode_reaches_visual_workers_and_preserves_legacy_checkpoints(pi
             assert "vision_mode" not in requests[task]
             assert "grouping_version" not in requests[task]
         else:
-            assert requests[task]["vision_mode"] == "content"
+            assert requests[task]["vision_mode"] == "pages"
             assert requests[task]["grouping_version"] == 1
+            assert requests[task]["page_selection_version"] == 1
     if legacy:
         assert "preflight" not in events
         assert "scan" not in events
@@ -67,7 +68,7 @@ def test_default_mode_reaches_visual_workers_and_preserves_legacy_checkpoints(pi
     else:
         assert events.index("preflight") < events.index("audio") < events.index("asr")
         assert result["visual_processing"] == {
-            "vision_mode": "content", "grouping_version": 1}
+            "vision_mode": "pages", "grouping_version": 1, "page_selection_version": 1}
         assert read_json(out / "extraction-config.json") == result["visual_processing"]
 
 
@@ -161,7 +162,7 @@ def test_alias_ocr_and_sources_keep_occurrence_times_without_future_content(pipe
     monkeypatch.setattr(extraction, "import_sources", sources)
     monkeypatch.setattr(extraction, "_frames", frames)
     monkeypatch.setattr(extraction, "_worker", worker)
-    evidence = read_json(extraction.extract(video, [source], out, ocr_model="mock-ocr"))
+    evidence = read_json(extraction.extract(video, [source], out, vision_mode="content", ocr_model="mock-ocr"))
 
     first, alias, future, source_visual = evidence["visuals"]
     assert [visual["timestamp"] for visual in evidence["visuals"]] == [10, 1000, 1100, None]

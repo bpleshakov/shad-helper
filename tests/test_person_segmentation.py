@@ -149,6 +149,35 @@ class PersonSegmentationTests(unittest.TestCase):
                 self.assertIsNone(PersonSegmenter()(np.zeros((2, 2, 3), dtype=np.uint8)))
             self.assertEqual((native.entered, native.exited), (1, 1))
 
+    def test_empty_mask_opt_in_accepts_successfully_copied_zero_mask(self):
+        native = NativeHarness()
+        native.buffer[:] = bytes(len(native.buffer))
+        rgb = np.zeros((3, 4, 3), dtype=np.uint8)
+        with patch("shad_helper.person_segmentation._native_modules", return_value=native.modules()):
+            mask = PersonSegmenter(allow_empty_masks=True)(rgb)
+        np.testing.assert_array_equal(mask, np.zeros(rgb.shape[:2], dtype=np.float32))
+        native.quartz.CVPixelBufferLockBaseAddress.assert_called_once()
+        native.quartz.CVPixelBufferUnlockBaseAddress.assert_called_once()
+
+    def test_empty_mask_opt_in_keeps_native_failures_and_full_coverage_uncertain(self):
+        changes = [
+            lambda native: native.buffer.__setitem__(slice(None), bytes([255] * 8)),
+            lambda native: setattr(native.handler.performRequests_error_, "return_value", (False, "error")),
+            lambda native: setattr(native.request.results, "return_value", []),
+            lambda native: setattr(native.quartz.CVPixelBufferLockBaseAddress, "return_value", -6662),
+            lambda native: setattr(native.quartz, "CVPixelBufferGetPixelFormatType", lambda buffer: 99),
+            lambda native: setattr(native.quartz, "CVPixelBufferIsPlanar", lambda buffer: True),
+            lambda native: setattr(native.quartz, "CVPixelBufferGetBaseAddress", lambda buffer: None),
+        ]
+        for change in changes:
+            native = NativeHarness()
+            native.buffer[:] = bytes(len(native.buffer))
+            change(native)
+            with self.subTest(change=change), \
+                    patch("shad_helper.person_segmentation._native_modules", return_value=native.modules()):
+                self.assertIsNone(PersonSegmenter(allow_empty_masks=True)(
+                    np.zeros((2, 2, 3), dtype=np.uint8)))
+
     def test_buffer_is_unlocked_when_copy_fails(self):
         native = NativeHarness()
         native.address.as_buffer = lambda count: memoryview(b"too short")[:2]

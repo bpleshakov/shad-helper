@@ -136,10 +136,17 @@ def group_visuals(items, analyze, segmenter, max_pending_seconds=30):
                   "image": state["image"], "sha256": state["sha256"],
                   "original_image": original, "original_sha256": sha256_file(Path(original)),
                   "analysis_id": state["id"]}
+        record["issues"] = list(dict.fromkeys([
+            *record.get("issues", []), *item.get("selection_issues", [])]))
         if "source_id" in item:
             record["source_id"] = item["source_id"]
         else:
             record.pop("source_id", None)
+        for field in ("page_id", "page_start", "page_end"):
+            if field in item:
+                record[field] = item[field]
+            else:
+                record.pop(field, None)
         outputs[position] = record
         previous = decisions[position]
         decisions[position] = {"id": item["id"], "timestamp": item.get("timestamp"),

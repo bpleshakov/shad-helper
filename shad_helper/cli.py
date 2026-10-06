@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .vision_mode import VISION_MODES
+
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Local Russian lecture extraction and LaTeX notes")
@@ -28,8 +30,8 @@ def parser() -> argparse.ArgumentParser:
     extract.add_argument("--start", type=float, default=0)
     extract.add_argument("--duration", type=float, help="Process a pilot interval, in seconds")
     extract.add_argument("--language", default="ru")
-    extract.add_argument("--vision-mode", choices=("content", "baseline"), default=None,
-                         help="Visual grouping mode (new jobs: content; existing jobs keep their mode)")
+    extract.add_argument("--vision-mode", choices=VISION_MODES, default=None,
+                         help="Visual selection mode (new jobs: pages; existing jobs keep their mode)")
     notes = commands.add_parser("notes", help="Generate notes or export/import a ChatGPT handoff")
     notes.add_argument("job", type=Path)
     mode = notes.add_mutually_exclusive_group()

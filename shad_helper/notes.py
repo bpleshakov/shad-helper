@@ -78,11 +78,19 @@ def chapter_context(evidence: dict, chapter: dict, overlap: float = 60) -> dict:
     segments = [s for s in evidence.get("segments", [])
                 if s["end"] >= start and s["start"] <= end]
     video_visuals = [v for v in evidence.get("visuals", [])
-                     if v.get("timestamp") is not None and start <= v["timestamp"] <= end]
+                     if v.get("timestamp") is not None
+                     and ((v["page_start"] < chapter["end"] and v["page_end"] > chapter["start"])
+                          if v.get("page_id") else start <= v["timestamp"] <= end)]
     preceding = [v for v in evidence.get("visuals", [])
-                 if v.get("timestamp") is not None and v["timestamp"] < start]
+                 if v.get("timestamp") is not None and not v.get("page_id")
+                 and v["timestamp"] < start]
     if preceding:
-        video_visuals.insert(0, max(preceding, key=lambda visual: visual["timestamp"]))
+        previous = max(preceding, key=lambda visual: visual["timestamp"])
+        superseded = any(v.get("page_id") and v["page_start"] <= chapter["start"]
+                         and previous["timestamp"] < v["page_end"]
+                         for v in evidence.get("visuals", []) if v.get("timestamp") is not None)
+        if not superseded:
+            video_visuals.insert(0, previous)
     video_ids = {v["id"] for v in video_visuals}
     sources = [s for s in evidence.get("sources", [])
                if video_ids.intersection(s.get("matched_visual_ids", []))]
@@ -197,8 +205,15 @@ def _chapter_prompt(context: dict, outline: dict, glossary: list[dict]) -> str:
     from .schemas import LectureNotes
 
     payload = {"lecture_title": outline["title"], "glossary": glossary, "context": context}
+    page_guidance = ("Изображения с page_id показывают итоговое состояние страницы доски за "
+                     "интервал page_start–page_end. Кадр может быть снят позже конца главы и "
+                     "служит общей визуальной опорой только для этой страницы. Следуй речи "
+                     "из интервала главы; не утверждай, что все записи уже существовали "
+                     "раньше, и не переноси содержание следующей страницы в эту главу.\n"
+                     if any(v.get("page_id") for v in context["visuals"]) else "")
     return ("Составь ровно одну главу с ID, start и end из context.chapter. "
             "Соседний контекст нужен для понимания; не дублируй его в этой главе.\n"
+            + page_guidance
             + json.dumps(payload, ensure_ascii=False, indent=2)
             + "\nJSON schema:\n"
             + json.dumps(LectureNotes.model_json_schema(), ensure_ascii=False, indent=2))
@@ -312,13 +327,17 @@ def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
 
         try:
             client = client or PlanClient(state_dir, proxy=proxy)
+            outline_visuals = [
+                {**{key: v.get(key) for key in ("id", "timestamp", "summary")},
+                 **({key: v[key] for key in ("page_id", "page_start", "page_end")}
+                    if v.get("page_id") else {})}
+                for v in evidence.get("visuals", []) if v.get("timestamp") is not None]
             outline_prompt = (
                 "Составь тематический план всей лекции: непрерывные главы до 15 минут, "
                 "покрывающие весь интервал. Сохрани точные границы начала/конца. "
                 "Также дай общий глоссарий обозначений.\n" + json.dumps({
                     "interval": lecture_bounds(evidence), "segments": evidence["segments"],
-                    "visuals": [{key: v.get(key) for key in ("id", "timestamp", "summary")}
-                                for v in evidence.get("visuals", []) if v.get("timestamp") is not None]},
+                    "visuals": outline_visuals},
                     ensure_ascii=False))
             outline = checkpoint(job, "notes/outline", {"evidence": signature,
                 "instructions": INSTRUCTIONS, "prompt": outline_prompt, "model": client.model,

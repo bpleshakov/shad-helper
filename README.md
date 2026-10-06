@@ -73,22 +73,36 @@ while valid results are reused.
 Occlusion, unreadable handwriting, and imperfect source matching can still
 require manual correction.
 
-### Repeated visual content
+### Visual selection
 
-New jobs default to `--vision-mode content`. The processor compares full-resolution
-lecture content against a fixed reference and uses Apple Vision person masks to
-track lecturer occlusion on physical whiteboards. Hidden areas remain unknown
-until a later view confirms the same content. Changed or uncertain content,
-unresolved occlusion, and scene changes retain separate analyses. The current
-Qwen model, image resolution, native-cadence scan, and original frames are kept.
-The comparison tolerates up to three intensity levels per color channel as noise;
-any larger co-visible pixel change retains an analysis, including outside the
-detected surface. The audit records this policy for pilot review.
+New jobs default to `--vision-mode pages`. For a physical whiteboard, the
+processor tracks writing and corrections and selects readable completed pages
+for Qwen and OCR. Partial writing and intermediate corrections are discarded
+from separate model analysis when a later completed page captures the content.
+The original frames remain internal evidence. Ambiguous erasures, incomplete
+pages, unreadable final views, and unresolved occlusion use conservative fallback
+frames and review warnings instead of assuming the content is complete.
 
-Install the macOS Vision and Quartz bindings with the local extra. Use
-`--vision-mode baseline` on a new job to disable grouping. Existing jobs without
-`extraction-config.json` resume in baseline mode; a job's recorded mode cannot be
-changed in place. Use a new output directory to compare modes.
+Apple Vision person masks help distinguish lecturer motion from board changes;
+hidden areas remain unknown until a later view confirms them. The current Qwen
+model, full image resolution, and native-cadence candidate scan are kept. Inspect
+`whiteboard-pages.json` for selected pages, discarded intermediate states, page
+boundaries, and fallback decisions before accepting a pilot's notes.
+
+Use `--vision-mode content` on a new job to keep every changed or uncertain content
+state and group only confirmed repeated content. This mode compares against a
+fixed reference, tolerates up to three intensity levels per color channel as
+noise, and retains an analysis for larger co-visible changes, including outside
+the detected surface. `--vision-mode baseline` on a new job disables both page
+selection and content grouping.
+
+Install the macOS Vision and Quartz bindings with the local extra. Run native
+segmentation in a normal macOS terminal: a restricted execution sandbox can
+reject CoreVideo operations even when the bindings import successfully.
+Existing saved `content` and `baseline` jobs keep their recorded behavior;
+legacy jobs without `extraction-config.json` resume in baseline mode. Saved
+`pages` jobs also keep their selector version. Modes and unsupported selector
+versions cannot be changed in place; use a new output directory to compare modes.
 
 Shared analyses retain occurrence-specific IDs/timestamps and `original_image`
 provenance. Their `image` and crop coordinates refer to the actual canonical
