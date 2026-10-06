@@ -26,13 +26,20 @@ def read_frame(video: Path, timestamp: float) -> np.ndarray:
         return np.asarray(image.convert("RGB")).copy()
 
 
-def iter_previews(video: Path, metadata: dict, start: float, end: float):
+def iter_previews(video: Path, metadata: dict, start: float, end: float, *,
+                  width: int = 384, sample_seconds: float | None = None):
     """Yield actual PTS and native-cadence RGB previews with bounded pixel memory."""
-    width = min(384, metadata["width"])
+    width = min(width, metadata["width"])
     height = max(2, round(metadata["height"] * width / metadata["width"] / 2) * 2)
+    filters = f"scale={width}:{height}"
+    if sample_seconds is not None:
+        # Scene events supplement sampling; a short intervening slide is not skipped.
+        filters += (f",select='isnan(prev_selected_t)+gte(t-prev_selected_t,{sample_seconds})"
+                    "+gt(scene,0.12)'")
+    filters += ",showinfo"
     command = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-ss", str(start),
                "-i", str(video), "-t", str(end - start), "-map", "0:v:0", "-an", "-sn", "-dn",
-               "-vf", f"scale={width}:{height},showinfo", "-fps_mode", "passthrough",
+               "-vf", filters, "-fps_mode", "passthrough",
                "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     timestamps = queue.Queue()

@@ -1,6 +1,7 @@
 import json
 import shutil
 import subprocess
+from itertools import pairwise
 
 import numpy as np
 import pytest
@@ -124,3 +125,64 @@ def test_early_preview_close_reaps_real_process(variable_rate_video, monkeypatch
     assert len(processes) == 1
     assert processes[0].poll() is not None
     assert processes[0].stdout.closed and processes[0].stderr.closed
+
+
+def test_sparse_previews_keep_variable_source_pts_and_clip_bounds(variable_rate_video):
+    video, metadata, _, colors = variable_rate_video
+    frames = list(video_frames.iter_previews(video, metadata, 0, 1.04,
+                                            width=640, sample_seconds=0.5))
+    assert [frame["timestamp"] for frame in frames] == pytest.approx([0, 0.12, 0.84])
+    for frame, color in zip(frames, [colors[0], colors[1], colors[3]], strict=True):
+        assert frame["rgb"].shape == (360, 640, 3)
+        assert np.all(frame["rgb"] == color)
+    clipped = list(video_frames.iter_previews(video, metadata, 0.13, 0.9,
+                                             width=640, sample_seconds=0.5))
+    assert [frame["timestamp"] for frame in clipped] == pytest.approx([0.4, 0.84])
+    assert all(0.13 <= frame["timestamp"] < 0.9 for frame in clipped)
+
+
+def test_stationary_ten_second_video_has_at_most_twenty_one_sparse_previews(tmp_path):
+    video = tmp_path / "stationary.mkv"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+         "color=c=white:s=640x360:r=25:d=10", "-c:v", "ffv1", "-pix_fmt", "bgr0", str(video)],
+        check=True, capture_output=True,
+    )
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries",
+         "stream=nb_read_frames", "-of", "json", str(video)],
+        check=True, capture_output=True, text=True,
+    )
+    assert int(json.loads(probe.stdout)["streams"][0]["nb_read_frames"]) == 250
+    frames = list(video_frames.iter_previews(video, {"width": 640, "height": 360}, 0, 10,
+                                            width=640, sample_seconds=0.5))
+    assert 19 <= len(frames) <= 21
+    timestamps = [frame["timestamp"] for frame in frames]
+    assert timestamps[0] == 0
+    assert timestamps[-1] < 10
+    assert all(0.5 <= later - earlier <= 0.56
+               for earlier, later in pairwise(timestamps))
+
+
+def test_brief_slide_between_regular_samples_is_retained_at_its_actual_pts(tmp_path):
+    Image.new("RGB", (640, 360), "white").save(tmp_path / "background.png")
+    Image.new("RGB", (640, 360), "red").save(tmp_path / "brief-slide.png")
+    manifest = tmp_path / "brief.txt"
+    manifest.write_text(
+        "file 'background.png'\nduration 0.2\n"
+        "file 'brief-slide.png'\nduration 0.2\n"
+        "file 'background.png'\nduration 0.6\n"
+        "file 'background.png'\n", encoding="utf-8",
+    )
+    video = tmp_path / "brief.mkv"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i",
+         str(manifest), "-fps_mode", "passthrough", "-c:v", "ffv1", "-pix_fmt", "bgr0", str(video)],
+        check=True, capture_output=True,
+    )
+    frames = list(video_frames.iter_previews(video, {"width": 640, "height": 360}, 0, 1.04,
+                                            width=640, sample_seconds=0.5))
+    assert all(any(frame["timestamp"] == pytest.approx(timestamp) for timestamp in (0, 0.2, 0.4, 1))
+               for frame in frames)
+    brief = next(frame for frame in frames if np.all(frame["rgb"] == (255, 0, 0)))
+    assert brief["timestamp"] == pytest.approx(0.2)

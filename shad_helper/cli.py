@@ -31,7 +31,10 @@ def parser() -> argparse.ArgumentParser:
     extract.add_argument("--duration", type=float, help="Process a pilot interval, in seconds")
     extract.add_argument("--language", default="ru")
     extract.add_argument("--vision-mode", choices=VISION_MODES, default=None,
-                         help="Visual selection mode (new jobs: pages; existing jobs keep their mode)")
+                         help="Visual selection mode (new jobs: pages until sparse benchmark qualifies; "
+                              "existing jobs keep their mode)")
+    extract.add_argument("--vision-budget-minutes", type=float,
+                         help="Cumulative Qwen budget in sparse mode; default: 30 minutes per video hour")
     notes = commands.add_parser("notes", help="Generate notes or export/import a ChatGPT handoff")
     notes.add_argument("job", type=Path)
     mode = notes.add_mutually_exclusive_group()
@@ -93,8 +96,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Signed in: {account.get('email') or account.get('subject')}")
         elif args.command == "extract":
             from .extraction import extract
+            budget = ({"vision_budget_minutes": args.vision_budget_minutes}
+                      if args.vision_budget_minutes is not None else {})
             print(extract(args.video, args.source, args.out, language=args.language,
-                          start=args.start, duration=args.duration, vision_mode=args.vision_mode))
+                          start=args.start, duration=args.duration, vision_mode=args.vision_mode, **budget))
         elif args.command == "notes":
             from .notes import generate_notes
             print(generate_notes(args.job, args.state_dir, imported=args.imported,

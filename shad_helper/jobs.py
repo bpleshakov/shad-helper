@@ -72,6 +72,8 @@ def evidence_index(evidence: dict) -> dict[str, str]:
                            f"итог страницы доски, кадр {timestamp(visual['timestamp'])}")
         else:
             description = f"Видео {timestamp(visual['timestamp'])}"
+        if visual.get("status") in {"deferred", "failed"}:
+            description += "; визуальные данные не обработаны"
         index[visual["id"]] = description
         for region in visual.get("regions", []):
             index[region["id"]] = description

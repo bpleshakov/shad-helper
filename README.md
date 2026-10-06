@@ -75,7 +75,53 @@ require manual correction.
 
 ### Visual selection
 
-New jobs default to `--vision-mode pages`. For a physical whiteboard, the
+For the sparse strategy, use a **new output directory**:
+
+```sh
+UV_CACHE_DIR=.cache/uv uv run shad-helper extract lecture.mp4 \
+  --vision-mode sparse --out jobs/lecture-sparse
+```
+
+Sparse mode samples small previews at two frames per second, supplemented by
+scene events. These previews are not saved as individual PNGs or sent to Qwen.
+It selects completed board pages, distinct slides, and notebook content before
+exporting full-resolution images. A page has at most three real views: one main
+frame and useful complementary views or explicitly uncertain earlier evidence.
+Uncertain selection retains bounded evidence and review
+warnings; it never restores every intermediate writing pause.
+If the final writing is fully covered, it retains an earlier readable frame
+with an explicit warning that the final content state could not be verified.
+
+The Qwen allowance defaults to **30 minutes per video hour**. It includes model
+loading, routing, analysis, and retries. Selection/export, Whisper, and PaddleOCR
+have separate timings. The allowance is cumulative across resumes. Budget
+exhaustion preserves partial results and selected images, marks deferred visual
+intervals explicitly, and skips their automatic OCR. Notes retain visible review
+gaps. To deliberately allow more Qwen work, raise the total job allowance:
+
+```sh
+UV_CACHE_DIR=.cache/uv uv run shad-helper extract lecture.mp4 \
+  --out jobs/lecture-sparse --vision-budget-minutes 45
+```
+
+Inspect `sparse-selection.json`, `sparse-vision-results.json`, and
+`sparse-qwen-budget.json` for selections, call/token timings, coverage warnings,
+and cumulative model time. `extraction-timings.json` separates current-run
+audio/ASR, vision, and OCR wall time from cumulative Qwen usage.
+A deadline-limited partial run is not a completed
+30-minute quality benchmark.
+
+The installed 27B model remains the reference until a smaller model passes a
+reviewed handwriting/diagram holdout. The benchmark utility compares it with
+Qwen3.5-9B-4bit and Qwen3.5-4B-MLX-4bit; run
+`uv run python -m shad_helper.vision_benchmark --help` for commands. See the
+[benchmark instructions](docs/sparse-benchmark.md) for input and review formats.
+A qualified model profile can be saved as `JOB/sparse-model-profile.json` or
+`.shad-helper/vision-profile.json` for subsequent jobs. Sparse becomes the default
+only when that profile also records a reviewed, passing full-hour pilot.
+
+Until the sparse benchmark qualifies, new jobs default to `--vision-mode pages`.
+For a physical whiteboard, the
 processor tracks writing and corrections and selects readable completed pages
 for Qwen and OCR. Partial writing and intermediate corrections are discarded
 from separate model analysis when a later completed page captures the content.

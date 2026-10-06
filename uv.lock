@@ -1681,6 +1681,7 @@ dependencies = [
     { name = "pyjwt", extra = ["crypto"] },
     { name = "pymupdf" },
     { name = "python-pptx" },
+    { name = "tqdm" },
 ]
 
 [package.optional-dependencies]
@@ -1711,6 +1712,7 @@ requires-dist = [
     { name = "pyobjc-framework-quartz", marker = "sys_platform == 'darwin' and extra == 'local'", specifier = ">=12.2.2" },
     { name = "pyobjc-framework-vision", marker = "sys_platform == 'darwin' and extra == 'local'", specifier = ">=12.2.2" },
     { name = "python-pptx", specifier = ">=1.0.2" },
+    { name = "tqdm", specifier = ">=4.67" },
 ]
 provides-extras = ["local"]
 

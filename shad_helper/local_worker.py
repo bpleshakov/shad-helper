@@ -3,8 +3,11 @@
 import argparse
 import json
 import math
+import shutil
+import stat
 import time
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from .jobs import checkpoint, read_json, sha256_file, write_json
 from .vision_mode import GROUPING_VERSION, PAGE_SELECTION_VERSION
@@ -169,11 +172,16 @@ def _pixel_signature(path: str) -> dict:
 
 
 def run(request: dict, task: str) -> dict:
+    if task == "vision" and request.get("vision_mode") == "sparse":
+        from .sparse_worker import run_sparse
+
+        return run_sparse(request)
     job = Path(request["job"])
     model_id = request["model"]
     if task == "convert":
         try:
             from mlx_vlm import convert
+            from mlx_vlm.utils import get_model_path
         except ImportError as error:
             raise RuntimeError("Local OCR conversion requires: uv sync --extra local.") from error
         destination = Path(request["destination"])
@@ -181,12 +189,33 @@ def run(request: dict, task: str) -> dict:
         if (not marker.exists() or read_json(marker).get("source") != model_id
                 or not (destination / "config.json").exists()
                 or not any(destination.glob("*.safetensors"))):
-            convert(hf_path=model_id, mlx_path=str(destination), dtype="bfloat16", trust_remote_code=True)
+            destination.mkdir(parents=True, exist_ok=True)
+            for path in destination.rglob("*"):
+                if path.is_file() and not path.is_symlink():
+                    mode = stat.S_IMODE(path.stat().st_mode)
+                    if not mode & stat.S_IWUSR:
+                        path.chmod(mode | stat.S_IWUSR)
+
+            # Upstream copies source permissions before rewriting tokenizer metadata.
+            # Stage writable sidecars; link weights to avoid copying gigabytes.
+            def copy_source(source, target):
+                if Path(source).suffix == ".safetensors":
+                    Path(target).symlink_to(Path(source).resolve())
+                else:
+                    shutil.copyfile(source, target)
+                return str(target)
+
+            source = get_model_path(model_id)
+            with TemporaryDirectory(prefix=".ocr-source-", dir=destination.parent) as temporary:
+                staged = Path(temporary) / "model"
+                shutil.copytree(source, staged, copy_function=copy_source)
+                convert(hf_path=str(staged), mlx_path=str(destination),
+                        dtype="bfloat16", trust_remote_code=True)
             write_json(marker, {"source": model_id, "dtype": "bfloat16"})
         return {"model": str(destination.resolve())}
 
     pages = request.get("vision_mode") == "pages" and task in {"vision", "ocr"}
-    content = request.get("vision_mode") in {"content", "pages"} and task in {"vision", "ocr"}
+    content = request.get("vision_mode") in {"content", "pages", "sparse"} and task in {"vision", "ocr"}
     if content and request.get("grouping_version", GROUPING_VERSION) != GROUPING_VERSION:
         raise ValueError("Unsupported visual grouping version; use a new output directory.")
     if pages and (type(request.get("page_selection_version")) is not int

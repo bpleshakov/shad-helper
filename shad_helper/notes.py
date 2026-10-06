@@ -126,6 +126,17 @@ def _validate_evidence(notes: dict, evidence: dict, resolutions: dict | None = N
                 raise ValueError(f"Unknown evidence references in {block['id']}: {sorted(unknown)}")
             if not block["evidence_ids"] and block["kind"] != "clarification":
                 raise ValueError(f"Lecture block {block['id']} requires source evidence")
+        for visual in chapter_context(evidence, chapter)["visuals"]:
+            if visual.get("status") not in {"deferred", "failed"}:
+                continue
+            identifier = f"{chapter['id'][:40]}_visual_gap_{fingerprint(visual['id'])[:12]}"
+            if not any(block["id"] == identifier for block in chapter["blocks"]):
+                chapter["blocks"].append({
+                    "id": identifier, "kind": "uncertain",
+                    "content": "Визуальные данные не обработаны: " + known[visual["id"]]
+                               + ". Проверить изображение и соответствующий интервал видео.",
+                    "evidence_ids": [visual["id"]], "caption": "", "language": "",
+                })
     for figure in notes["illustrations"]:
         if figure["path"]:
             raise ValueError("Illustration paths are imported with render --images, not model output")
@@ -211,9 +222,15 @@ def _chapter_prompt(context: dict, outline: dict, glossary: list[dict]) -> str:
                      "из интервала главы; не утверждай, что все записи уже существовали "
                      "раньше, и не переноси содержание следующей страницы в эту главу.\n"
                      if any(v.get("page_id") for v in context["visuals"]) else "")
+    gap_guidance = ("Изображения со status deferred или failed не получили полную визуальную "
+                    "обработку. Явно обозначь пробелы по их интервалам и необходимость проверки; "
+                    "не считай отсутствие OCR отсутствием записей и не выдавай конспект за полный.\n"
+                    if any(v.get("status") in {"deferred", "failed"}
+                           for v in context["visuals"]) else "")
     return ("Составь ровно одну главу с ID, start и end из context.chapter. "
             "Соседний контекст нужен для понимания; не дублируй его в этой главе.\n"
             + page_guidance
+            + gap_guidance
             + json.dumps(payload, ensure_ascii=False, indent=2)
             + "\nJSON schema:\n"
             + json.dumps(LectureNotes.model_json_schema(), ensure_ascii=False, indent=2))
@@ -330,7 +347,8 @@ def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
             outline_visuals = [
                 {**{key: v.get(key) for key in ("id", "timestamp", "summary")},
                  **({key: v[key] for key in ("page_id", "page_start", "page_end")}
-                    if v.get("page_id") else {})}
+                    if v.get("page_id") else {}),
+                 **({"status": v["status"]} if "status" in v else {})}
                 for v in evidence.get("visuals", []) if v.get("timestamp") is not None]
             outline_prompt = (
                 "Составь тематический план всей лекции: непрерывные главы до 15 минут, "

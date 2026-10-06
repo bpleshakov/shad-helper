@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from collections import Counter, deque
 from pathlib import Path
 
@@ -208,9 +209,14 @@ def _worker(out: Path, task: str, request: dict) -> dict:
     request = {"job": str(out.resolve()), **request}
     request_path = out / "workers" / f"{task}.request.json"
     response_path = out / "workers" / f"{task}.response.json"
+    command = [sys.executable, "-m", "shad_helper.local_worker", task,
+               "--request", str(request_path), "--output", str(response_path)]
+    if task == "vision" and request.get("vision_mode") == "sparse":
+        from .vision_budget import run_budgeted_worker
+
+        return run_budgeted_worker(command, out, request, response_path, request_path=request_path)
     write_json(request_path, request)
-    subprocess.run([sys.executable, "-m", "shad_helper.local_worker", task,
-                    "--request", str(request_path), "--output", str(response_path)], check=True)
+    subprocess.run(command, check=True)
     return read_json(response_path)
 
 
@@ -267,6 +273,10 @@ def _prepare_visuals(raw_visuals: list[dict], out: Path) -> tuple[list[dict], li
                   "summary": str(raw.get("summary", "")), "kind": raw.get("kind", "other"),
                   "diagram": str(raw.get("diagram", "")), "issues": list(raw.get("issues", [])), "regions": []}
         visual.update({key: raw[key] for key in ("page_id", "page_start", "page_end") if key in raw})
+        if "status" in raw:
+            visual["status"] = raw["status"]
+        if "analysis_model" in raw:
+            visual["analysis_model"] = raw["analysis_model"]
         if raw.get("analysis_id"):
             original = Path(raw.get("original_image", raw["image"]))
             visual.update(analysis_id=analysis_id,
@@ -274,6 +284,10 @@ def _prepare_visuals(raw_visuals: list[dict], out: Path) -> tuple[list[dict], li
                           original_sha256=sha256_file(original))
         if raw.get("source_id"):
             visual["source_id"] = raw["source_id"]
+        if raw.get("status") in {"deferred", "failed"}:
+            # A model deadline must not turn into implicit full-image OCR work.
+            visuals.append(visual)
+            continue
         regions = raw.get("regions") or [{"kind": "text", "bbox": [0, 0, 1, 1]}]
         with Image.open(path) as image:
             if raw.get("analysis_id"):
@@ -327,7 +341,8 @@ def _prepare_visuals(raw_visuals: list[dict], out: Path) -> tuple[list[dict], li
 
 def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru", start: float = 0.0,
             duration: float | None = None, asr_model: str = ASR_MODEL, vlm_model: str = VLM_MODEL,
-            ocr_model: str = OCR_MODEL, vision_mode: str | None = None) -> Path:
+            ocr_model: str = OCR_MODEL, vision_mode: str | None = None,
+            vision_budget_minutes: float | None = None) -> Path:
     video, out = Path(video).resolve(), Path(out).resolve()
     for binary in ("ffmpeg", "ffprobe"):
         if not shutil.which(binary):
@@ -339,16 +354,17 @@ def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru"
         raise ValueError("duration must be positive.")
     from .vision_mode import resolve_vision_mode
 
-    config = resolve_vision_mode(out, vision_mode)
+    end = metadata["duration"] if duration is None else min(metadata["duration"], start + duration)
+    config = resolve_vision_mode(out, vision_mode, vision_budget_minutes=vision_budget_minutes,
+                                 clip_seconds=end - start)
     if config["vision_mode"] in {"content", "pages"}:
         from .person_segmentation import check_person_segmentation
 
         check_person_segmentation()
-    end = metadata["duration"] if duration is None else min(metadata["duration"], start + duration)
     out.mkdir(parents=True, exist_ok=True)
     video_hash = sha256_file(video)
     run_inputs = {"video": video_hash, "start": start, "end": end}
-    if config["vision_mode"] in {"content", "pages"}:
+    if config["vision_mode"] in {"content", "pages", "sparse"}:
         run_inputs["vision"] = config
     source_inputs = {"format": 2, "files": [
         {"path": str(Path(path).resolve()), "sha256": sha256_file(Path(path))} for path in sources]}
@@ -356,14 +372,16 @@ def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru"
                                    lambda records: [out / image for record in records
                                                     for image in record["images"] +
                                                     ([record["original"]] if record.get("original") else [])])
+    asr_started = time.monotonic()
     chunks = _audio_chunks(video, out, start, end, video_hash)
     asr = _worker(out, "asr", {"model": asr_model, "language": language, "items": chunks,
                                "initial_prompt": source_glossary(records)})
     segments = stitch_segments(asr["items"])
     write_json(out / "transcript.json", segments)
     write_subtitles(segments, out)
+    asr_seconds = time.monotonic() - asr_started
     video_request = {}
-    if config["vision_mode"] == "pages":
+    if config["vision_mode"] in {"pages", "sparse"}:
         images = []
         video_request = {"video": str(video), "video_sha256": video_hash,
                          "metadata": metadata, "start": start, "end": end}
@@ -381,9 +399,13 @@ def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru"
             images.extend({"id": f"visual_{record['id']}_{position}", "source_id": record["id"], "timestamp": None,
                            "image": str(out / image)} for position, image in enumerate(record["images"])
                           if Path(image).suffix.lower() in (".png", ".jpg", ".jpeg"))
-    visual_settings = config if config["vision_mode"] in {"content", "pages"} else {}
-    raw_visuals = _worker(out, "vision", {"model": vlm_model, "items": images,
-                                        **visual_settings, **video_request})["items"]
+    visual_settings = config if config["vision_mode"] in {"content", "pages", "sparse"} else {}
+    vision_started = time.monotonic()
+    vision_result = _worker(out, "vision", {"model": vlm_model, "items": images,
+                                          **visual_settings, **video_request})
+    vision_seconds = time.monotonic() - vision_started
+    raw_visuals = vision_result["items"]
+    ocr_started = time.monotonic()
     visuals, crops = _prepare_visuals(raw_visuals, out)
     resolved_ocr = ocr_model
     if crops and ocr_model == OCR_MODEL:
@@ -397,6 +419,7 @@ def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru"
             if visual_settings and not region["text"].strip():
                 visual["issues"].append(
                     f"OCR вернул пустой ответ для области {region['id']}. Проверить видимое содержимое.")
+    ocr_seconds = time.monotonic() - ocr_started
     records = match_sources(records, visuals)
     warnings = [(visual["id"], description) for visual in visuals for description in visual["issues"]]
     warnings.extend((segment["id"], description) for segment in segments
@@ -416,5 +439,19 @@ def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru"
                 "models": {"asr": asr_model, "vlm": vlm_model, "ocr": ocr_model, "ocr_runtime": resolved_ocr}}
     if visual_settings:
         evidence["visual_processing"] = config
+    if config["vision_mode"] == "sparse":
+        audit = vision_result.get("audit", {})
+        evidence["visual_processing"].update(
+            status="partial" if any(v.get("status") != "processed" for v in visuals) else "complete",
+            qwen_budget=audit.get("qwen_budget", {}),
+        )
+        evidence["models"]["vlm_primary"] = audit.get("primary_model", vlm_model)
+        write_json(out / "extraction-timings.json", {
+            "scope": "current extraction invocation; Qwen usage is cumulative",
+            "audio_asr_seconds": asr_seconds,
+            "vision_selection_export_analysis_seconds": vision_seconds,
+            "ocr_preparation_conversion_analysis_seconds": ocr_seconds,
+            "qwen_cumulative_seconds": audit.get("qwen_budget", {}).get("used_seconds", 0),
+        })
     write_json(out / "evidence.json", evidence)
     return out / "evidence.json"

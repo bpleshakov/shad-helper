@@ -38,7 +38,7 @@ def test_login_forwards_proxy_flag_or_none(monkeypatch, tmp_path, capsys, proxy,
     assert capsys.readouterr().err == ""
 
 
-@pytest.mark.parametrize("vision_mode", [None, "pages", "content", "baseline"])
+@pytest.mark.parametrize("vision_mode", [None, "pages", "content", "baseline", "sparse"])
 def test_extract_forwards_vision_mode_without_resolving_or_writing(monkeypatch, tmp_path, vision_mode):
     extract = Mock(return_value=tmp_path / "evidence.json")
     monkeypatch.setitem(sys.modules, "shad_helper.extraction", SimpleNamespace(extract=extract))
@@ -58,7 +58,15 @@ def test_vision_mode_help_describes_pages_default(capsys):
     assert stopped.value.code == 0
     help_text = capsys.readouterr().out
     assert "new jobs: pages" in help_text
-    assert "--vision-mode {pages,content,baseline}" in help_text
+    assert "--vision-mode {pages,content,baseline,sparse}" in help_text
+
+
+def test_extract_forwards_explicit_qwen_budget(monkeypatch, tmp_path):
+    extract = Mock(return_value=tmp_path / "evidence.json")
+    monkeypatch.setitem(sys.modules, "shad_helper.extraction", SimpleNamespace(extract=extract))
+    assert main(["extract", "lecture.mp4", "--out", str(tmp_path), "--vision-mode", "sparse",
+                 "--vision-budget-minutes", "30"]) == 0
+    assert extract.call_args.kwargs["vision_budget_minutes"] == 30
 
 
 def test_extract_rejects_unknown_vision_mode_before_any_work(monkeypatch, tmp_path):

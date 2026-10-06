@@ -170,3 +170,57 @@ Acceptance requires preservation of the readable final content of every annotate
 A page is the current visible lecture surface; a major reset clears most of its current content. Static, reliably detected boards are the initial optimized case; uncertainty uses existing selection.
 
 Keep the inexpensive native-cadence scan. Lower sampling rates and exponential search are deferred until measurements show scanning is a meaningful bottleneck.
+
+# Sparse visual processing with a 30-minute Qwen budget
+
+## Summary
+
+Replace dense frame selection with completed-content selection before bulk image
+export and inference. Aim for 20–40 model-input images per hour of whiteboard
+video, adding views only when they reveal otherwise covered content.
+
+The previous run selected 1,154 frames because its blank opening locked almost
+the entire lecture into dense fallback. Repair blank/title routing, eliminate
+whole-scene fallback amplification, and reduce redundant generated output.
+
+The hard allowance is 30 minutes of Qwen work per video hour, including model
+loading, routing, analysis, and retries. Whisper, frame selection/export, and
+PaddleOCR have separate timings.
+
+## Sparse selection
+
+- Read two 640-pixel previews per second, supplemented by cheap scene events. Keep bounded memory; previews are not exported PNGs or individual model inputs.
+- Skip blank openings/endings. Route stable nonblank content with compact media/surface/person metadata; retry unknown layouts and refresh after persistent layout changes.
+- Track spatial board strokes and persistent changes rather than whole-image single-pixel differences. Request foreground masks for initial visibility and boundary decisions rather than every writing pause.
+- Select the final readable state before a major reset, replacement, or clip ending. Refine detected boundaries locally rather than exponentially skipping long intervals.
+- Keep one primary and up to two complementary real views per page. Complementary views must show the same final content state; earlier corrected equations must not reappear.
+- Preserve distinct slide content and notebook code/output changes, ignoring cursor movement and unchanged views.
+- Keep uncertainty local, retaining completed pages and bounded representative evidence. Never restore every pause from a surrounding scene.
+- Retain the latest readable evidence if terminal writing remains fully covered, with explicit final-state uncertainty. Confirmed page resets discard this older candidate.
+- At credible writing-loss boundaries, check for late-entering foreground even if the initial route had no lecturer. Failed masks preserve local uncertain evidence and do not merge later clear pages. Older unverified evidence is labelled uncertain, never a same-state complement.
+- Save a complete cheap overview before routing, and the final selection manifest before bulk analysis. Export only sparse full-resolution evidence with actual capture times and page intervals.
+
+## Model work and budget
+
+- Benchmark the installed Qwen3.8-27B-4bit against `mlx-community/Qwen3.5-9B-4bit` and `mlx-community/Qwen3.5-4B-MLX-4bit`. Choose the fastest smaller candidate that passes a human-reviewed holdout; otherwise retain 27B.
+- Routing has a 128-token ceiling; concise layout/diagram analysis has a 1,024-token ceiling. Disable thinking. Leave literal transcription to PaddleOCR, retaining meaningful diagram labels and relationships.
+- Keep full-resolution evidence and readable analysis images. Limit reduced image size to routing.
+- Reject incomplete JSON, repetition, and token-limit truncation. Permit one budgeted 27B escalation for failed or explicitly ambiguous primary analysis.
+- Group before inference and cache exact decoded-image matches by model, prompt, and generation settings. Keep selection warnings separate from inference validity.
+- Prioritize primary views across five-minute timeline buckets, then failed-page escalations and complementary views. Batch model switching.
+- Add `--vision-mode sparse` and `--vision-budget-minutes`. Preserve existing saved modes. New-job sparse default is gated on a reviewed passing full-hour benchmark.
+- Persist policy version, selected model profile, total allowance, and cumulative Qwen wall time. Resume does not reset the allowance; increasing it explicitly permits deferred work.
+- Use streamed cancellation and a parent watchdog covering model loading, prefill, and stalled generation. Checkpoint completed work atomically and preserve selected evidence on termination.
+- Deferred/failed visual items remain first-class review gaps, bypass implicit full-image OCR, and appear in automatic notes and manual handoff.
+- Report exports, routing/analysis calls, tokens, retries, escalations, deferred items, peak memory, and cumulative Qwen time. Report other stage timings separately.
+
+## Verification and acceptance
+
+- Regression tests cover blank/title/board routing, hundreds of pauses on one page, wipes and corrections, compression noise, lecturer movement, faint symbols, brief slides, notebook changes, and covered final content.
+- Verify local uncertainty, same-final-state complementary views, deadline handling during loading/prefill/decode, cumulative resume behavior, and unchanged saved modes.
+- Use 20 tuning examples and 20 separate holdout examples, covering handwriting, formulas, small symbols, diagrams, and occlusion. A qualified smaller model introduces no additional critical errors, missed regions, or lost final content.
+- Run a fresh full-hour pilot on the M5 Pro with downloaded models. Require at least 90% fewer exported images than dense selection, Qwen completion within 30 minutes, and zero deferred meaningful content or lost annotated final content.
+- A partial run that respects the deadline verifies enforcement, not successful optimization. Keep sparse opt-in until the complete quality/runtime gate passes.
+
+Whisper and the PaddleOCR model remain unchanged. Earlier material deliberately
+erased within a board page remains excluded by the existing final-page policy.
