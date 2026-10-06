@@ -1,0 +1,38 @@
+[project]
+name = "shad-helper"
+version = "0.1.0"
+description = "Local Russian lecture extraction and source-grounded LaTeX notes"
+requires-python = ">=3.14"
+dependencies = [
+    "httpx>=0.28.1",
+    "numpy>=2.3",
+    "opencv-python>=4.12.0.88",
+    "pillow>=11.3",
+    "pydantic>=2.12",
+    "PyJWT[crypto]>=2.10",
+    "pymupdf>=1.26",
+    "python-pptx>=1.0.2",
+]
+
+[project.optional-dependencies]
+local = ["mlx-whisper>=0.4.3", "mlx-vlm>=0.7.6"]
+
+[project.scripts]
+shad-helper = "shad_helper.cli:main"
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["shad_helper*"]
+
+[dependency-groups]
+dev = ["pytest>=8.4", "ruff>=0.13"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100

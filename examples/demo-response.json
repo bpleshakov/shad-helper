@@ -1,0 +1,22 @@
+{
+  "title": "Синтетический пример: линейное преобразование",
+  "language": "ru",
+  "chapters": [
+    {
+      "id": "ch001",
+      "title": "Линейность и растяжение",
+      "start": 0,
+      "end": 120,
+      "blocks": [
+        {"id": "ch001_definition", "kind": "text", "content": "Преобразование \\(T\\) линейно, если оно сохраняет сложение векторов и умножение на скаляр.", "evidence_ids": ["s001"]},
+        {"id": "ch001_formula", "kind": "math", "content": "T(\\alpha u + \\beta v)=\\alpha T(u)+\\beta T(v),\\qquad A=\\begin{pmatrix}2&0\\\\0&1\\end{pmatrix}", "evidence_ids": ["s001", "s002"]},
+        {"id": "ch001_diagram", "kind": "diagram", "content": "\\begin{tikzpicture}[>=Stealth,scale=1.2]\n\\draw[->] (0,0) -- (2.8,0) node[right] {$x$};\n\\draw[->] (0,0) -- (0,1.8) node[above] {$y$};\n\\draw[->,blue,thick] (0,0) -- (1,1) node[above left] {$v=(1,1)$};\n\\draw[->,red,thick] (0,0) -- (2,1) node[above right] {$Av=(2,1)$};\n\\end{tikzpicture}", "caption": "Схематическое растяжение первой координаты. Синтетическая демонстрация.", "evidence_ids": ["s002"]},
+        {"id": "ch001_code", "kind": "code", "content": "import numpy as np\n\n# Первая координата растягивается вдвое.\nA = np.array([[2, 0], [0, 1]])\nv = np.array([1, 1])\nresult = A @ v\n", "language": "python", "evidence_ids": ["s003"]},
+        {"id": "ch001_explanation", "kind": "clarification", "content": "Этот рисунок показывает действие конкретной диагональной матрицы. Для произвольной линейной матрицы геометрический эффект может включать вращение или сдвиг направлений.", "evidence_ids": []}
+      ]
+    }
+  ],
+  "glossary": [{"term": "Линейное преобразование", "definition": "Отображение, сохраняющее линейные комбинации векторов."}],
+  "issues": [],
+  "illustrations": []
+}

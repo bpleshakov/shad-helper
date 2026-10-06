@@ -1,0 +1,17 @@
+.venv/
+.shad-helper/
+.tools/
+.cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.egg-info/
+jobs/
+models/
+.models/
+dist/
+build/
+.DS_Store
+.idea
+algo_lecture_1
+
