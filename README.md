@@ -73,6 +73,35 @@ while valid results are reused.
 Occlusion, unreadable handwriting, and imperfect source matching can still
 require manual correction.
 
+### Repeated visual content
+
+New jobs default to `--vision-mode content`. The processor compares full-resolution
+lecture content against a fixed reference and uses Apple Vision person masks to
+track lecturer occlusion on physical whiteboards. Hidden areas remain unknown
+until a later view confirms the same content. Changed or uncertain content,
+unresolved occlusion, and scene changes retain separate analyses. The current
+Qwen model, image resolution, native-cadence scan, and original frames are kept.
+The comparison tolerates up to three intensity levels per color channel as noise;
+any larger co-visible pixel change retains an analysis, including outside the
+detected surface. The audit records this policy for pilot review.
+
+Install the macOS Vision and Quartz bindings with the local extra. Use
+`--vision-mode baseline` on a new job to disable grouping. Existing jobs without
+`extraction-config.json` resume in baseline mode; a job's recorded mode cannot be
+changed in place. Use a new output directory to compare modes.
+
+Shared analyses retain occurrence-specific IDs/timestamps and `original_image`
+provenance. Their `image` and crop coordinates refer to the actual canonical
+analysis frame. Identical OCR inputs reuse results by decoded pixels, model,
+recognition prompt, and generation settings. Both automatic notes and manual
+handoff include each shared image once per chapter.
+
+Inspect `visual-grouping.json` for original/representative frames, grouping and
+fallback decisions, and Qwen call counts; `ocr-reuse.json` reports OCR reuse and
+processing time. Savings depend on visible repeated content. Review the audit
+on a representative pilot, especially handwriting, erasures, and brief content.
+The original and optimization plans are recorded in [docs/plan.md](docs/plan.md).
+
 ## Generate notes with your ChatGPT plan
 
 Set the proxy before online commands. Every app-owned OpenAI request requires it:

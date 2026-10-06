@@ -255,18 +255,28 @@ def _frames(video: Path, out: Path, selections: list[dict]) -> list[dict]:
 def _prepare_visuals(raw_visuals: list[dict], out: Path) -> tuple[list[dict], list[dict]]:
     from PIL import Image
 
-    visuals, crops = [], []
+    visuals, crops, prepared_crops = [], [], set()
     (out / "crops").mkdir(parents=True, exist_ok=True)
     for raw in raw_visuals:
         path = Path(raw["image"])
+        analysis_id = raw.get("analysis_id", raw["id"])
         visual = {"id": raw["id"], "timestamp": raw.get("timestamp"), "image": path.relative_to(out).as_posix(),
                   "sha256": sha256_file(path),
                   "summary": str(raw.get("summary", "")), "kind": raw.get("kind", "other"),
                   "diagram": str(raw.get("diagram", "")), "issues": list(raw.get("issues", [])), "regions": []}
+        if raw.get("analysis_id"):
+            original = Path(raw.get("original_image", raw["image"]))
+            visual.update(analysis_id=analysis_id,
+                          original_image=original.relative_to(out).as_posix(),
+                          original_sha256=sha256_file(original))
         if raw.get("source_id"):
             visual["source_id"] = raw["source_id"]
         regions = raw.get("regions") or [{"kind": "text", "bbox": [0, 0, 1, 1]}]
         with Image.open(path) as image:
+            if raw.get("analysis_id"):
+                from PIL import ImageOps
+
+                image = ImageOps.exif_transpose(image)
             for position, region in enumerate(regions):
                 if not isinstance(region, dict):
                     visual["issues"].append("Модель вернула область без координат и типа.")
@@ -280,29 +290,41 @@ def _prepare_visuals(raw_visuals: list[dict], out: Path) -> tuple[list[dict], li
                     visual["issues"].append("Модель определила пустую область.")
                     continue
                 identifier = f"{visual['id']}_region_{position:03d}"
-                crop_path = out / "crops" / f"{identifier}.png"
-                image.crop((int(left * image.width), int(top * image.height), math.ceil(right * image.width), math.ceil(bottom * image.height))).save(crop_path)
+                analysis_region_id = f"{analysis_id}_region_{position:03d}"
+                crop_path = out / "crops" / f"{analysis_region_id}.png"
+                if analysis_region_id not in prepared_crops:
+                    image.crop((int(left * image.width), int(top * image.height), math.ceil(right * image.width), math.ceil(bottom * image.height))).save(crop_path)
                 kind = region.get("kind", "text")
                 kind = kind if isinstance(kind, str) else "text"
                 digest = sha256_file(crop_path)
                 visual["regions"].append({"id": identifier, "kind": kind, "bbox": [left, top, right, bottom],
                                           "image": crop_path.relative_to(out).as_posix(), "sha256": digest, "text": ""})
-                crops.append({"id": identifier, "kind": kind, "image": str(crop_path.resolve()), "sha256": digest})
+                if raw.get("analysis_id"):
+                    visual["regions"][-1]["analysis_region_id"] = analysis_region_id
+                if analysis_region_id not in prepared_crops:
+                    crops.append({"id": analysis_region_id, "kind": kind, "image": str(crop_path.resolve()), "sha256": digest})
+                    prepared_crops.add(analysis_region_id)
             if not visual["regions"]:
                 identifier = f"{visual['id']}_region_fallback"
-                crop_path = out / "crops" / f"{identifier}.png"
-                image.save(crop_path)
+                analysis_region_id = f"{analysis_id}_region_fallback"
+                crop_path = out / "crops" / f"{analysis_region_id}.png"
+                if analysis_region_id not in prepared_crops:
+                    image.save(crop_path)
                 digest = sha256_file(crop_path)
                 visual["regions"].append({"id": identifier, "kind": "text", "bbox": [0, 0, 1, 1],
                                           "image": crop_path.relative_to(out).as_posix(), "sha256": digest, "text": ""})
-                crops.append({"id": identifier, "kind": "text", "image": str(crop_path.resolve()), "sha256": digest})
+                if raw.get("analysis_id"):
+                    visual["regions"][-1]["analysis_region_id"] = analysis_region_id
+                if analysis_region_id not in prepared_crops:
+                    crops.append({"id": analysis_region_id, "kind": "text", "image": str(crop_path.resolve()), "sha256": digest})
+                    prepared_crops.add(analysis_region_id)
         visuals.append(visual)
     return visuals, crops
 
 
 def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru", start: float = 0.0,
             duration: float | None = None, asr_model: str = ASR_MODEL, vlm_model: str = VLM_MODEL,
-            ocr_model: str = OCR_MODEL) -> Path:
+            ocr_model: str = OCR_MODEL, vision_mode: str | None = None) -> Path:
     video, out = Path(video).resolve(), Path(out).resolve()
     for binary in ("ffmpeg", "ffprobe"):
         if not shutil.which(binary):
@@ -312,10 +334,19 @@ def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru"
         raise ValueError("start must be within the video duration.")
     if duration is not None and (not math.isfinite(duration) or duration <= 0):
         raise ValueError("duration must be positive.")
+    from .vision_mode import resolve_vision_mode
+
+    config = resolve_vision_mode(out, vision_mode)
+    if config["vision_mode"] == "content":
+        from .person_segmentation import check_person_segmentation
+
+        check_person_segmentation()
     end = metadata["duration"] if duration is None else min(metadata["duration"], start + duration)
     out.mkdir(parents=True, exist_ok=True)
     video_hash = sha256_file(video)
     run_inputs = {"video": video_hash, "start": start, "end": end}
+    if config["vision_mode"] == "content":
+        run_inputs["vision"] = config
     source_inputs = {"format": 2, "files": [
         {"path": str(Path(path).resolve()), "sha256": sha256_file(Path(path))} for path in sources]}
     records = _artifact_checkpoint(out, "sources", source_inputs, lambda: import_sources(sources, out),
@@ -340,17 +371,21 @@ def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru"
             images.extend({"id": f"visual_{record['id']}_{position}", "source_id": record["id"], "timestamp": None,
                            "image": str(out / image)} for position, image in enumerate(record["images"])
                           if Path(image).suffix.lower() in (".png", ".jpg", ".jpeg"))
-    raw_visuals = _worker(out, "vision", {"model": vlm_model, "items": images})["items"]
+    visual_settings = config if config["vision_mode"] == "content" else {}
+    raw_visuals = _worker(out, "vision", {"model": vlm_model, "items": images, **visual_settings})["items"]
     visuals, crops = _prepare_visuals(raw_visuals, out)
     resolved_ocr = ocr_model
     if crops and ocr_model == OCR_MODEL:
         destination = out.parent / ".models" / "PaddleOCR-VL-1.6-bf16"
         resolved_ocr = _worker(out, "convert", {"model": ocr_model, "destination": str(destination)})["model"]
-    recognized = _worker(out, "ocr", {"model": resolved_ocr, "items": crops})["items"]
+    recognized = _worker(out, "ocr", {"model": resolved_ocr, "items": crops, **visual_settings})["items"]
     texts = {item["id"]: item["text"] for item in recognized}
     for visual in visuals:
         for region in visual["regions"]:
-            region["text"] = texts.get(region["id"], "")
+            region["text"] = texts.get(region.get("analysis_region_id", region["id"]), "")
+            if visual_settings and not region["text"].strip():
+                visual["issues"].append(
+                    f"OCR вернул пустой ответ для области {region['id']}. Проверить видимое содержимое.")
     records = match_sources(records, visuals)
     warnings = [(visual["id"], description) for visual in visuals for description in visual["issues"]]
     warnings.extend((segment["id"], description) for segment in segments
@@ -368,5 +403,7 @@ def extract(video: Path, sources: list[Path], out: Path, *, language: str = "ru"
                           "clip_start": start, "clip_end": end},
                 "segments": segments, "visuals": visuals, "sources": records, "issues": issues,
                 "models": {"asr": asr_model, "vlm": vlm_model, "ocr": ocr_model, "ocr_runtime": resolved_ocr}}
+    if visual_settings:
+        evidence["visual_processing"] = config
     write_json(out / "evidence.json", evidence)
     return out / "evidence.json"

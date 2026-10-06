@@ -28,6 +28,8 @@ def parser() -> argparse.ArgumentParser:
     extract.add_argument("--start", type=float, default=0)
     extract.add_argument("--duration", type=float, help="Process a pilot interval, in seconds")
     extract.add_argument("--language", default="ru")
+    extract.add_argument("--vision-mode", choices=("content", "baseline"), default=None,
+                         help="Visual grouping mode (new jobs: content; existing jobs keep their mode)")
     notes = commands.add_parser("notes", help="Generate notes or export/import a ChatGPT handoff")
     notes.add_argument("job", type=Path)
     mode = notes.add_mutually_exclusive_group()
@@ -55,6 +57,9 @@ def doctor() -> bool:
     # find_spec on a dotted name imports its parent, so check MLX top-level only.
     packages.update({name: importlib.util.find_spec(name) is not None
                      for name in ("mlx", "mlx_whisper", "mlx_vlm")})
+    if sys.platform == "darwin":
+        packages.update({name: importlib.util.find_spec(name) is not None
+                         for name in ("Vision", "Quartz")})
     tools = {name: shutil.which(name) for name in ("ffmpeg", "ffprobe", "latexmk", "lualatex")}
     tools["libreoffice"] = shutil.which("libreoffice") or shutil.which("soffice")
     app = Path("/Applications/LibreOffice.app/Contents/MacOS/soffice")
@@ -87,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "extract":
             from .extraction import extract
             print(extract(args.video, args.source, args.out, language=args.language,
-                          start=args.start, duration=args.duration))
+                          start=args.start, duration=args.duration, vision_mode=args.vision_mode))
         elif args.command == "notes":
             from .notes import generate_notes
             print(generate_notes(args.job, args.state_dir, imported=args.imported,

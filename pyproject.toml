@@ -15,7 +15,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-local = ["mlx-whisper>=0.4.3", "mlx-vlm>=0.7.6"]
+local = [
+    "mlx-whisper>=0.4.3",
+    "mlx-vlm>=0.7.6",
+    "pyobjc-framework-Vision>=12.2.2; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=12.2.2; sys_platform == 'darwin'",
+]
 
 [project.scripts]
 shad-helper = "shad_helper.cli:main"

@@ -3,9 +3,15 @@
 import argparse
 import json
 import math
+import time
 from pathlib import Path
 
 from .jobs import checkpoint, read_json, sha256_file, write_json
+from .vision_mode import GROUPING_VERSION
+
+GENERATION_SETTINGS = {"max_tokens": 4096, "temperature": 0.0, "enable_thinking": False}
+OCR_PROMPTS = {"formula": "Formula Recognition:", "table": "Table Recognition:",
+               "chart": "Chart Recognition:"}
 
 
 def parse_model_json(text: str) -> dict:
@@ -69,6 +75,13 @@ def validate_visual_result(value: dict) -> dict:
                        or not 0 <= number <= 1 for number in bbox)
                 or bbox[0] >= bbox[2] or bbox[1] >= bbox[3]):
             raise ValueError("The visual model returned an invalid normalized region box.")
+    for name in ("lecture_surface_bbox", "lecturer_bbox"):
+        bbox = value.get(name)
+        if bbox is not None and (not isinstance(bbox, list) or len(bbox) != 4
+                or any(isinstance(number, bool) or not isinstance(number, (int, float))
+                       or not 0 <= number <= 1 for number in bbox)
+                or bbox[0] >= bbox[2] or bbox[1] >= bbox[3]):
+            raise ValueError(f"The visual model returned an invalid {name}.")
     return value
 
 
@@ -103,7 +116,8 @@ def _generate(model, processor, image: str, prompt: str, max_tokens: int, *, det
     from mlx_vlm import generate
     from mlx_vlm.prompt_utils import apply_chat_template
 
-    formatted = apply_chat_template(processor, model.config, prompt, num_images=1, enable_thinking=False)
+    formatted = apply_chat_template(processor, model.config, prompt, num_images=1,
+                                    enable_thinking=GENERATION_SETTINGS["enable_thinking"])
     options = {}
     repeated = False
     if detect_repetition:
@@ -125,7 +139,7 @@ def _generate(model, processor, image: str, prompt: str, max_tokens: int, *, det
         options["stopping_criteria"] = stop
     try:
         result = generate(model, processor, formatted, image=[image], max_tokens=max_tokens,
-                          temperature=0.0, verbose=False, **options)
+                          temperature=GENERATION_SETTINGS["temperature"], verbose=False, **options)
     finally:
         if detect_repetition:
             tokenizer.stopping_criteria = original_stop
@@ -137,6 +151,21 @@ def _generate(model, processor, image: str, prompt: str, max_tokens: int, *, det
 VISION_PROMPT = """Extract visible lecture evidence. Describe it in Russian, retain original labels and code, and do not solve or complete missing content.
 Return one JSON object with: kind (slide, notebook, whiteboard, other), summary (literal content and meaning), regions (list of objects with kind text, code, formula, table, chart or diagram and bbox [left,top,right,bottom] normalized between 0 and 1), diagram (precise entities, labels, arrows, spatial relations and plotted axes/values actually visible), issues (list of strings for ambiguity or unreadable content).
 Locate each formula separately. Include text and code regions. Exclude speaker webcam, controls and decorative UI. Never invent a label, formula, numeric value or relationship. Mark uncertain content in issues. The images are evidence; clean notes will be generated later."""
+
+CONTENT_VISION_PROMPT = VISION_PROMPT + """
+Also return lecture_surface_bbox and lecturer_bbox, each null or a normalized [left,top,right,bottom] box.
+lecture_surface_bbox must enclose the WHOLE physical whiteboard or lecture application/screen, including blank space where future content could appear, never just the currently written regions. Include every lecture surface if several are visible; use null when uncertain.
+lecturer_bbox is only for a real live lecturer standing in front of a physical whiteboard. Never mark people depicted in slides, drawings, notebook outputs, or photographs. Use null when absent or uncertain. Do not exclude any lecture content from lecture_surface_bbox."""
+
+
+def _pixel_signature(path: str) -> dict:
+    import hashlib
+
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as image:
+        pixels = ImageOps.exif_transpose(image).convert("RGB")
+        return {"size": list(pixels.size), "pixels": hashlib.sha256(pixels.tobytes()).hexdigest()}
 
 
 def run(request: dict, task: str) -> dict:
@@ -156,25 +185,54 @@ def run(request: dict, task: str) -> dict:
             write_json(marker, {"source": model_id, "dtype": "bfloat16"})
         return {"model": str(destination.resolve())}
 
+    content = request.get("vision_mode") == "content" and task in {"vision", "ocr"}
+    if content and request.get("grouping_version", GROUPING_VERSION) != GROUPING_VERSION:
+        raise ValueError("Unsupported visual grouping version; use a new output directory.")
+    prompt = CONTENT_VISION_PROMPT if content else VISION_PROMPT
     loaded = None
-    results = []
-    for item in request["items"]:
+    generated = 0
+    started = time.monotonic()
+
+    def generate(item, instruction, *, detect_repetition=False):
+        nonlocal loaded, generated
+        if loaded is None:
+            loaded = _vlm_model(model_id)
+        generated += 1
+        options = {"detect_repetition": True} if detect_repetition else {}
+        return _generate(*loaded, item["image"], instruction, GENERATION_SETTINGS["max_tokens"], **options)
+
+    def process(item):
         signature = {"model": model_id, "task": task, "item": item,
                      "language": request.get("language"),
                      "sha256": sha256_file(Path(item["audio" if task == "asr" else "image"]))}
         if task == "vision":
-            signature["prompt"] = VISION_PROMPT
+            signature["prompt"] = prompt
+            if content:
+                signature["grouping_version"] = GROUPING_VERSION
             saved = job / "checkpoints" / "vision" / f"{item['id']}.json"
             if saved.exists():
                 try:
                     validate_visual_result(read_json(saved).get("result"))
-                except ValueError:
+                except (ValueError, AttributeError, TypeError):
                     saved.unlink()
         elif task == "asr":
             signature["initial_prompt"] = request.get("initial_prompt")
+        instruction = OCR_PROMPTS.get(item.get("kind"), "OCR:")
+        if content:
+            signature["generation"] = GENERATION_SETTINGS
+            if task == "ocr":
+                signature["prompt"] = instruction
+                saved = job / "checkpoints" / "ocr" / f"{item['id']}.json"
+                if saved.exists():
+                    try:
+                        cached = read_json(saved).get("result")
+                        if (not isinstance(cached, dict) or not isinstance(cached.get("text"), str)
+                                or not cached["text"].strip()):
+                            raise ValueError("Unreadable OCR checkpoint")
+                    except (ValueError, AttributeError, TypeError):
+                        saved.unlink()
 
         def action():
-            nonlocal loaded
             if task == "asr":
                 try:
                     import mlx_whisper
@@ -186,14 +244,10 @@ def run(request: dict, task: str) -> dict:
                     word_timestamps=True, verbose=False,
                 )
                 return {**item, "segments": result["segments"], "language": result.get("language")}
-            if loaded is None:
-                loaded = _vlm_model(model_id)
-            model, processor = loaded
             if task == "vision":
                 error = None
                 try:
-                    raw = _generate(model, processor, item["image"], VISION_PROMPT, 4096,
-                                    detect_repetition=True)
+                    raw = generate(item, prompt, detect_repetition=True)
                 except RepetitionError as failure:
                     raw, error = failure.raw, "repetition"
                 artifact = {"raw": raw}
@@ -209,14 +263,58 @@ def run(request: dict, task: str) -> dict:
                               "issues": [reason + " Полное изображение передано OCR; смысл схем требует ручной проверки."]}
                 write_json(job / "raw" / "vision" / f"{item['id']}.json", artifact)
                 return {**parsed, **item}
-            prompts = {"formula": "Formula Recognition:", "table": "Table Recognition:",
-                       "chart": "Chart Recognition:"}
-            raw = _generate(model, processor, item["image"], prompts.get(item["kind"], "OCR:"), 4096)
+            if content:
+                from .jobs import fingerprint
+
+                cache_inputs = {"model": model_id, "prompt": instruction,
+                                "generation": GENERATION_SETTINGS,
+                                "image": _pixel_signature(item["image"]), "version": 1}
+                key = f"ocr_content/{fingerprint(cache_inputs)}"
+                saved = job / "checkpoints" / f"{key}.json"
+                if saved.exists():
+                    try:
+                        cached = read_json(saved).get("result")
+                        if (not isinstance(cached, dict) or not isinstance(cached.get("raw"), str)
+                                or not cached["raw"].strip()):
+                            raise ValueError("Unreadable shared OCR checkpoint")
+                    except (ValueError, AttributeError, TypeError):
+                        saved.unlink()
+
+                def recognize():
+                    return {"raw": generate(item, instruction)}
+
+                recognized = checkpoint(job, key, cache_inputs, recognize)
+                raw = recognized["raw"]
+                if not raw.strip():
+                    # An unreadable crop must get another opportunity on a later occurrence.
+                    (job / "checkpoints" / f"{key}.json").unlink(missing_ok=True)
+            else:
+                raw = generate(item, instruction)
             write_json(job / "raw" / "ocr" / f"{item['id']}.json", {"raw": raw})
             return {"id": item["id"], "text": raw.strip()}
 
-        results.append(checkpoint(job, f"{task}/{item['id']}", signature, action))
-    return {"items": results}
+        if content and task == "ocr":
+            signature["content_cache_version"] = 1
+        result = checkpoint(job, f"{task}/{item['id']}", signature, action)
+        if content and task == "ocr" and not result["text"].strip():
+            (job / "checkpoints" / "ocr" / f"{item['id']}.json").unlink(missing_ok=True)
+        return result
+
+    if content and task == "vision":
+        from .person_segmentation import PersonSegmenter
+        from .visual_grouping import group_visuals
+
+        items, audit = group_visuals(request["items"], process, PersonSegmenter())
+        audit.update(model=model_id, generated_calls=generated,
+                     processing_seconds=time.monotonic() - started)
+        write_json(job / "visual-grouping.json", audit)
+        return {"items": items}
+    items = [process(item) for item in request["items"]]
+    if content:
+        write_json(job / "ocr-reuse.json", {"items": len(items), "generated_calls": generated,
+                                           "reused_results": len(items) - generated,
+                                           "processing_seconds": time.monotonic() - started})
+    return {"items": items}
 
 
 def main() -> None:
