@@ -20,7 +20,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--openai-proxy", help="HTTP/HTTPS proxy URL for OpenAI requests "
                         "(or SHAD_HELPER_OPENAI_PROXY; required for online commands)")
     commands = result.add_subparsers(dest="command", required=True)
-    check = commands.add_parser("doctor", help="Check Python, local packages, and external tools")
+    check = commands.add_parser("doctor", help="Check local dependencies and account-available models")
     check.add_argument("--smoke", type=Path, help="Run all local models on a short video excerpt")
     login = commands.add_parser("login", help="Authorize this local app to use your ChatGPT plan")
     extract = commands.add_parser("extract", help="Extract resumable local lecture evidence")
@@ -41,7 +41,7 @@ def parser() -> argparse.ArgumentParser:
     mode.add_argument("--manual", action="store_true", help="Export handoff without any network calls")
     mode.add_argument("--import", dest="imported", type=Path, help="JSON response or chapter replies folder")
     notes.add_argument("--rebuild", action="store_true", help="Invalidate synthesized note checkpoints")
-    for command in (login, notes):
+    for command in (check, login, notes):
         command.add_argument("--openai-proxy", default=argparse.SUPPRESS,
                              help="HTTP/HTTPS proxy URL for OpenAI requests")
     render = commands.add_parser("render", help="Compile editable LaTeX and create PDF QA images")
@@ -56,7 +56,7 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def doctor() -> bool:
+def doctor(state_dir: Path = Path(".shad-helper/auth"), *, proxy: str | None = None) -> bool:
     packages = {name: importlib.util.find_spec(name) is not None for name in (
         "httpx", "jwt", "pydantic", "fitz", "cv2", "numpy", "PIL", "pptx")}
     # find_spec on a dotted name imports its parent, so check MLX top-level only.
@@ -70,9 +70,37 @@ def doctor() -> bool:
     app = Path("/Applications/LibreOffice.app/Contents/MacOS/soffice")
     if not tools["libreoffice"] and app.exists():
         tools["libreoffice"] = str(app)
+    openai = {"status": "not_checked", "models": [], "default_model": "gpt-6-astra",
+              "default_model_available": None}
+    configured_proxy = os.environ.get("SHAD_HELPER_OPENAI_PROXY") if proxy is None else proxy
+    if not (Path(state_dir) / "credentials.json").is_file():
+        openai["message"] = "Run shad-helper login to authorize ChatGPT plan access."
+    elif not configured_proxy:
+        openai["message"] = "Configure --openai-proxy or SHAD_HELPER_OPENAI_PROXY to check models."
+    elif not packages["httpx"] or not packages["jwt"]:
+        openai["message"] = "Install HTTP/auth dependencies with uv sync before checking models."
+    else:
+        try:
+            from .openai_client import PlanClient
+            client = PlanClient(state_dir, proxy=proxy)
+            openai["default_model"] = client.model
+            openai["models"] = client.models()
+            openai["status"] = "available"
+            openai["default_model_available"] = client.model in openai["models"]
+            if not openai["default_model_available"]:
+                openai["message"] = "The default notes model is unavailable for this account."
+        except ModuleNotFoundError:
+            openai["message"] = "Install HTTP/auth dependencies with uv sync before checking models."
+        except ValueError:
+            openai.update(status="error", message="Invalid OpenAI proxy configuration; use "
+                          "--openai-proxy or SHAD_HELPER_OPENAI_PROXY with an HTTP/HTTPS proxy URL.")
+        except (OSError, RuntimeError):
+            openai.update(status="error", message="Could not check the ChatGPT account model catalog. "
+                          "Verify proxy connectivity and account access; run shad-helper login "
+                          "if needed, then retry.")
     print(json.dumps({"python": sys.version.split()[0], "platform": platform.platform(),
                       "architecture": platform.machine(), "packages": packages,
-                      "tools": tools, "cache": os.environ["HF_HOME"]}, indent=2))
+                      "tools": tools, "cache": os.environ["HF_HOME"], "openai": openai}, indent=2))
     return all(packages.values()) and all(tools[name] for name in
                                           ("ffmpeg", "ffprobe", "latexmk", "lualatex"))
 
@@ -85,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     try:
         if args.command == "doctor":
-            healthy = doctor()
+            healthy = doctor(args.state_dir, proxy=args.openai_proxy)
             if args.smoke:
                 from .extraction import extract
                 extract(args.smoke, [], Path(".shad-helper/smoke"), duration=30)

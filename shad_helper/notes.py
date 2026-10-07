@@ -17,7 +17,7 @@ INSTRUCTIONS = r"""Ты составляешь подробный русский
 речи, OCR и изображения явно отметь неопределенность. Не выдумывай символы,
 подписи, результаты исполнения кода или численные значения графиков.
 Добавленные объяснения обозначай блоками clarification. Неясные утверждения —
-uncertain и открытым issue. Никогда не разрешай существующие review issues.
+uncertain и открытым issue.
 Каждый блок из лекции должен ссылаться на существующие evidence_ids.
 Текст — обычный текст, с допустимой встроенной математикой только в \(...\).
 math — выражение LaTeX без \[\] и без $$; code — точный код без Markdown оград.
@@ -73,7 +73,38 @@ def validate_outline(value: dict, evidence: dict) -> dict:
     return result
 
 
-def chapter_context(evidence: dict, chapter: dict, overlap: float = 60) -> dict:
+def _notes_visual(visual: dict) -> dict:
+    result = {key: value for key, value in visual.items()
+              if key not in {"sha256", "original_sha256", "analysis_model", "analysis_id",
+                             "issues", "selection_issues"}}
+    if "regions" in visual:
+        result["regions"] = [{key: value for key, value in region.items()
+                              if key not in {"sha256", "analysis_region_id", "issues",
+                                             "selection_issues"}}
+                             for region in visual["regions"]]
+    return result
+
+
+def _notes_source(source: dict) -> dict:
+    result = {key: value for key, value in source.items()
+              if key not in {"sha256", "original", "issues", "selection_issues"}}
+    # Notebook image payloads are already extracted to the referenced images.
+    image_mimes = {"image/png", "image/jpeg", "image/svg+xml"}
+    if "outputs" in source:
+        result["outputs"] = [dict(output, data={mime: value for mime, value in output["data"].items()
+                                              if mime not in image_mimes})
+                             if "data" in output else dict(output)
+                             for output in source["outputs"]]
+    if "attachments" in source:
+        result["attachments"] = {name: {mime: value for mime, value in bundle.items()
+                                        if mime not in image_mimes}
+                                 for name, bundle in source["attachments"].items()}
+    return result
+
+
+def chapter_context(evidence: dict, chapter: dict, overlap: float | None = None) -> dict:
+    if overlap is None:
+        overlap = min(60, (chapter["end"] - chapter["start"]) / 4)
     start, end = chapter["start"] - overlap, chapter["end"] + overlap
     segments = [s for s in evidence.get("segments", [])
                 if s["end"] >= start and s["start"] <= end]
@@ -100,8 +131,11 @@ def chapter_context(evidence: dict, chapter: dict, overlap: float = 60) -> dict:
     known = {s["id"] for s in segments} | source_ids | {v["id"] for v in visuals}
     known |= {r["id"] for v in visuals for r in v.get("regions", [])}
     issues = [i for i in evidence.get("issues", []) if known.intersection(i.get("evidence_ids", []))]
-    return {"chapter": chapter, "segments": segments, "visuals": visuals,
-            "sources": sources, "issues": issues}
+    return {"chapter": chapter,
+            "segments": [{key: segment[key] for key in ("id", "start", "end", "text")}
+                         for segment in segments],
+            "visuals": [_notes_visual(visual) for visual in visuals],
+            "sources": [_notes_source(source) for source in sources], "issues": issues}
 
 
 def validate_notes(value: dict, evidence: dict, resolutions: dict | None = None) -> dict:
@@ -129,7 +163,8 @@ def _validate_evidence(notes: dict, evidence: dict, resolutions: dict | None = N
         for visual in chapter_context(evidence, chapter)["visuals"]:
             if visual.get("status") not in {"deferred", "failed"}:
                 continue
-            identifier = f"{chapter['id'][:40]}_visual_gap_{fingerprint(visual['id'])[:12]}"
+            gap = fingerprint((chapter["id"], visual["id"]))[:12]
+            identifier = f"{chapter['id'][:40]}_visual_gap_{gap}"
             if not any(block["id"] == identifier for block in chapter["blocks"]):
                 chapter["blocks"].append({
                     "id": identifier, "kind": "uncertain",
@@ -170,52 +205,33 @@ def _validate_evidence(notes: dict, evidence: dict, resolutions: dict | None = N
     return notes
 
 
+def _context_image_references(context: dict) -> list[dict]:
+    paths = [entry[name] for visual in context["visuals"]
+             for entry in [visual, *visual.get("regions", [])]
+             for name in ("image", "original_image") if entry.get(name)]
+    paths.extend(image for source in context.get("sources", []) for image in source.get("images", []))
+    return [{"image": path} for path in dict.fromkeys(paths)]
+
+
 def _evidence_image_paths(job: Path, context: dict) -> list[Path]:
     images = []
-    for visual in context["visuals"]:
-        paths = [visual["image"]] + [r["image"] for r in visual.get("regions", [])
-                                     if r.get("image") and r.get("kind") in {"formula", "diagram", "chart"}]
-        for relative in paths:
-            path = (job / relative).resolve()
-            if not path.is_relative_to(job.resolve()):
-                raise ValueError("Evidence image lies outside the job directory")
-            if path not in images:
-                if not path.is_file():
-                    raise FileNotFoundError(f"Evidence image is missing: {path}")
-                images.append(path)
+    for reference in _context_image_references(context):
+        path = (job / reference["image"]).resolve()
+        if not path.is_relative_to(job.resolve()):
+            raise ValueError("Evidence image lies outside the job directory")
+        if path not in images:
+            if not path.is_file():
+                raise FileNotFoundError(f"Evidence image is missing: {path}")
+            images.append(path)
     return images
 
 
-def _context_pdf(path: Path, text: str, images: list[Path]) -> None:
-    import fitz
-
-    # Story's font fallback preserves Unicode in the portable audit packet.
-    html = "<html><body><pre style='white-space:pre-wrap;font-size:9pt'>"
-    import html as html_module
-    html += html_module.escape(text) + "</pre></body></html>"
-    story = fitz.Story(html=html)
-    buffer = fitz.DocumentWriter(str(path))
-    more = True
-    while more:
-        rectangle = fitz.Rect(0, 0, 595, 842)
-        device = buffer.begin_page(rectangle)
-        more, _ = story.place(rectangle + (36, 36, -36, -36))
-        story.draw(device)
-        buffer.end_page()
-    buffer.close()
-    with fitz.open(path) as document:
-        for image in images:
-            page = document.new_page()
-            page.insert_text((36, 24), image.name, fontsize=9)
-            page.insert_image(page.rect + (24, 36, -24, -24), filename=str(image))
-        document.save(path.with_suffix(".tmp.pdf"))
-    path.with_suffix(".tmp.pdf").replace(path)
+def _model_context(context: dict) -> dict:
+    return {key: value for key, value in context.items() if key != "issues"}
 
 
-def _chapter_prompt(context: dict, outline: dict, glossary: list[dict]) -> str:
-    from .schemas import LectureNotes
-
-    payload = {"lecture_title": outline["title"], "glossary": glossary, "context": context}
+def _chapter_prompt(context: dict, outline: dict, glossary: list[dict], *, manual: bool = False) -> str:
+    payload = {"lecture_title": outline["title"], "glossary": glossary}
     page_guidance = ("Изображения с page_id показывают итоговое состояние страницы доски за "
                      "интервал page_start–page_end. Кадр может быть снят позже конца главы и "
                      "служит общей визуальной опорой только для этой страницы. Следуй речи "
@@ -227,13 +243,20 @@ def _chapter_prompt(context: dict, outline: dict, glossary: list[dict]) -> str:
                     "не считай отсутствие OCR отсутствием записей и не выдавай конспект за полный.\n"
                     if any(v.get("status") in {"deferred", "failed"}
                            for v in context["visuals"]) else "")
+    if manual:
+        evidence_guidance = ("Материалы главы находятся в приложенном context.json; "
+                             "схема ответа — в response-schema.json. "
+                             "Не включай исходный контекст в ответ.\n")
+    else:
+        payload["context"] = _model_context(context)
+        evidence_guidance = ""
     return ("Составь ровно одну главу с ID, start и end из context.chapter. "
+            "Дай главе тематическое название по материалу ее интервала. "
             "Соседний контекст нужен для понимания; не дублируй его в этой главе.\n"
             + page_guidance
             + gap_guidance
-            + json.dumps(payload, ensure_ascii=False, indent=2)
-            + "\nJSON schema:\n"
-            + json.dumps(LectureNotes.model_json_schema(), ensure_ascii=False, indent=2))
+            + evidence_guidance
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
 def export_handoff(job: Path, evidence: dict, outline: dict) -> Path:
@@ -241,25 +264,36 @@ def export_handoff(job: Path, evidence: dict, outline: dict) -> Path:
 
     folder = job / "handoff"
     folder.mkdir(exist_ok=True)
+    for name in ("evidence.pdf", "evidence.tmp.pdf"):
+        for legacy in folder.glob(f"*/{name}"):
+            legacy.unlink()
     write_json(folder / "response-schema.json", LectureNotes.model_json_schema())
     write_json(folder / "outline.json", outline)
     for chapter in outline["chapters"]:
         part = folder / chapter["id"]
         part.mkdir(exist_ok=True)
         context = chapter_context(evidence, chapter)
-        text = _chapter_prompt(context, outline, outline["glossary"])
-        write_json(part / "context.json", context)
+        text = _chapter_prompt(context, outline, outline["glossary"], manual=True)
+        write_json(part / "context.json", _model_context(context))
         (part / "prompt.txt").write_text(INSTRUCTIONS + "\n" + text, encoding="utf-8")
         transcript = "\n\n".join(f"[{s['id']}] {timestamp(s['start'])}\n{s['text']}"
                                  for s in context["segments"])
         (part / "transcript.txt").write_text(transcript, encoding="utf-8")
-        _context_pdf(part / "evidence.pdf", json.dumps(context, ensure_ascii=False, indent=2),
-                     _evidence_image_paths(job, context))
+        for image in _evidence_image_paths(job, context):
+            destination = part / image.relative_to(job.resolve())
+            if not destination.resolve().is_relative_to(part.resolve()):
+                raise ValueError("Handoff image lies outside the chapter directory")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(image, destination)
     (folder / "README.txt").write_text(
-        "For each chapter, attach evidence.pdf and context.json in ChatGPT and paste prompt.txt.\n"
+        "For each chapter listed in outline.json, attach context.json and response-schema.json\n"
+        "from the handoff folder,\n"
+        "and the image files referenced in its visuals/sources\n"
+        "in ChatGPT, then paste prompt.txt. Images are copied under their existing paths\n"
+        "inside the chapter folder; attach each once, including crops and notebook image assets.\n"
         "Save its JSON response as CHAPTER_ID.json in a replies directory.\n"
         f"Import using: shad-helper notes {job} --import replies/\n"
-        "Evidence PDFs contain audit screenshots; these never belong in the finished notes.\n"
+        "Evidence screenshots never belong in the finished notes.\n"
         "For generated illustrations, use notes/illustrations.json prompts and save each image\n"
         "as FIGURE_ID.png. Import with: shad-helper render JOB --images images/\n",
         encoding="utf-8")
@@ -295,11 +329,64 @@ def _merge_chapters(parts: list[dict], outline: dict, evidence: dict,
     return validate_notes(notes, evidence, resolutions)
 
 
+MAX_CHAPTER_TEXT_BYTES = 120_000
+MAX_CHAPTER_IMAGES = 24
+MIN_CHAPTER_SECONDS = 30
+
+
+def _chapter_budget_error(job: Path, context: dict, outline: dict,
+                          glossary: list[dict]) -> str | None:
+    from .schemas import LectureNotes
+
+    # Conservative local size caps, not a model-specific token calculation.
+    text = INSTRUCTIONS + _chapter_prompt(context, outline, glossary)
+    text += json.dumps(LectureNotes.model_json_schema(), ensure_ascii=False)
+    size = len(text.encode("utf-8"))
+    images = {(job / entry["image"]).resolve()
+              for entry in _context_image_references(context)}
+    if size > MAX_CHAPTER_TEXT_BYTES or len(images) > MAX_CHAPTER_IMAGES:
+        return (f"{size:,} text bytes and {len(images)} images exceed the local notes "
+                f"input budget ({MAX_CHAPTER_TEXT_BYTES:,} bytes, {MAX_CHAPTER_IMAGES} images)")
+    return None
+
+
+def _split_chapter(chapter: dict) -> list[dict] | None:
+    if chapter["end"] - chapter["start"] < 2 * MIN_CHAPTER_SECONDS:
+        return None
+    middle = (chapter["start"] + chapter["end"]) / 2
+    split = []
+    for suffix, start, end in (("a", chapter["start"], middle),
+                               ("b", middle, chapter["end"])):
+        digest = fingerprint((chapter["id"], start, end))[:8]
+        split.append(dict(chapter, id=f"{chapter['id'][:60]}_{suffix}_{digest}",
+                          start=start, end=end))
+    return split
+
+
+def _bounded_outline(job: Path, evidence: dict, outline: dict) -> dict:
+    chapters = []
+
+    def append(chapter):
+        context = chapter_context(evidence, chapter)
+        reason = _chapter_budget_error(job, context, outline, outline["glossary"])
+        split = _split_chapter(chapter) if reason else None
+        if split:
+            print(f"Splitting notes chapter {chapter['id']}: {reason}.", flush=True)
+            for part in split:
+                append(part)
+        else:
+            chapters.append(chapter)
+
+    for chapter in outline["chapters"]:
+        append(chapter)
+    return validate_outline(dict(outline, chapters=chapters), evidence)
+
+
 def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
                    manual: bool = False, client=None, rebuild: bool = False,
                    proxy: str | None = None) -> Path:
     from .rendering import write_project
-    from .schemas import LectureNotes, LectureOutline
+    from .schemas import LectureNotes
 
     job = Path(job).resolve()
     if rebuild:
@@ -308,7 +395,6 @@ def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
     resolutions_file = job / "review-resolutions.json"
     resolutions = read_json(resolutions_file) if resolutions_file.exists() else {}
     outline_file = job / "outline.json"
-    signature = fingerprint(evidence)
     if outline_file.exists():
         saved_outline = read_json(outline_file)
         chapters = saved_outline.get("chapters", [])
@@ -321,10 +407,23 @@ def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
             outline = validate_outline(saved_outline, evidence)
     else:
         outline = default_outline(evidence)
-        write_json(outline_file, outline)
-    handoff = export_handoff(job, evidence, outline)
+    if not imported:
+        outline = _bounded_outline(job, evidence, outline)
+    write_json(outline_file, outline)
+    handoff = job / "handoff"
     if manual:
-        return handoff
+        folder = export_handoff(job, evidence, outline)
+        warnings = [f"{chapter['id']}: {reason}. No evidence was omitted."
+                    for chapter in outline["chapters"]
+                    if (reason := _chapter_budget_error(job, chapter_context(evidence, chapter),
+                                                       outline, outline["glossary"]))]
+        if warnings:
+            reason = "\n".join(warnings)
+            write_json(folder / "status.json", {"status": "manual_required", "reason": reason})
+            print(reason)
+        else:
+            (folder / "status.json").unlink(missing_ok=True)
+        return folder
     if imported:
         imported = Path(imported)
         if imported.is_dir():
@@ -338,59 +437,64 @@ def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
                 {key: c[key] for key in ("id", "title", "start", "end")}
                 for c in notes["chapters"]], "glossary": notes["glossary"]}
             validate_outline(imported_outline, evidence)
+            outline = imported_outline
     else:
         from .auth import PlanAccessError
-        from .openai_client import PlanClient, ResponseError
+        from .openai_client import DEFAULT_REASONING_EFFORT, PlanClient, ResponseError
 
         try:
             client = client or PlanClient(state_dir, proxy=proxy)
-            outline_visuals = [
-                {**{key: v.get(key) for key in ("id", "timestamp", "summary")},
-                 **({key: v[key] for key in ("page_id", "page_start", "page_end")}
-                    if v.get("page_id") else {}),
-                 **({"status": v["status"]} if "status" in v else {})}
-                for v in evidence.get("visuals", []) if v.get("timestamp") is not None]
-            outline_prompt = (
-                "Составь тематический план всей лекции: непрерывные главы до 15 минут, "
-                "покрывающие весь интервал. Сохрани точные границы начала/конца. "
-                "Также дай общий глоссарий обозначений.\n" + json.dumps({
-                    "interval": lecture_bounds(evidence), "segments": evidence["segments"],
-                    "visuals": outline_visuals},
-                    ensure_ascii=False))
-            outline = checkpoint(job, "notes/outline", {"evidence": signature,
-                "instructions": INSTRUCTIONS, "prompt": outline_prompt, "model": client.model,
-                "schema": LectureOutline.model_json_schema()},
-                lambda: validate_outline(client.complete(
-                    INSTRUCTIONS, outline_prompt,
-                    schema=LectureOutline.model_json_schema()), evidence))
-            write_json(outline_file, outline)
-            export_handoff(job, evidence, outline)
             parts = []
             glossary = list(outline["glossary"])
-            for chapter in outline["chapters"]:
+            position = 0
+            while position < len(outline["chapters"]):
+                chapter = outline["chapters"][position]
                 context = chapter_context(evidence, chapter)
+                reason = _chapter_budget_error(job, context, outline, glossary)
+                if reason:
+                    split = _split_chapter(chapter)
+                    if not split:
+                        raise ValueError(f"Chapter {chapter['id']}: {reason}; further time splitting "
+                                         "cannot safely reduce this evidence. No evidence was omitted.")
+                    outline["chapters"][position:position + 1] = split
+                    write_json(outline_file, outline)
+                    continue
                 text = _chapter_prompt(context, outline, glossary)
                 images = _evidence_image_paths(job, context)
-                part = checkpoint(job, f"notes/{chapter['id']}",
-                    {"context": context, "prompt": text, "instructions": INSTRUCTIONS,
-                     "model": client.model, "rebuild": rebuild,
-                     "images": [sha256_file(image) for image in images]},
-                    lambda: _validate_chapter_reply(client.complete(
-                        INSTRUCTIONS, text, images,
-                        LectureNotes.model_json_schema()), evidence, chapter, resolutions))
+                try:
+                    part = checkpoint(job, f"notes/{chapter['id']}",
+                        {"context": context, "prompt": text, "instructions": INSTRUCTIONS,
+                         "model": client.model, "rebuild": rebuild,
+                         "reasoning_effort": DEFAULT_REASONING_EFFORT,
+                         "schema": LectureNotes.model_json_schema(),
+                         "images": [sha256_file(image) for image in images]},
+                        lambda: _validate_chapter_reply(client.complete(
+                            INSTRUCTIONS, text, images,
+                            LectureNotes.model_json_schema()), evidence, chapter, resolutions))
+                except (PlanAccessError, ResponseError) as exc:
+                    if getattr(exc, "code", None) != "context_length_exceeded":
+                        raise
+                    split = _split_chapter(chapter)
+                    if not split:
+                        raise ValueError(f"Chapter {chapter['id']} still exceeds the model context "
+                                         "at the minimum split duration. No evidence was omitted.") from exc
+                    print(f"Context limit reached; splitting notes chapter {chapter['id']}.", flush=True)
+                    outline["chapters"][position:position + 1] = split
+                    write_json(outline_file, outline)
+                    continue
                 parts.append(part)
                 terms = {g["term"]: g for g in glossary}
                 terms.update({g["term"]: g for g in part["glossary"]})
                 glossary = list(terms.values())
+                position += 1
             notes = _merge_chapters(parts, outline, evidence, resolutions)
         except (PlanAccessError, ResponseError, ValueError) as exc:
+            handoff = export_handoff(job, evidence, outline)
             write_json(handoff / "status.json", {"status": "manual_required", "reason": str(exc)})
             print(f"Automatic synthesis unavailable: {exc}\nManual handoff: {handoff}")
             return handoff
     (handoff / "status.json").unlink(missing_ok=True)
-    write_json(outline_file, {"title": notes["title"], "chapters": [
-        {key: chapter[key] for key in ("id", "title", "start", "end")}
-        for chapter in notes["chapters"]], "glossary": notes["glossary"]})
+    write_json(outline_file, outline)
     write_json(job / "notes.json", notes)
     write_json(job / "review.json", {"issues": notes["issues"], "ready": review_ready(notes)})
     payload = dict(notes, evidence_index=evidence_index(evidence))

@@ -30,7 +30,7 @@ def test_shared_analysis_keeps_occurrences_and_prepares_one_canonical_crop(tmp_p
     assert visuals[1]["regions"][0]["analysis_region_id"] == crops[0]["id"]
     assert visuals[1]["regions"][0]["image"] == visuals[0]["regions"][0]["image"]
     assert _evidence_image_paths(tmp_path, {"visuals": visuals}) == [
-        canonical, Path(crops[0]["image"])]
+        canonical, Path(crops[0]["image"]), original]
 
     evidence = {"visuals": visuals, "sources": [], "segments": [], "issues": []}
     context = chapter_context(evidence, {"start": 950, "end": 1200})

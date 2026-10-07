@@ -24,6 +24,12 @@ LibreOffice's standard macOS app location is recognized automatically.
 UV_CACHE_DIR=.cache/uv uv run shad-helper doctor
 ```
 
+When app-owned login credentials and an OpenAI proxy are configured, `doctor`
+also lists the models available to the signed-in ChatGPT account and reports
+whether the default notes model is available. Missing configuration or a catalog
+error is reported separately; the command still completes its local checks and
+keeps their exit status. It does not start login or generate a model response.
+
 The initial model run downloads Whisper large-v3, Qwen3.8-27B-4bit, and
 PaddleOCR-VL-1.6. The Qwen weights alone are approximately 16 GB. Model caches live
 under `.cache/huggingface`; Paddle's BF16 conversion is stored next to the jobs.
@@ -172,7 +178,7 @@ and streamed note generation.
 export SHAD_HELPER_OPENAI_PROXY=http://127.0.0.1:7890
 ```
 
-Alternatively, pass `--openai-proxy http://127.0.0.1:7890` before the command name or after `login`/`notes`.
+Alternatively, pass `--openai-proxy http://127.0.0.1:7890` before the command name or after `doctor`/`login`/`notes`.
 The flag takes precedence over `SHAD_HELPER_OPENAI_PROXY`. HTTP and HTTPS proxies
 are supported, including URL-encoded credentials (`http://user:password@host:port`).
 For an HTTP proxy tunneling HTTPS destinations, keep `http://` in the proxy URL.
@@ -196,21 +202,49 @@ Login registers this app through the official Sign in with ChatGPT flow. It uses
 its own protected credentials in `.shad-helper/auth`, never Codex credentials.
 To change their location, place `--state-dir PATH` before the command name.
 
-The app checks that `gpt-6.1-sol` is available to your signed-in account. Access
+The app checks that `gpt-6-astra` is available to your signed-in account and
+requests `high` reasoning effort for automatic note generation. Access
 depends on eligibility, preview availability, and usage limits; Pro does not
 guarantee access. Inference uses your authorized ChatGPT plan, with no separately
 billed API fallback. Image generation is not supported by this route.
 
-The model creates a complete outline and then chapter-sized notes with a shared
-notation glossary. Core lecture blocks have source references; explanations added
-by the model are marked **Пояснение**, and tentative reconstructions are marked
-**Требует проверки**. Existing extraction issues cannot be cleared by generation.
-Unmatched source material cannot silently become lecture content.
+The app uses the saved `outline.json`, or creates consecutive fifteen-minute
+chapters locally. It sends one chapter at a time, carrying a shared notation
+glossary, without making a whole-lecture outline request. The model writes each
+chapter's title and detailed notes. Speech inputs contain only segment IDs,
+timestamps, and text (`id`, `start`, `end`, `text`). Word timestamps,
+probabilities, transcription diagnostics, and existing extraction issues remain in
+the local extraction files for review; they are not repeated in synthesis inputs.
+Relevant visual evidence and matched source material remain in each chapter.
+
+Before generation or manual export, chapters are split at their time midpoint
+when a request exceeds either 120,000 UTF-8 bytes of serialized text (including
+instructions and the response schema) or 24 unique evidence images. These are
+conservative size estimates, not model token limits. Splitting keeps consecutive
+coverage and stops before creating parts shorter than thirty seconds. Neighboring
+context shrinks with smaller chapters; evidence from each chapter's own interval
+remains included. An explicit `context_length_exceeded` response also triggers a
+bounded split and retry. If persistent visual/source evidence still cannot fit,
+the app exports a manual
+handoff with a warning; it does not omit evidence to meet the budget.
+
+Core lecture blocks have source references; explanations added by the model are
+marked **Пояснение**, and tentative reconstructions are marked **Требует проверки**.
+Existing extraction issues cannot be cleared by generation. Unmatched source
+material cannot silently become lecture content.
+Existing issue records and diagnostic warnings are omitted from both automatic
+requests and manual ChatGPT inputs, then restored locally in the resulting notes
+and review. Visual processing status remains available to distinguish processed
+images from evidence awaiting interpretation. The model can still report new
+uncertainties in its response.
 
 The outputs are `notes.json`, `review.json`, and an editable `notes/` LaTeX project.
 Running `notes` regenerates that project; keep manual TeX edits for the later
 `render` step. `--rebuild` invalidates synthesized-note checkpoints while keeping
 local extraction results.
+The input outline keeps its seed titles and glossary, including any split chapter
+boundaries, so reruns can reuse successful chapter checkpoints. Generated titles
+and the complete glossary are saved in `notes.json`.
 
 ## Manual ChatGPT fallback
 
@@ -221,9 +255,16 @@ also choose the manual path without making any network calls:
 UV_CACHE_DIR=.cache/uv uv run shad-helper notes jobs/lecture-01 --manual
 ```
 
-For each `handoff/chNNN/` directory, attach `evidence.pdf` and `context.json` in
-ChatGPT and paste `prompt.txt`. The PDF deliberately includes original evidence
-images for inspection. Save the JSON reply as `chNNN.json` in a replies directory:
+Use the chapter IDs in `handoff/outline.json`; budget splits may add suffixes to
+an ID. For each listed chapter, attach its `context.json`, the shared
+`handoff/response-schema.json`, and its evidence image files in ChatGPT, then paste
+its `prompt.txt`. The prompt contains instructions rather than a second copy of
+the context JSON. Attach each image once; images are copied into matching relative
+subdirectories beside the JSON so their provenance remains clear. `transcript.txt`
+is an optional readable alternative for inspecting the speech, not another input
+to upload alongside the same transcript in `context.json`. The handoff does not
+render JSON or images into PDFs. Save the JSON reply as `CHAPTER_ID.json` in a
+replies directory:
 
 ```sh
 UV_CACHE_DIR=.cache/uv uv run shad-helper notes jobs/lecture-01 --import replies/
@@ -233,6 +274,14 @@ All expected chapter files must be present. A complete combined response can
 also be imported with `--import response.json`; it uses the same response schema
 and validation as automatic generation. `handoff/response-schema.json` documents
 the format. JSON replies must not have Markdown fences.
+
+Handoff files are exported only for manual mode or an automatic-generation
+fallback. Successful automatic generation and importing replies skip this
+export. Regenerating a handoff removes its obsolete generated evidence PDFs;
+original evidence and finished note PDFs are preserved.
+Run `notes JOB --manual` again to refresh an older handoff whose JSON still
+contains extraction issues or warnings; local evidence and review records remain
+available.
 
 The outline can be edited in `outline.json` before exporting a new handoff.
 Chapters must be consecutive, cover the entire extracted interval, and be at

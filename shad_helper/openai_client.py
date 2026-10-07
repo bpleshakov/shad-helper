@@ -10,13 +10,18 @@ import httpx
 from shad_helper.auth import RESOURCE, PlanAccessError, access_token, http_error
 from shad_helper.network import openai_http_client, resolve_openai_proxy
 
+DEFAULT_MODEL = "gpt-6-astra"
+DEFAULT_REASONING_EFFORT = "high"
+
 # https://developers.openai.com/api/docs/guides/images-vision
 MAX_REQUEST_BYTES = 512_000_000
 MAX_IMAGES = 1_500
 
 
 class ResponseError(RuntimeError):
-    pass
+    def __init__(self, message, *, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 def _strict_schema(value):
@@ -91,7 +96,7 @@ def _stream_text(response):
             if code.startswith(("subscription_sharing_", "chatpass_")) or code in {"server_error", "rate_limit_exceeded", "invalid_api_key", "authentication_error", "permission_denied"}:
                 request_id = response.headers.get("x-request-id") or response.headers.get("openai-request-id")
                 raise PlanAccessError(f"ChatGPT plan request failed: {code}.", code=code, request_id=request_id)
-            raise ResponseError(f"OpenAI response failed: {code}.")
+            raise ResponseError(f"OpenAI response failed: {code}.", code=code)
         elif kind == "response.incomplete":
             raise ResponseError("OpenAI response was incomplete; partial notes were discarded.")
         elif kind == "response.completed":
@@ -110,7 +115,7 @@ def _stream_text(response):
 
 
 class PlanClient:
-    def __init__(self, state_dir: Path, model="gpt-6.1-sol", *, proxy=None, transport=None, token_provider=None):
+    def __init__(self, state_dir: Path, model=DEFAULT_MODEL, *, proxy=None, transport=None, token_provider=None):
         self.state_dir = Path(state_dir)
         self.model = model
         self.proxy = resolve_openai_proxy(proxy)
@@ -138,7 +143,7 @@ class PlanClient:
         if len(images) > MAX_IMAGES:
             raise _image_payload_error()
         content = [{"type": "input_text", "text": text}]
-        body = {"model": self.model, "instructions": instructions, "input": [{"role": "user", "content": content}], "store": False, "stream": True}
+        body = {"model": self.model, "reasoning": {"effort": DEFAULT_REASONING_EFFORT}, "instructions": instructions, "input": [{"role": "user", "content": content}], "store": False, "stream": True}
         if schema is not None:
             body["text"] = {"format": {"type": "json_schema", "name": "lecture_notes", "schema": _strict_schema(schema), "strict": True}}
         estimated_size = len(_serialize(body))
@@ -147,15 +152,28 @@ class PlanClient:
         for image in images:
             image = Path(image)
             mime = mimetypes.guess_type(image.name)[0]
+            rendered = None
+            if mime == "image/svg+xml":
+                import pymupdf
+
+                try:
+                    with (pymupdf.open(image) as vector,
+                          pymupdf.open(stream=vector.convert_to_pdf(), filetype="pdf") as pdf):
+                        rendered = pdf[0].get_pixmap(
+                            matrix=pymupdf.Matrix(2, 2), alpha=False).tobytes("png")
+                except (RuntimeError, ValueError) as exc:
+                    raise ResponseError(f"Cannot render evidence SVG: {image.name}.") from exc
+                mime = "image/png"
             if mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
                 raise ResponseError(f"Unsupported evidence image format: {image.suffix}.")
             # Vision does not receive filenames; make the provenance mapping explicit.
             label = {"type": "input_text", "text": f"Evidence image: {image.name}"}
             item = {"type": "input_image", "image_url": f"data:{mime};base64,", "detail": "high"}
-            estimated_size += len(_serialize([label, item])) - 1 + 4 * ((image.stat().st_size + 2) // 3)
+            image_size = len(rendered) if rendered is not None else image.stat().st_size
+            estimated_size += len(_serialize([label, item])) - 1 + 4 * ((image_size + 2) // 3)
             if estimated_size > MAX_REQUEST_BYTES:
                 raise _image_payload_error()
-            encoded = base64.b64encode(image.read_bytes()).decode("ascii")
+            encoded = base64.b64encode(rendered if rendered is not None else image.read_bytes()).decode("ascii")
             item["image_url"] += encoded
             content.extend([label, item])
         payload = _serialize(body)

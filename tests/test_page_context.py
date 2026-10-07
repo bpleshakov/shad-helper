@@ -25,6 +25,56 @@ def legacy_evidence():
     return evidence([{"id": "slide", "timestamp": 10, "summary": "legacy", "regions": []}])
 
 
+def test_compact_context_preserves_text_visual_outputs_and_uncertainty_without_mutating_evidence():
+    visual = {**page("board", 0, 900, 890), "status": "deferred", "kind": "whiteboard",
+              "diagram": "Nodes A and B", "issues": ["Check formula"], "sha256": "hash",
+              "analysis_id": "previous", "analysis_model": "local-model",
+              "original_image": "frames/original.png", "original_sha256": "original-hash",
+              "regions": [{"id": "formula", "kind": "formula", "text": r"x^2",
+                           "bbox": [0, 0, 1, 1], "image": "crops/formula.png", "sha256": "hash",
+                           "analysis_region_id": "previous_region"}]}
+    data = evidence([visual])
+    data["segments"] = [{"id": "speech", "start": 10, "end": 12, "text": "Full statement",
+                         "words": [{"word": "Full", "probability": 0.2}],
+                         "diagnostics": {"avg_logprob": -2}}]
+    data["issues"] = [{"id": "speech_issue", "evidence_ids": ["speech"],
+                       "description": "Low confidence", "status": "open", "resolution": ""}]
+    data["sources"] = [{"id": "source", "kind": "ipynb", "source": "lecture.ipynb",
+                        "location": "cell 1", "matched_visual_ids": ["board"],
+                        "code": "print(x)", "text": "result", "execution_count": 3,
+                        "images": ["source_assets/output.png", "source_assets/attachment.svg"],
+                        "sha256": "hash", "original": "source_originals/notebook.ipynb",
+                        "outputs": [{"output_type": "display_data", "data": {
+                            "image/png": "encoded", "image/jpeg": "encoded",
+                            "image/svg+xml": "<svg/>", "text/latex": r"x^2",
+                            "application/json": {"value": 3}}},
+                            {"output_type": "stream", "name": "stdout", "text": "result"}],
+                        "attachments": {"figure.svg": {"image/svg+xml": "<svg/>",
+                                                        "text/plain": "Figure caption"}}}]
+    original = json.dumps(data, sort_keys=True)
+    chapter = {"id": "ch001", "start": 0, "end": 900}
+    context = notes.chapter_context(data, chapter)
+    assert context["segments"] == [{"id": "speech", "start": 10, "end": 12,
+                                    "text": "Full statement"}]
+    assert context["issues"] == data["issues"]
+    assert context["visuals"] == [{"id": "board", "timestamp": 890, "page_id": "page_board",
+                                   "page_start": 0, "page_end": 900, "image": "board.png",
+                                   "summary": "Итог страницы", "status": "deferred",
+                                   "kind": "whiteboard", "diagram": "Nodes A and B",
+                                   "original_image": "frames/original.png", "regions": [
+                                       {"id": "formula", "kind": "formula", "text": r"x^2",
+                                        "bbox": [0, 0, 1, 1], "image": "crops/formula.png"}]}]
+    source = context["sources"][0]
+    assert source["code"] == "print(x)" and source["text"] == "result"
+    assert source["execution_count"] == 3 and source["images"] == data["sources"][0]["images"]
+    assert source["outputs"][0]["data"] == {"text/latex": r"x^2", "application/json": {"value": 3}}
+    assert source["outputs"][1] == data["sources"][0]["outputs"][1]
+    assert source["attachments"] == {"figure.svg": {"text/plain": "Figure caption"}}
+    assert "sha256" not in source and "original" not in source
+    assert json.dumps(data, sort_keys=True) == original
+    assert evidence_index(context).keys() == evidence_index(data).keys()
+
+
 def test_long_page_final_image_serves_earlier_chapter_and_only_its_matched_sources():
     first = page("first", 0, 1200, 1100)
     future = page("future", 1200, 1800, 1700)
@@ -71,20 +121,22 @@ def test_slide_after_page_can_carry_forward_and_ordinary_overlap_is_retained():
 
     data["visuals"].extend([{"id": "near_slide", "timestamp": 770},
                             {"id": "near_notebook", "timestamp": 1005}])
-    context = notes.chapter_context(data, {"start": 800, "end": 950})
+    context = notes.chapter_context(data, {"start": 800, "end": 950}, overlap=60)
     assert [v["id"] for v in context["visuals"]] == ["board", "near_slide", "near_notebook"]
 
 
-def test_legacy_context_citations_and_prompt_bytes_stay_unchanged():
+def test_legacy_context_citations_remain_and_prompt_contains_context_once_without_schema():
     context = notes.chapter_context(legacy_evidence(), {"id": "ch001", "start": 0, "end": 900})
     assert [v["id"] for v in context["visuals"]] == ["slide"]
     assert evidence_index(context)["slide"] == "Видео 00:00:10"
     prompt = notes._chapter_prompt(context, {"title": "Lecture"}, [])
-    # Captured before the page policy was implemented.
-    assert hashlib.sha256(prompt.encode()).hexdigest() == (
-        "dfd9479247a538f1bdfba4179e5b2ab61f385ce09dbf34a02681b9fdeaccba4f")
+    payload = json.loads(prompt.rsplit("\n", 1)[1])
+    assert payload == {"lecture_title": "Lecture", "glossary": [],
+                       "context": notes._model_context(context)}
+    assert prompt.count('"context":') == 1
+    assert "JSON schema" not in prompt and '"properties"' not in prompt
     assert hashlib.sha256(notes.INSTRUCTIONS.encode()).hexdigest() == (
-        "b9625fa22dfbb4d2853e0ebb7cabf711afe29781cdce01f57d3f12705c9c54f1")
+        "11f98c3140abd85695df9925eeb9fbe00926d13d36b5b0fe8d324a6a6df1a047")
 
 
 def test_page_guidance_is_shared_by_manual_handoff_and_chapter_prompt(tmp_path, monkeypatch):
@@ -96,9 +148,11 @@ def test_page_guidance_is_shared_by_manual_handoff_and_chapter_prompt(tmp_path, 
     assert "Кадр может быть снят позже конца главы" in prompt
     assert "не переноси содержание следующей страницы" in prompt
     monkeypatch.setattr(notes, "_evidence_image_paths", lambda *args: [])
-    monkeypatch.setattr(notes, "_context_pdf", lambda *args: None)
     folder = notes.export_handoff(tmp_path, data, outline)
-    assert (folder / chapter["id"] / "prompt.txt").read_text() == notes.INSTRUCTIONS + "\n" + prompt
+    manual = notes._chapter_prompt(context, outline, [], manual=True)
+    assert (folder / chapter["id"] / "prompt.txt").read_text() == notes.INSTRUCTIONS + "\n" + manual
+    assert "Кадр может быть снят позже конца главы" in manual
+    assert "context.json" in manual and '"visuals"' not in manual
     saved = read_json(folder / chapter["id"] / "context.json")
     assert saved["visuals"][0]["timestamp"] == 1700
     assert saved["visuals"][0]["page_start"] == 0
@@ -128,7 +182,7 @@ def test_automatic_chapter_uses_the_common_consolidated_page_prompt(tmp_path, mo
     write_json(tmp_path / "evidence.json", data)
     outline = notes.default_outline(data)
     client = Mock(model="fake")
-    client.complete.side_effect = [outline, OutlineCaptured]
+    client.complete.side_effect = OutlineCaptured
     monkeypatch.setattr(notes, "export_handoff", lambda *args: tmp_path / "handoff")
     monkeypatch.setattr(notes, "_evidence_image_paths", lambda *args: [])
     with pytest.raises(OutlineCaptured):
@@ -139,23 +193,22 @@ def test_automatic_chapter_uses_the_common_consolidated_page_prompt(tmp_path, mo
 
 
 @pytest.mark.parametrize("pages", [False, True])
-def test_automatic_outline_includes_page_intervals_only_when_available(tmp_path, monkeypatch, pages):
+def test_automatic_chapter_includes_page_intervals_only_when_available(tmp_path, monkeypatch, pages):
     data = evidence([page("board", 0, 1800, 1700)]) if pages else legacy_evidence()
     write_json(tmp_path / "evidence.json", data)
     client = Mock(model="fake")
     client.complete.side_effect = OutlineCaptured
     monkeypatch.setattr(notes, "export_handoff", lambda *args: tmp_path / "handoff")
+    monkeypatch.setattr(notes, "_evidence_image_paths", lambda *args: [])
     with pytest.raises(OutlineCaptured):
         notes.generate_notes(tmp_path, tmp_path / "state", client=client)
     prompt = client.complete.call_args.args[1]
-    visual = json.loads(prompt.split("\n", 1)[1])["visuals"][0]
+    visual = json.loads(prompt.rsplit("\n", 1)[1])["context"]["visuals"][0]
     if pages:
         assert visual["page_id"] == "page_board"
         assert (visual["page_start"], visual["page_end"], visual["timestamp"]) == (0, 1800, 1700)
     else:
-        assert visual == {"id": "slide", "timestamp": 10, "summary": "legacy"}
-        assert hashlib.sha256(prompt.encode()).hexdigest() == (
-            "6eff73de98567bb099b2160ad1c7f9d4f1b1ad7e7ad653b199f16528a08ad428")
+        assert visual == {"id": "slide", "timestamp": 10, "summary": "legacy", "regions": []}
 
 
 def test_grouping_alias_keeps_own_page_interval_and_clears_untrusted_canonical_fields(tmp_path):

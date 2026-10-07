@@ -195,14 +195,15 @@ class NotesValidationTests(unittest.TestCase):
             response["chapters"][0]["blocks"][0]["evidence_ids"] = ["s1"]
             response_file = job / "response.json"
             write_json(response_file, response)
-            with patch.dict(os.environ, {"SHAD_HELPER_OPENAI_PROXY": ""}), \
-                    patch("shad_helper.notes._context_pdf") as pdf:
+            with patch.dict(os.environ, {"SHAD_HELPER_OPENAI_PROXY": ""}):
                 folder = generate_notes(job, job / "auth", manual=True)
                 self.assertEqual(folder, job / "handoff")
                 self.assertTrue((folder / "ch001/prompt.txt").exists())
-                self.assertTrue(pdf.called)
+                self.assertFalse(list(folder.rglob("*.pdf")))
                 write_json(folder / "status.json", {"status": "manual_required"})
-                path = generate_notes(job, job / "auth", imported=response_file)
+                with patch("shad_helper.notes.export_handoff") as export:
+                    path = generate_notes(job, job / "auth", imported=response_file)
+                export.assert_not_called()
                 self.assertTrue(path.exists())
                 self.assertTrue((job / "notes.json").exists())
                 self.assertTrue(read_json(job / "review.json")["ready"])
@@ -219,13 +220,14 @@ class NotesValidationTests(unittest.TestCase):
             data["visuals"], data["sources"], data["issues"] = [], [], []
             write_json(job / "evidence.json", data)
             with patch.dict(os.environ, {"SHAD_HELPER_OPENAI_PROXY": ""}), \
-                    patch("shad_helper.notes._context_pdf"), \
                     patch("shad_helper.network.httpx.Client") as client:
                 folder = generate_notes(job, job / "auth")
             client.assert_not_called()
             status = read_json(folder / "status.json")
             self.assertEqual(status["status"], "manual_required")
             self.assertIn("--openai-proxy", status["reason"])
+            self.assertTrue((folder / "ch001/context.json").exists())
+            self.assertFalse(list(folder.rglob("*.pdf")))
 
 
 if __name__ == "__main__":

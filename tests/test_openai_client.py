@@ -65,7 +65,7 @@ def _client_module():
             calls.append(("GET", url, kwargs))
             if module.network_error is not None:
                 raise module.network_error
-            return _Response(catalog={"models": [{"slug": "gpt-6.1-sol", "visibility": "list"},
+            return _Response(catalog={"models": [{"slug": "gpt-6-astra", "visibility": "list"},
                 {"slug": "hidden", "visibility": "hide"}]})
 
         def stream(self, method, url, **kwargs):
@@ -140,7 +140,7 @@ class ClientStdlibTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(module.client_options), 1)
         self.assertEqual(module.client_options[0]["proxy"], proxy)
-        client._available_models = ["gpt-6.1-sol"]
+        client._available_models = ["gpt-6-astra"]
         with self.assertRaisesRegex(module.PlanAccessError, "connection was interrupted"):
             client.complete("Instructions", "Text")
         self.assertEqual([item[0] for item in calls], ["GET", "POST"])
@@ -200,12 +200,13 @@ class ClientStdlibTests(unittest.TestCase):
             image.write_bytes(b"original-image-bytes")
             client = module.PlanClient(Path(directory), token_provider=lambda: "offline-token")
             self.assertEqual(client.complete("Notes instructions", "Русская лекция", [image]), {})
-            self.assertEqual(client.models(), ["gpt-6.1-sol"])
+            self.assertEqual(client.models(), ["gpt-6-astra"])
             method, url, request = next(call for call in reversed(calls) if call[0] == "POST")
             self.assertEqual((method, url), ("POST", "https://api.openai.com/v1/responses"))
             self.assertEqual(request["headers"]["Content-Type"], "application/json")
             body = json.loads(request["content"])
-            self.assertEqual(body["model"], "gpt-6.1-sol")
+            self.assertEqual(body["model"], "gpt-6-astra")
+            self.assertEqual(body["reasoning"], {"effort": "high"})
             self.assertFalse(body["store"])
             self.assertTrue(body["stream"])
             content = body["input"][0]["content"]
@@ -240,11 +241,11 @@ class ClientStdlibTests(unittest.TestCase):
     def test_unavailable_model_and_invalid_json_never_return_notes(self):
         module, calls = _client_module()
         client = module.PlanClient(Path("."), token_provider=lambda: "offline-token")
-        client._available_models = []
+        client._available_models = ["gpt-6.1-sol"]
         with self.assertRaisesRegex(module.PlanAccessError, "unavailable"):
             client.complete("Instructions", "Text")
         self.assertEqual(calls, [])
-        client._available_models = ["gpt-6.1-sol"]
+        client._available_models = ["gpt-6-astra"]
         for output, message in [("not JSON", "invalid notes JSON"), ("[]", "JSON object")]:
             module.response_events = [_completed(output)]
             with self.subTest(output=output), self.assertRaisesRegex(module.ResponseError, message):
@@ -285,7 +286,7 @@ if _FULL_DEPS:
             assert request.headers["Authorization"] == "Bearer test-plan-token"
             if request.url.path == "/v1/models":
                 return httpx.Response(200, json={"models": models if models is not None else [
-                    {"slug": "gpt-6.1-sol", "visibility": "list"}, {"slug": "hidden", "visibility": "hide"}]})
+                    {"slug": "gpt-6-astra", "visibility": "list"}, {"slug": "hidden", "visibility": "hide"}]})
             assert str(request.url) == "https://api.openai.com/v1/responses"
             return httpx.Response(status, text=stream, headers={"content-type": "text/event-stream"})
 
@@ -343,7 +344,8 @@ if _FULL_DEPS:
         client, requests = client_for(tmp_path, sse({"type": "response.output_text.delta", "delta": '{"notes":'}, completed('{"notes":"Привет"}')))
         assert client.complete("Return notes JSON.", "Lecture text.", [image], schema) == {"notes": "Привет"}
         body = json.loads(requests[-1].content)
-        assert body["model"] == "gpt-6.1-sol"
+        assert body["model"] == "gpt-6-astra"
+        assert body["reasoning"] == {"effort": "high"}
         assert body["store"] is False and body["stream"] is True
         assert body["instructions"] == "Return notes JSON."
         assert isinstance(body["input"], list)
@@ -352,7 +354,36 @@ if _FULL_DEPS:
         assert body["input"][0]["content"][2]["image_url"].startswith("data:image/png;base64,")
         assert body["text"]["format"]["schema"] == schema
         assert not set(body) & {"tools", "max_output_tokens", "previous_response_id", "background", "temperature"}
-        assert client.models() == ["gpt-6.1-sol"]
+        assert client.models() == ["gpt-6-astra"]
+
+
+    def test_svg_evidence_is_rendered_without_changing_source_or_provenance(tmp_path, monkeypatch):
+        pymupdf = pytest.importorskip("pymupdf")
+        image = tmp_path / "notebook-chart.svg"
+        original = (b'<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300">'
+                    b'<rect width="400" height="300" fill="white"/>'
+                    b'<path d="M20 280 L200 20 L380 280" fill="none" stroke="blue"/>'
+                    b'<text x="20" y="150" font-size="20">x+y=1</text></svg>')
+        image.write_bytes(original)
+        client, requests = client_for(tmp_path, sse(completed("{}")))
+        assert client.complete("Instructions", "Lecture text", [image]) == {}
+        body = json.loads(requests[-1].content)
+        content = body["input"][0]["content"]
+        assert content[1] == {"type": "input_text", "text": "Evidence image: notebook-chart.svg"}
+        assert content[2]["image_url"].startswith("data:image/png;base64,")
+        rendered = base64.b64decode(content[2]["image_url"].split(",", 1)[1])
+        assert rendered.startswith(b"\x89PNG\r\n\x1a\n")
+        raster = pymupdf.Pixmap(rendered)
+        assert (raster.width, raster.height) == (800, 600)
+        assert image.read_bytes() == original
+
+        # The limit uses rasterized bytes, including base64 overhead, rather than SVG size.
+        monkeypatch.setattr(openai_client, "MAX_REQUEST_BYTES", len(requests[-1].content) - 1)
+        count = len(requests)
+        with pytest.raises(ResponseError, match="512 MB"):
+            client.complete("Instructions", "Lecture text", [image])
+        assert len(requests) == count
+        assert image.read_bytes() == original
 
 
     def test_oversized_image_count_never_makes_network_requests(tmp_path):
@@ -419,7 +450,7 @@ if _FULL_DEPS:
 
 
     def test_unavailable_account_model_does_not_call_inference(tmp_path):
-        client, requests = client_for(tmp_path, "", models=[{"slug": "another-model", "visibility": "list"}])
+        client, requests = client_for(tmp_path, "", models=[{"slug": "gpt-6.1-sol", "visibility": "list"}])
         with pytest.raises(PlanAccessError, match="unavailable"):
             client.complete("Instructions", "Lecture text")
         assert len(requests) == 1
@@ -439,6 +470,20 @@ if _FULL_DEPS:
         client, _ = client_for(tmp_path, sse(*events))
         with pytest.raises(error, match=message):
             client.complete("Instructions", "Lecture text")
+
+
+    @pytest.mark.parametrize("event", [
+        {"type": "error", "code": "context_length_exceeded"},
+        {"type": "response.failed", "response": {
+            "error": {"code": "context_length_exceeded"}}},
+    ])
+    def test_stream_context_limit_preserves_code_for_chapter_retry(tmp_path, event):
+        partial = {"type": "response.output_text.delta", "delta": '{"partial":true}'}
+        client, requests = client_for(tmp_path, sse(partial, event))
+        with pytest.raises(ResponseError, match="context_length_exceeded") as caught:
+            client.complete("Instructions", "Lecture text")
+        assert caught.value.code == "context_length_exceeded"
+        assert [request.url.path for request in requests] == ["/v1/models", "/v1/responses"]
 
 
     def test_done_marker_is_not_success(tmp_path):
@@ -463,7 +508,7 @@ if _FULL_DEPS:
     def test_http_eligibility_error_retains_code_and_request_id(tmp_path):
         def handle(request):
             if request.url.path.endswith("models"):
-                return httpx.Response(200, json={"models": [{"slug": "gpt-6.1-sol", "visibility": "list"}]})
+                return httpx.Response(200, json={"models": [{"slug": "gpt-6-astra", "visibility": "list"}]})
             return httpx.Response(403, json={"error": {"code": "subscription_sharing_user_not_eligible"}}, headers={"x-request-id": "request-1"})
 
         client = PlanClient(tmp_path, transport=httpx.MockTransport(handle), token_provider=lambda: "token")
