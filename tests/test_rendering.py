@@ -66,7 +66,35 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("Пояснение", chapter)
         self.assertEqual((root / "code/code-1.txt").read_text(), self.notes["chapters"][0]["blocks"][2]["content"])
         self.assertEqual(len(manifest["review"]), 2)
-        self.assertIn("Аудио 00:01:05", chapter)
+
+    def test_evidence_and_review_metadata_do_not_add_pdf_footnotes_or_appendix(self):
+        for block in self.notes["chapters"][0]["blocks"]:
+            block["evidence_ids"] = ["ev-1"]
+        root, manifest = self.project()
+        rendering._validate_project(root, manifest)
+        for relative in manifest["tex_files"]:
+            source = (root / relative).read_text()
+            self.assertNotIn(r"\footnote", source)
+            self.assertNotIn("Источники:", source)
+            self.assertNotIn("Аудио 00:01:05", source)
+            self.assertNotIn("Вопросы и замечания", source)
+        self.assertFalse((root / "review.tex").exists())
+        self.assertNotIn("review.tex", manifest["tex_files"])
+        self.assertNotIn(r"\input{review.tex}", (root / "main.tex").read_text())
+        self.assertEqual(manifest["issues"], self.notes["issues"])
+        self.assertTrue(manifest["draft"])
+        self.assertIn("Ожидание", (root / "main.tex").read_text())
+        self.assertEqual([block["evidence_ids"] for block in self.notes["chapters"][0]["blocks"]],
+                         [["ev-1"]] * 6)
+
+    def test_regeneration_removes_obsolete_review_appendix(self):
+        root, _ = self.project()
+        (root / "review.tex").write_text(r"\section{Вопросы и замечания}")
+        root, manifest = self.project()
+        self.assertFalse((root / "review.tex").exists())
+        self.assertNotIn("review.tex", manifest["tex_files"])
+        self.assertNotIn(r"\input{review.tex}", (root / "main.tex").read_text())
+        rendering._validate_project(root, manifest)
 
     def test_invalid_inline_math_is_blocked(self):
         for content in (r"Не закрыто \(x", r"Опасно \(\input{secret}\)"):
@@ -74,6 +102,16 @@ class RenderingTests(unittest.TestCase):
                 self.notes["chapters"][0]["blocks"][0]["content"] = content
                 with self.assertRaises(rendering.RenderError):
                     self.project()
+
+    def test_function_colon_is_supported_in_inline_and_display_math(self):
+        expression = r"f\colon \mathbb{R} \to \mathbb{R}"
+        self.notes["chapters"][0]["blocks"][0]["content"] = "Функция \\(" + expression + r"\)."
+        self.notes["chapters"][0]["blocks"][1]["content"] = expression
+        root, manifest = self.project()
+        rendering._validate_project(root, manifest)
+        chapter = (root / "chapters/chapter-1.tex").read_text()
+        self.assertIn(r"\(" + expression + r"\)", chapter)
+        self.assertIn("\\[\n" + expression + "\n\\]", chapter)
 
     def test_inner_math_environments_are_wrapped_but_display_environments_are_not(self):
         inner = {
@@ -219,9 +257,9 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(manifest["issues"], self.notes["issues"])
         self.assertTrue(manifest["draft"])
         self.assertEqual([item["id"] for item in manifest["review"]], ["uncertain-1"])
-        appendix = (root / "review.tex").read_text()
-        self.assertIn("Решено", appendix)
-        self.assertIn(r"Уточнено: \(i = 1\).", appendix)
+        self.assertFalse((root / "review.tex").exists())
+        self.assertNotIn("review.tex", manifest["tex_files"])
+        self.assertNotIn(r"\input{review.tex}", main_path.read_text())
         self.assertEqual(main_path.read_text(), original_main)
         for path, content in edited.items():
             self.assertEqual(path.read_bytes(), content)
@@ -283,6 +321,7 @@ class RenderingTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("latexmk") and shutil.which("lualatex") and importlib.util.find_spec("pymupdf"), "LuaLaTeX, latexmk, and PyMuPDF are required")
     def test_actual_cyrillic_math_diagram_code_pdf_and_qa(self):
+        self.notes["chapters"][0]["blocks"][1]["content"] = r"f\colon \mathbb{R} \to \mathbb{R},\quad x \mapsto x^2"
         self.project()
         pdf = rendering.render(self.job)
         self.assertGreater(pdf.stat().st_size, 1000)
@@ -290,6 +329,15 @@ class RenderingTests(unittest.TestCase):
         report = json.loads((pdf.parent / "render-report.json").read_text())
         self.assertEqual(report["missing_fonts"], [])
         self.assertEqual(report["missing_glyphs"], [])
+        import pymupdf
+        with pymupdf.open(pdf) as document:
+            text = "\n".join(page.get_text() for page in document)
+        self.assertIn("Случайные величины", text)
+        self.assertIn("Проверьте индекс.", text)
+        self.assertNotIn("Источники:", text)
+        self.assertNotIn("Аудио 00:01:05", text)
+        self.assertNotIn("Вопросы и замечания", text)
+        self.assertNotIn("Неясный индекс", text)
 
 
 if __name__ == "__main__":

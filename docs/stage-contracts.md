@@ -43,7 +43,9 @@ support extraction and resume. Transcript copies support inspection. The handoff
 files provide an alternative way to obtain the same note response format.
 
 Review is optional in the command sequence. Open issues do not prevent rendering;
-they produce a draft footer and remain visible in the review appendix.
+they produce a draft footer and remain available in the review JSON files and
+the `review` command. The PDF contains no review appendix or audio source
+footnotes.
 Extraction warnings are separate informational data. Notes ignore them without
 requiring a resolution or an acknowledgment. A note issue instead records a
 missing explanation, formula detail, or other uncertainty discovered during
@@ -87,7 +89,6 @@ JOB/
 └── notes/
     ├── project.json
     ├── main.tex
-    ├── review.tex
     ├── chapters/ch001.tex
     ├── figures/diagram-ch001_diagram.tex      # diagram blocks only
     ├── code/ch001_code.txt                    # code blocks only
@@ -800,8 +801,14 @@ minimum on an original short recording or an imported chapter.
 
 Preparation persists the split outline. During automatic generation, the same
 check repeats with the glossary accumulated from earlier replies. A typed
-`context_length_exceeded` model failure also triggers splitting. Other model
-errors do not trigger this retry.
+`context_length_exceeded` model failure also triggers splitting immediately,
+instead of retrying the same input.
+
+Other chapter request failures and invalid replies get up to three retries after
+the initial attempt, with waits of 5, 10, and 20 seconds. Each retry uses the same
+chapter, context, glossary, instructions, and response schema. Only a validated
+successful reply is checkpointed. Completed chapters are reused; exhausting all
+four attempts exports the manual handoff with the final failure in `status.json`.
 
 If time splitting cannot reduce an oversized input, all speech is retained in
 the manual handoff and `status.json` explains the failure. Import mode skips
@@ -1147,10 +1154,10 @@ issue. Unknown issue IDs and blank explanations are rejected.
 Recording a resolution does not transcribe audio again or correct note content
 automatically. Correct the affected note content explicitly, or correct evidence
 and regenerate notes when speech is wrong. When the LaTeX project is bound to the
-current clean evidence fingerprint, resolving an issue refreshes `review.tex`,
-the marked footer in `main.tex`, and
-`project.json`, preserving chapter, diagram, and code edits. If the project was
-already stale, resolution is saved but project refresh is deferred until notes
+current clean evidence fingerprint, resolving an issue refreshes the marked
+footer in `main.tex` and `project.json`, preserving chapter, diagram, and code
+edits. If the project was already stale, resolution is saved but project refresh
+is deferred until notes
 are regenerated or imported.
 
 ## Validated notes to LaTeX
@@ -1158,9 +1165,11 @@ are regenerated or imported.
 **Producer:** `shad_helper.rendering.write_project`, called after successful
 synthesis or import. **Consumer:** `render`, with optional human source edits.
 
-Generation computes a temporary `evidence_index` mapping each segment ID to
-`Аудио HH:MM:SS`. This mapping produces source footnotes and is not persisted
-in `notes.json`. Footnotes contain timestamp labels, not embedded audio.
+The project writer receives the validated notes directly. `evidence_index` is
+used internally to validate source citations; it is neither persisted in
+`notes.json` nor passed to the project writer. Block and issue `evidence_ids`
+remain in the JSON contracts for validation and review, but produce no audio
+source footnotes in the PDF. Review issues are not printed as an appendix.
 
 Generating or importing notes rewrites generated source paths. Rendering
 compiles the existing project and preserves source edits. To edit content, use
@@ -1178,7 +1187,6 @@ The complete manifest shape is:
   "draft": true,
   "tex_files": [
     "main.tex",
-    "review.tex",
     "chapters/ch001.tex"
   ],
   "code_files": [],
@@ -1205,10 +1213,10 @@ The complete manifest shape is:
 | --- | --- | --- |
 | `version` | integer | Manifest format; rendering and review refresh require `2` |
 | `draft` | boolean | Whether generation found review flags |
-| `tex_files` | array of relative paths | Declared TeX sources, including `main.tex` and `review.tex` |
+| `tex_files` | array of relative paths | Declared TeX sources, including `main.tex`, chapters, and any diagrams |
 | `code_files` | array of relative paths | Declared verbatim code assets under `code/` |
 | `review` | array of `{id, description}` | Uncertain blocks followed by unresolved issues |
-| `issues` | array of full review issues | Review appendix state, including resolved issues |
+| `issues` | array of full review issues | Review metadata, including resolved issues; not printed in the PDF |
 | `evidence_fingerprint` | string or null | Fingerprint of complete evidence when the project was written |
 
 Normal synthesis has evidence and writes a fingerprint string. The low-level
@@ -1222,7 +1230,8 @@ the renderer also derives its report's draft flag from the list.
 The writer appends diagram files and chapter files while traversing the
 chapters; consumers must use the manifest rather than assume a sorted file
 list. A regenerated project may leave obsolete files on disk. Only declared
-files belong to the current compilation contract.
+files belong to the current compilation contract. Regeneration removes the
+obsolete generator-owned `review.tex` from earlier projects.
 
 The manifest has no separate Pydantic model. Version, path confinement,
 declared references, and source restrictions are checked during rendering.
@@ -1239,7 +1248,7 @@ This is the LuaLaTeX entry point. It contains:
 4. Document start, title page content, table of contents, and a new page.
 5. `\input{chapters/<chapter ID>.tex}` entries in note order.
 6. An inline glossary section when terms exist.
-7. `\input{review.tex}` and document end.
+7. Document end.
 
 The generated class is `article`, A4, 11 pt, with 23 mm margins. Text fonts are
 `CMU Serif` and `CMU Typewriter Text`; mathematics uses `Latin Modern Math`.
@@ -1261,8 +1270,7 @@ when editing `main.tex` so a later resolution can refresh the footer.
 
 Each chapter file contains a section heading, a human-readable audio interval,
 then blocks in their original order. Ordinary text is escaped for LaTeX.
-Supported inline math is retained. Each cited block receives a footnote listing
-its source timestamps.
+Supported inline math is retained. Source citations do not produce footnotes.
 
 A generated chapter excerpt is:
 
@@ -1271,7 +1279,7 @@ A generated chapter excerpt is:
 
 \noindent\textit{Аудио: 00:30:00 - 00:32:00}\par
 
-Событие \(A\) имеет вероятность \(p\).\footnote{Источники: Аудио 00:30:00}
+Событие \(A\) имеет вероятность \(p\).
 ~~~
 
 Chapter files contain body content rather than their own document preamble.
@@ -1284,10 +1292,9 @@ There is one file per diagram block, named `diagram-<block ID>.tex`. Its content
 is UTF-8 TeX for an inline TikZ picture, optionally containing PGFPlots axes,
 expressions, and literal coordinates. It has no independent JSON metadata.
 
-The chapter wraps the diagram reference in a `figure`, centers it, writes
-the escaped block caption, and adds its evidence footnote. The manifest lists
-the diagram in `tex_files`. External image files and external plot data are
-unsupported.
+The chapter wraps the diagram reference in a `figure`, centers it, and writes
+the escaped block caption. The manifest lists the diagram in `tex_files`.
+External image files and external plot data are unsupported.
 
 ### notes/code/ch001_code.txt
 
@@ -1298,17 +1305,6 @@ The manifest lists it in `code_files`.
 
 Code is rendered as text. The renderer does not execute it or apply
 language-specific syntax highlighting.
-
-### notes/review.tex
-
-This appendix contains all note issues, including resolved ones. It labels
-each issue as requiring review or resolved, adds source footnotes, and includes
-the resolution explanation when present. With no issues, it contains only a
-newline.
-
-Unlike the manifest's short review flags, it uses full issue metadata from the
-notes. Explicit review refresh replaces this appendix without rewriting chapter
-content.
 
 ### Project validation
 
@@ -1367,9 +1363,10 @@ before invoking the compiler.
 ### notes/main.pdf
 
 This is the compiled PDF. It includes the title, contents, ordered chapters,
-optional glossary, and review appendix. Open review flags produce the draft
-footer. A successful compiler exit and an existing PDF are required, followed
-by successful page preview generation.
+and optional glossary. It has no audio source footnotes or review appendix.
+Chapter audio intervals and inline uncertainty labels remain. Open review
+flags produce the draft footer. A successful compiler exit and an existing PDF
+are required, followed by successful page preview generation.
 
 An older PDF can remain after a failed render. File existence alone is not
 evidence that the current render succeeded. The report records the latest

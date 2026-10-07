@@ -2,6 +2,7 @@
 
 import json
 import shutil
+import time
 from pathlib import Path
 
 from .jobs import (
@@ -195,6 +196,26 @@ def _validate_chapter_reply(reply: dict, evidence: dict, chapter: dict,
     return notes
 
 
+def _generate_chapter(client, text: str, evidence: dict, chapter: dict,
+                      resolutions: dict) -> dict:
+    from .auth import PlanAccessError
+    from .openai_client import ResponseError
+    from .schemas import LectureNotes
+
+    schema = LectureNotes.model_json_schema()
+    for attempt in range(4):
+        try:
+            return _validate_chapter_reply(
+                client.complete(INSTRUCTIONS, text, schema=schema), evidence, chapter, resolutions)
+        except (PlanAccessError, ResponseError, ValueError) as exc:
+            if attempt == 3 or getattr(exc, "code", None) == "context_length_exceeded":
+                raise
+            delay = 5 * 2 ** attempt
+            print(f"Notes chapter {chapter['id']} failed: {exc}\n"
+                  f"Retrying {chapter['id']} ({attempt + 1}/3) in {delay} seconds.", flush=True)
+            time.sleep(delay)
+
+
 def _merge_chapters(parts: list[dict], outline: dict, evidence: dict,
                     resolutions: dict | None = None) -> dict:
     notes = {"title": outline["title"], "language": "ru", "chapters": [],
@@ -346,9 +367,7 @@ def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
                          "model": client.model, "rebuild": rebuild,
                          "reasoning_effort": DEFAULT_REASONING_EFFORT,
                          "schema": LectureNotes.model_json_schema()},
-                        lambda: _validate_chapter_reply(client.complete(
-                            INSTRUCTIONS, text,
-                            schema=LectureNotes.model_json_schema()), evidence, chapter, resolutions))
+                        lambda: _generate_chapter(client, text, evidence, chapter, resolutions))
                 except (PlanAccessError, ResponseError) as exc:
                     if getattr(exc, "code", None) != "context_length_exceeded":
                         raise
@@ -375,8 +394,7 @@ def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
     write_json(outline_file, outline)
     write_json(job / "notes.json", notes)
     write_json(job / "review.json", {"issues": notes["issues"], "ready": review_ready(notes)})
-    payload = dict(notes, evidence_index=evidence_index(evidence))
-    return write_project(job, payload)
+    return write_project(job, notes)
 
 
 def review_ready(data: dict) -> bool:
@@ -411,6 +429,6 @@ def resolve_issue(job: Path, issue_id: str, resolution: str) -> None:
     if project.exists() and (job / "notes.json").exists():
         if read_json(project).get("evidence_fingerprint", original_signature) == original_signature:
             from .rendering import refresh_review
-            refresh_review(job, dict(data, evidence_index=evidence_index(read_json(job / "evidence.json"))))
+            refresh_review(job, data)
         else:
             print("Review saved; regenerate or import notes to refresh the stale LaTeX project.")

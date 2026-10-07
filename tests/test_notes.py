@@ -84,7 +84,8 @@ class NotesContextTests(unittest.TestCase):
             chapter.write_text(edited)
             resolve_issue(job, "issue1", "Проверен индекс")
             self.assertEqual(chapter.read_text(), edited)
-            self.assertIn("Решено", (job / "notes/review.tex").read_text())
+            self.assertFalse((job / "notes/review.tex").exists())
+            self.assertEqual(read_json(job / "notes/project.json")["issues"][0]["status"], "resolved")
             self.assertNotIn("ЧЕРНОВИК", (job / "notes/main.tex").read_text())
             self.assertEqual(read_json(job / "notes/project.json")["evidence_fingerprint"],
                              fingerprint(read_json(job / "evidence.json")))

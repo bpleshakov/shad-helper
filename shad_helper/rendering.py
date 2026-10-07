@@ -30,7 +30,7 @@ _MATH_COMMANDS = set(
     "langle rangle lvert rvert lVert rVert vert Vert lceil rceil lfloor rfloor "
     "infty partial nabla ell hbar imath jmath Re Im emptyset varnothing "
     "in notin ni subset supset subseteq supseteq subsetneq supsetneq "
-    "cup cap setminus union times cdot div pm mp ast star circ bullet oplus otimes "
+    "cup cap setminus union times cdot div pm mp ast star circ bullet oplus otimes colon "
     "le leq ge geq neq ne approx sim simeq equiv cong propto ll gg "
     "to mapsto rightarrow leftarrow leftrightarrow Rightarrow Leftarrow "
     "Leftrightarrow longrightarrow longleftarrow Longrightarrow Longleftrightarrow "
@@ -175,18 +175,6 @@ def _stamp(seconds: float) -> str:
     return f"{total // 3600:02}:{total // 60 % 60:02}:{total % 60:02}"
 
 
-def _evidence(ids: list[str], index: dict) -> str:
-    if not ids:
-        return ""
-    descriptions = []
-    for evidence_id in ids:
-        entry = index.get(evidence_id, evidence_id)
-        if isinstance(entry, dict):
-            entry = entry.get("description") or entry.get("text") or evidence_id
-        descriptions.append(escape_text(str(entry)))
-    return "\\footnote{Источники: " + "; ".join(descriptions) + "}"
-
-
 def _draft_footer(review: list[dict]) -> str:
     if review:
         return r"\fancyfoot[L]{\scriptsize ЧЕРНОВИК - требуется проверка}" + "\n"
@@ -204,18 +192,6 @@ def _review_flags(notes: dict) -> list[dict]:
     flags.extend({"id": issue["id"], "description": issue["description"]}
                  for issue in notes.get("issues", []) if issue["status"] != "resolved")
     return flags
-
-
-def _review_section(notes: dict) -> str:
-    lines = []
-    if notes.get("issues"):
-        lines.append(r"\section{Вопросы и замечания}")
-        for issue in notes["issues"]:
-            status = "Решено" if issue["status"] == "resolved" else "Требует проверки"
-            lines.append("\\paragraph{" + escape_text(issue["id"]) + ": " + status + "} " + _prose(issue["description"]) + _evidence(issue.get("evidence_ids", []), notes.get("evidence_index", {})))
-            if issue.get("resolution"):
-                lines.append("\\noindent\\textbf{Уточнение:} " + _prose(issue["resolution"]))
-    return "\n\n".join(lines) + "\n"
 
 
 def _evidence_fingerprint(job: Path) -> str | None:
@@ -257,8 +233,7 @@ def write_project(job: Path, notes: dict) -> Path:
     root = job.resolve() / "notes"
     if root.is_symlink() or not root.resolve().is_relative_to(job.resolve()):
         raise RenderError("The notes directory escapes the job")
-    index = notes.get("evidence_index", {})
-    tex_files = ["main.tex", "review.tex"]
+    tex_files = ["main.tex"]
     code_files = []
     chapter_sources = []
     block_ids = set()
@@ -277,15 +252,14 @@ def write_project(job: Path, notes: dict) -> Path:
                 raise RenderError("Block IDs must be unique")
             block_ids.add(block_id)
             content = block["content"]
-            source = _evidence(block.get("evidence_ids", []), index)
             kind = block["kind"]
             if kind == "math":
                 _validate_commands(content)
                 display_environment = re.match(r"\s*\\begin\s*\{(?:equation|align|gather|multline)\*?\}", content)
                 if content.lstrip().startswith(r"\[") or display_environment:
-                    lines.append(content + source + "\n")
+                    lines.append(content + "\n")
                 else:
-                    lines.append("\\[\n" + content + "\n\\]" + source + "\n")
+                    lines.append("\\[\n" + content + "\n\\]\n")
             elif kind == "diagram":
                 _validate_commands(content, diagram=True)
                 if not content.lstrip().startswith((r"\begin{tikzpicture}", r"\tikz")):
@@ -293,17 +267,17 @@ def write_project(job: Path, notes: dict) -> Path:
                 relative = f"figures/diagram-{block_id}.tex"
                 _write(root, relative, content + "\n")
                 tex_files.append(relative)
-                lines.append("\\begin{figure}[htbp]\n\\centering\n\\input{" + relative + "}\n\\caption{" + escape_text(block.get("caption", "Схема")) + "}\n\\end{figure}\n" + source)
+                lines.append("\\begin{figure}[htbp]\n\\centering\n\\input{" + relative + "}\n\\caption{" + escape_text(block.get("caption", "Схема")) + "}\n\\end{figure}\n")
             elif kind == "code":
                 relative = f"code/{block_id}.txt"
                 _write(root, relative, content)
                 code_files.append(relative)
-                lines.append("\\VerbatimInput[breaklines,breakanywhere,fontsize=\\small,frame=single]{" + relative + "}" + source + "\n")
+                lines.append("\\VerbatimInput[breaklines,breakanywhere,fontsize=\\small,frame=single]{" + relative + "}\n")
             elif kind in {"clarification", "uncertain"}:
                 label = "Пояснение" if kind == "clarification" else "Требует проверки"
-                lines.append("\\begin{quote}\\textbf{" + label + ".} " + _prose(content) + source + "\\end{quote}\n")
+                lines.append("\\begin{quote}\\textbf{" + label + ".} " + _prose(content) + "\\end{quote}\n")
             elif kind == "text":
-                lines.append(_prose(content) + source + "\n")
+                lines.append(_prose(content) + "\n")
             else:
                 raise RenderError(f"Unsupported note block kind: {kind}")
         relative = f"chapters/{chapter_id}.tex"
@@ -315,8 +289,8 @@ def write_project(job: Path, notes: dict) -> Path:
         appendix.append(r"\section{Глоссарий}")
         for entry in notes["glossary"]:
             appendix.append("\\paragraph{" + _prose(entry["term"]) + "} " + _prose(entry["definition"]))
-    _write(root, "review.tex", _review_section(notes))
-    main = _PREAMBLE + _marked_footer(review) + "\\title{" + escape_text(notes["title"]) + "}\n\\author{}\n\\date{}\n\\begin{document}\n\\maketitle\n\\tableofcontents\n\\newpage\n" + "\n".join(chapter_sources + appendix + [r"\input{review.tex}"]) + "\n\\end{document}\n"
+    _confined(root, "review.tex").unlink(missing_ok=True)
+    main = _PREAMBLE + _marked_footer(review) + "\\title{" + escape_text(notes["title"]) + "}\n\\author{}\n\\date{}\n\\begin{document}\n\\maketitle\n\\tableofcontents\n\\newpage\n" + "\n".join(chapter_sources + appendix) + "\n\\end{document}\n"
     _write(root, "main.tex", main)
     manifest = {"version": 2, "draft": bool(review), "tex_files": tex_files,
                 "code_files": code_files, "review": review,
@@ -329,7 +303,7 @@ def refresh_review(job: Path, notes: dict) -> Path:
     """Refresh explicit review metadata while retaining edited note content.
 
     The caller verifies the project matches the current evidence before refresh.
-    It updates only review.tex, project.json, and the marked footer in main.tex.
+    It updates only project.json and the marked footer in main.tex.
     """
     check_audio_job(job)
     root = job.resolve() / "notes"
@@ -340,20 +314,16 @@ def refresh_review(job: Path, notes: dict) -> Path:
         raise RenderError("Unsupported note project; use a new output directory.")
     main_path = _confined(root, "main.tex")
     main = main_path.read_text(encoding="utf-8")
-    if ("review.tex" not in manifest["tex_files"] or main.count(_DRAFT_START) != 1
-            or main.count(_DRAFT_END) != 1):
-        raise RenderError("Review refresh requires the generated appendix/footer markers; regenerate or import notes before refreshing review")
+    if main.count(_DRAFT_START) != 1 or main.count(_DRAFT_END) != 1:
+        raise RenderError("Review refresh requires the generated footer markers; regenerate or import notes before refreshing review")
     pattern = re.escape(_DRAFT_START) + r".*?" + re.escape(_DRAFT_END) + r"\n?"
     if not re.search(pattern, main, flags=re.DOTALL):
         raise RenderError("Review footer markers are out of order; regenerate or import notes")
     review = _review_flags(notes)
-    appendix = _review_section(notes)
-    _validate_commands(appendix, project=True)
     footer = _marked_footer(review)
     main = re.sub(pattern, lambda _: footer, main, count=1, flags=re.DOTALL)
     manifest.update(review=review, issues=notes.get("issues", []), draft=bool(review),
                     evidence_fingerprint=_evidence_fingerprint(job))
-    _write(root, "review.tex", appendix)
     _write(root, "main.tex", main)
     _write(root, "project.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     return main_path

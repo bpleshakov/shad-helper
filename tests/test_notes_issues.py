@@ -93,7 +93,8 @@ def test_extraction_warnings_do_not_block_generation_or_review_readiness(tmp_pat
 
 
 @pytest.mark.parametrize("fallback", [False, True])
-def test_manual_and_failed_fallback_handoffs_omit_diagnostics(tmp_path, fallback):
+def test_manual_and_failed_fallback_handoffs_omit_diagnostics(tmp_path, monkeypatch, fallback):
+    monkeypatch.setattr(notes.time, "sleep", lambda seconds: None)
     data = prepare_job(tmp_path)
     original = (tmp_path / "evidence.json").read_bytes()
     prior_review = {"issues": [{"id": "prior_note", "description": "Prior note ambiguity",
@@ -109,7 +110,7 @@ def test_manual_and_failed_fallback_handoffs_omit_diagnostics(tmp_path, fallback
     assert read_json(tmp_path / "review.json") == prior_review
     assert not list(folder.rglob("*.png"))
     if fallback:
-        assert len(client.prompts) == 1
+        assert len(client.prompts) == 4
         assert read_json(folder / "status.json")["status"] == "manual_required"
     else:
         assert client.prompts == []

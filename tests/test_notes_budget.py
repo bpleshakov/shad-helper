@@ -63,6 +63,8 @@ class FakeClient:
 
 @pytest.fixture(autouse=True)
 def no_tex(monkeypatch):
+    monkeypatch.setattr(notes.time, "sleep", lambda seconds: None)
+
     def write_project(job, payload):
         destination = job / "notes" / "main.tex"
         destination.parent.mkdir(exist_ok=True)
@@ -161,7 +163,7 @@ def test_typed_context_error_splits_only_failed_chapter_and_retries(tmp_path, er
 
 
 @pytest.mark.parametrize("error_type", [ResponseError, PlanAccessError])
-def test_other_error_falls_back_once_without_matching_message_text(tmp_path, error_type):
+def test_other_error_retries_then_falls_back_without_matching_message_text(tmp_path, error_type):
     data = evidence()
     prepare_job(tmp_path, data)
 
@@ -170,7 +172,7 @@ def test_other_error_falls_back_once_without_matching_message_text(tmp_path, err
 
     client = FakeClient(fail)
     folder = notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
-    assert folder == tmp_path / "handoff" and len(client.calls) == 1
+    assert folder == tmp_path / "handoff" and len(client.calls) == 4
     assert read_json(tmp_path / "outline.json") == notes.default_outline(data)
     assert read_json(folder / "status.json")["status"] == "manual_required"
     assert read_json(folder / "inputs/ch001/context.json")["segments"] == notes.chapter_context(
@@ -245,7 +247,7 @@ def test_resume_reuses_successful_chapters_with_generated_titles_and_glossary(tm
 
     first_client = FakeClient(fail_second)
     assert notes.generate_notes(tmp_path, tmp_path / "auth", client=first_client) == tmp_path / "handoff"
-    assert len(first_client.calls) == 2
+    assert len(first_client.calls) == 5
     assert read_json(tmp_path / "outline.json") == outline
     resumed = FakeClient()
     assert notes.generate_notes(tmp_path, tmp_path / "auth", client=resumed).exists()

@@ -95,7 +95,9 @@ the command name.
 
 Automatic synthesis checks account availability of `gpt-6-astra` and requests
 `high` reasoning effort through the authorized ChatGPT-plan integration.
-Unavailable access or generation failure exports a manual handoff.
+Each failed chapter request or invalid reply gets three retries after the initial
+attempt, waiting 5, 10, and 20 seconds. Completed chapters remain cached.
+Unavailable access or failure after all four attempts exports a manual handoff.
 
 The app uses `outline.json`, or creates consecutive fifteen-minute chapters.
 Each request contains one chapter, neighboring speech context, and a shared
@@ -113,6 +115,9 @@ of at most twenty minutes.
 Lecture blocks cite transcript IDs. Added explanations are **Пояснение**;
 uncertain claims are **Требует проверки**. Unspoken details of a referenced
 formula, diagram, or code display must be flagged rather than invented.
+The PDF omits audio source footnotes and the list of review issues. Chapter
+audio intervals and inline uncertainty labels remain; review issues are stored
+in the JSON files and available through `review`.
 Transcription warnings are informational: inspect or correct them before notes
 when needed. They are ignored by note generation rather than carried into review.
 
@@ -160,9 +165,9 @@ UV_CACHE_DIR=.cache/uv uv run shad-helper review jobs/audio-lecture --resolve ch
 UV_CACHE_DIR=.cache/uv uv run shad-helper render jobs/audio-lecture
 ```
 
-Resolving an issue refreshes the review appendix and footer while preserving
-chapter edits. An uncertain block stays tentative until its content and kind
-are corrected. Resolutions survive imports only while issue and evidence match.
+Resolving an issue refreshes the project metadata and draft footer while
+preserving chapter edits. An uncertain block stays tentative until its content
+and kind are corrected. Resolutions survive imports only while issue and evidence match.
 Review commands resolve note issues only; they do not edit evidence or extraction
 warnings. Editing the diagnostic report does not invalidate notes or rendering.
 
