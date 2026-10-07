@@ -16,11 +16,14 @@ from shad_helper.notes import (
 
 
 def evidence():
-    return {"schema_version": 2, "title": "Линейная алгебра", "media": {"duration": 1800},
+    return {"schema_version": 3, "title": "Линейная алгебра", "media": {"duration": 1800},
             "segments": [{"id": "s1", "start": 10, "end": 12, "text": "Матрица"},
-                         {"id": "s2", "start": 1200, "end": 1205, "text": "Следующий раздел"}],
-            "issues": [{"id": "issue1", "description": "Неясный индекс",
-                        "evidence_ids": ["s1"], "status": "open", "resolution": ""}]}
+                         {"id": "s2", "start": 1200, "end": 1205, "text": "Следующий раздел"}]}
+
+
+def issue():
+    return {"id": "issue1", "description": "Неясный индекс",
+            "evidence_ids": ["s1"], "status": "open", "resolution": ""}
 
 
 def reply():
@@ -31,11 +34,10 @@ def reply():
 
 
 class NotesContextTests(unittest.TestCase):
-    def test_context_includes_only_scoped_speech_and_issues(self):
+    def test_context_includes_only_scoped_speech(self):
         context = chapter_context(evidence(), {"id": "ch001", "start": 0, "end": 900})
-        self.assertEqual(set(context), {"chapter", "segments", "issues"})
+        self.assertEqual(set(context), {"chapter", "segments"})
         self.assertEqual([s["id"] for s in context["segments"]], ["s1"])
-        self.assertEqual([i["id"] for i in context["issues"]], ["issue1"])
 
     def test_clip_outline_keeps_original_timestamps(self):
         data = evidence()
@@ -54,11 +56,16 @@ class NotesContextTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             job = Path(temporary)
             write_json(job / "evidence.json", evidence())
+            original = (job / "evidence.json").read_bytes()
+            data = reply()
+            data["issues"] = [issue()]
+            write_json(job / "notes.json", data)
             with self.assertRaises(ValueError):
                 resolve_issue(job, "issue1", "")
             resolve_issue(job, "issue1", "Проверен нижний индекс i; исправлена транскрипция")
             self.assertTrue(read_json(job / "review.json")["ready"])
-            self.assertEqual(read_json(job / "evidence.json")["issues"][0]["status"], "resolved")
+            self.assertEqual(read_json(job / "notes.json")["issues"][0]["status"], "resolved")
+            self.assertEqual((job / "evidence.json").read_bytes(), original)
             self.assertIn("evidence_fingerprint", read_json(job / "review-resolutions.json")["issue1"])
 
     def test_resolution_refreshes_review_without_overwriting_chapter_edits(self):
@@ -68,7 +75,7 @@ class NotesContextTests(unittest.TestCase):
             job = Path(temporary)
             source = evidence()
             notes = reply()
-            notes["issues"] = source["issues"]
+            notes["issues"] = [issue()]
             write_json(job / "evidence.json", source)
             write_json(job / "notes.json", notes)
             write_project(job, dict(notes, evidence_index=evidence_index(source)))
@@ -110,20 +117,21 @@ class NotesValidationTests(unittest.TestCase):
         data["issues"] = [{"id": "note_issue", "description": "Неясный знак",
                            "evidence_ids": ["s1"], "status": "open", "resolution": ""}]
         source = evidence()
-        signature = fingerprint({key: value for key, value in source.items() if key != "issues"})
+        signature = fingerprint(source)
         records = {"note_issue": {"description": "Неясный знак", "evidence_ids": ["s1"],
                                   "resolution": "Проверено: плюс", "evidence_fingerprint": signature}}
         self.assertEqual(_validate_evidence(data, source, records)["issues"][0]["status"], "resolved")
         source["segments"][0]["text"] = "Другой материал"
         self.assertEqual(_validate_evidence(data, source, records)["issues"][0]["status"], "open")
 
-    def test_upstream_resolution_reopens_after_material_changes(self):
+    def test_note_resolution_reopens_after_media_changes(self):
         source = evidence()
-        signature = fingerprint({key: value for key, value in source.items() if key != "issues"})
-        source["issues"][0].update(status="resolved", resolution="Checked")
-        records = {"issue1": dict(source["issues"][0], evidence_fingerprint=signature)}
+        data = reply()
+        data["issues"] = [dict(issue(), status="resolved", resolution="Checked")]
+        signature = fingerprint(source)
+        records = {"issue1": dict(data["issues"][0], evidence_fingerprint=signature)}
         source["media"]["sha256"] = "changed-media"
-        issues = _validate_evidence(reply(), source, records)["issues"]
+        issues = _validate_evidence(data, source, records)["issues"]
         self.assertEqual(issues[0]["status"], "open")
 
     @unittest.skipUnless(importlib.util.find_spec("pydantic"), "requires installed pydantic")
@@ -142,9 +150,9 @@ class NotesValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _validate_evidence(data, evidence())
 
-    def test_model_cannot_resolve_upstream_issue(self):
+    def test_model_cannot_resolve_its_own_issue(self):
         data = reply()
-        data["issues"] = [dict(evidence()["issues"][0], status="resolved", resolution="guess")]
+        data["issues"] = [dict(issue(), status="resolved", resolution="guess")]
         notes = _validate_evidence(data, evidence())
         self.assertEqual(notes["issues"][0]["status"], "open")
 
@@ -156,7 +164,6 @@ class NotesValidationTests(unittest.TestCase):
             job = Path(temporary).resolve()
             data = evidence()
             data["media"]["duration"] = 900
-            data["issues"] = []
             write_json(job / "evidence.json", data)
             write_json(job / "outline.json", default_outline(evidence()))
             response = reply()
@@ -166,7 +173,7 @@ class NotesValidationTests(unittest.TestCase):
             with patch.dict(os.environ, {"SHAD_HELPER_OPENAI_PROXY": ""}):
                 folder = generate_notes(job, job / "auth", manual=True)
                 self.assertEqual(folder, job / "handoff")
-                self.assertTrue((folder / "ch001/prompt.txt").exists())
+                self.assertTrue((folder / "inputs/ch001/prompt.txt").exists())
                 self.assertFalse(list(folder.rglob("*.pdf")))
                 write_json(folder / "status.json", {"status": "manual_required"})
                 with patch("shad_helper.notes.export_handoff") as export:
@@ -185,7 +192,6 @@ class NotesValidationTests(unittest.TestCase):
             job = Path(temporary).resolve()
             data = evidence()
             data["media"]["duration"] = 900
-            data["issues"] = []
             write_json(job / "evidence.json", data)
             with patch.dict(os.environ, {"SHAD_HELPER_OPENAI_PROXY": ""}), \
                     patch("shad_helper.network.httpx.Client") as client:
@@ -194,7 +200,7 @@ class NotesValidationTests(unittest.TestCase):
             status = read_json(folder / "status.json")
             self.assertEqual(status["status"], "manual_required")
             self.assertIn("--openai-proxy", status["reason"])
-            self.assertTrue((folder / "ch001/context.json").exists())
+            self.assertTrue((folder / "inputs/ch001/context.json").exists())
             self.assertFalse(list(folder.rglob("*.pdf")))
 
 

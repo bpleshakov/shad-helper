@@ -48,11 +48,14 @@ core interval. JSON, SRT, and VTT timestamps refer to the original recording.
 Russian is the default; override transcription language with `--language`.
 Notes remain in Russian.
 
-Jobs contain `extraction-config.json`, schema-version-2 `evidence.json`,
+Jobs contain `extraction-config.json`, schema-version-3 `evidence.json`,
 `transcript.json`, `transcript.srt`, `transcript.vtt`, audio chunks, worker
 requests/responses, successful checkpoints, and current-run extraction timings.
-Evidence stores media identity and interval, timed speech, local diagnostics,
-review issues, and the ASR model.
+Evidence stores only the title, media identity and interval, and speech segments
+with `id`, `start`, `end`, and `text`. `extraction-diagnostics.json` separately
+stores ASR model metadata, word timestamps and confidence, segment diagnostics,
+and extraction warnings. Notes do not read that report, and warnings do not block
+generation.
 
 Reruns reuse matching audio and ASR checkpoints. Changes to media, intervals,
 language, or model invalidate affected results. Deleted audio artifacts are
@@ -97,8 +100,8 @@ Unavailable access or generation failure exports a manual handoff.
 The app uses `outline.json`, or creates consecutive fifteen-minute chapters.
 Each request contains one chapter, neighboring speech context, and a shared
 glossary. Speech inputs contain only `id`, `start`, `end`, and `text`.
-Confidence, diagnostics, and existing issues stay local and are restored in
-resulting review records.
+Confidence and extraction diagnostics stay in their separate report. Only
+uncertainties discovered during note generation become note review issues.
 
 Chapters split above 120,000 UTF-8 bytes of instructions, context, and response
 schema. A typed `context_length_exceeded` response also triggers a split and
@@ -110,7 +113,8 @@ of at most twenty minutes.
 Lecture blocks cite transcript IDs. Added explanations are **Пояснение**;
 uncertain claims are **Требует проверки**. Unspoken details of a referenced
 formula, diagram, or code display must be flagged rather than invented.
-Generation cannot clear existing transcription issues.
+Transcription warnings are informational: inspect or correct them before notes
+when needed. They are ignored by note generation rather than carried into review.
 
 Outputs are `notes.json`, `review.json`, and editable `notes/` LaTeX sources.
 `notes` regenerates the project; `--rebuild` invalidates synthesis checkpoints.
@@ -124,9 +128,13 @@ Export without network calls:
 UV_CACHE_DIR=.cache/uv uv run shad-helper notes jobs/audio-lecture --manual
 ```
 
-For each chapter in `handoff/outline.json`, attach its `context.json` and shared
-`handoff/response-schema.json` in ChatGPT, then paste its `prompt.txt`.
-`transcript.txt` is an optional readable copy for local inspection.
+For each chapter listed in the job's `outline.json`, attach
+`handoff/inputs/CHAPTER_ID/context.json` and the shared
+`handoff/inputs/response-schema.json` in ChatGPT, then paste that chapter's
+`prompt.txt`. These are the three model inputs: instructions, lecture data, and
+response structure. The context contains the lecture title, glossary, chapter
+metadata, and speech once. `handoff/README.txt` and any `status.json` are operator
+instructions and should not be sent to the model.
 Save JSON replies without Markdown fences as `CHAPTER_ID.json`:
 
 ```sh
@@ -148,13 +156,15 @@ Edit chapter/TikZ sources directly for note corrections, or edit `notes.json`
 and import it to regenerate the project. Record a verified correction explicitly:
 
 ```sh
-UV_CACHE_DIR=.cache/uv uv run shad-helper review jobs/audio-lecture --resolve issue_0000 --resolution "Checked the audio and corrected the subscript."
+UV_CACHE_DIR=.cache/uv uv run shad-helper review jobs/audio-lecture --resolve ch001_missing_detail --resolution "Checked the lecture and corrected the missing detail."
 UV_CACHE_DIR=.cache/uv uv run shad-helper render jobs/audio-lecture
 ```
 
 Resolving an issue refreshes the review appendix and footer while preserving
 chapter edits. An uncertain block stays tentative until its content and kind
 are corrected. Resolutions survive imports only while issue and evidence match.
+Review commands resolve note issues only; they do not edit evidence or extraction
+warnings. Editing the diagnostic report does not invalidate notes or rendering.
 
 Rendering preserves sources and produces `notes/main.pdf`, `notes/qa/` page
 previews, and `notes/render-report.json`. Inspect previews for clipped text,
@@ -185,5 +195,6 @@ UV_CACHE_DIR=.cache/uv uv run shad-helper render jobs/audio-example
 ```
 
 The synthetic example exercises Russian text, mathematics, a transcript-based
-diagram, and code. See [the pipeline design](docs/plan.md).
+diagram, and code. See [the pipeline design](docs/plan.md) and the
+[stage contracts](docs/stage-contracts.md) for file structures and validation rules.
 Anki remains a separate, unimplemented command.

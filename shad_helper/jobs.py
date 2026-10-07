@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-EVIDENCE_VERSION = 2
+EVIDENCE_VERSION = 3
 AUDIO_CONFIG = {"schema_version": EVIDENCE_VERSION, "pipeline": "audio"}
 
 
@@ -28,8 +28,13 @@ def check_audio_job(job: Path) -> None:
 
 
 def validate_audio_evidence(evidence: dict) -> dict:
-    if (evidence.get("schema_version") != EVIDENCE_VERSION or "media" not in evidence
-            or any(key in evidence for key in ("video", "visuals", "sources", "visual_processing"))):
+    if (not isinstance(evidence, dict) or evidence.get("schema_version") != EVIDENCE_VERSION
+            or set(evidence) != {"schema_version", "title", "media", "segments"}
+            or not isinstance(evidence["media"], dict)
+            or not isinstance(evidence["segments"], list)
+            or any(not isinstance(segment, dict)
+                   or set(segment) != {"id", "start", "end", "text"}
+                   for segment in evidence["segments"])):
         raise ValueError("Unsupported evidence format; use a new output directory for audio extraction.")
     return evidence
 

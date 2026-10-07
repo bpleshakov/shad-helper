@@ -2,7 +2,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from shad_helper.jobs import checkpoint, evidence_index, read_json, write_json
+from shad_helper.jobs import (
+    checkpoint,
+    evidence_index,
+    read_json,
+    validate_audio_evidence,
+    write_json,
+)
 
 
 class CheckpointTests(unittest.TestCase):
@@ -36,6 +42,27 @@ class CheckpointTests(unittest.TestCase):
             write_json(path, evidence)
             self.assertEqual(read_json(path), evidence)
             self.assertEqual(evidence_index(evidence), {"s1": "Аудио 00:01:05"})
+
+    def test_evidence_rejects_diagnostics_and_incomplete_segments(self):
+        evidence = {"schema_version": 3, "title": "Лекция", "media": {"duration": 120},
+                    "segments": [{"id": "s1", "start": 0, "end": 10, "text": "Теорема"}]}
+        self.assertEqual(validate_audio_evidence(evidence), evidence)
+        for key in ("issues", "models", "diagnostics", "visuals"):
+            with self.subTest(root_key=key), self.assertRaises(ValueError):
+                validate_audio_evidence(dict(evidence, **{key: []}))
+        for key in ("words", "diagnostics", "probability"):
+            segment = dict(evidence["segments"][0], **{key: []})
+            with self.subTest(segment_key=key), self.assertRaises(ValueError):
+                validate_audio_evidence(dict(evidence, segments=[segment]))
+        for segment in ({"id": "s1", "text": "Теорема"}, None):
+            with self.subTest(segment=segment), self.assertRaises(ValueError):
+                validate_audio_evidence(dict(evidence, segments=[segment]))
+
+    def test_evidence_rejects_unsupported_containers(self):
+        for value in (None, [], {"schema_version": 3},
+                      {"schema_version": 3, "title": "Лекция", "media": {}, "segments": {}}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_audio_evidence(value)
 
 
 if __name__ == "__main__":

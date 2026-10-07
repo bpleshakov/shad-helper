@@ -127,7 +127,9 @@ def main(argv: list[str] | None = None) -> int:
                 from .notes import resolve_issue
                 resolve_issue(args.job, args.resolve, args.resolution)
             path = args.job / "review.json"
-            data = read_json(path) if path.exists() else read_json(args.job / "evidence.json")
+            if not path.exists():
+                path = args.job / "notes.json"
+            data = read_json(path) if path.exists() else {"issues": []}
             issues = data.get("issues", [])
             for issue in issues:
                 print(f"[{issue['status']}] {issue['id']}: {issue['description']}")

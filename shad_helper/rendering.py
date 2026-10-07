@@ -328,8 +328,7 @@ def write_project(job: Path, notes: dict) -> Path:
 def refresh_review(job: Path, notes: dict) -> Path:
     """Refresh explicit review metadata while retaining edited note content.
 
-    The caller verifies the project was current before resolving evidence issues.
-    This operation then binds it to the post-resolution evidence fingerprint.
+    The caller verifies the project matches the current evidence before refresh.
     It updates only review.tex, project.json, and the marked footer in main.tex.
     """
     check_audio_job(job)

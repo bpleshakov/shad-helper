@@ -14,6 +14,7 @@ from .jobs import (
     EVIDENCE_VERSION,
     check_audio_job,
     checkpoint,
+    fingerprint,
     read_json,
     sha256_file,
     write_json,
@@ -167,19 +168,27 @@ def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
     started = time.monotonic()
     chunks = _audio_chunks(media, out, start, end, media_hash)
     asr = _worker(out, {"model": asr_model, "language": language, "items": chunks})
-    segments = stitch_segments(asr["items"])
+    transcribed = stitch_segments(asr["items"])
+    warnings = [(segment["id"], description) for segment in transcribed
+                for description in transcription_warnings(segment)]
+    segments = [{key: segment[key] for key in ("id", "start", "end", "text")}
+                for segment in transcribed]
     write_json(out / "transcript.json", segments)
     write_subtitles(segments, out)
-    warnings = [(segment["id"], description) for segment in segments
-                for description in transcription_warnings(segment)]
-    issues = [{"id": f"issue_{position:04d}", "description": description,
-               "evidence_ids": [identifier], "status": "open", "resolution": ""}
-              for position, (identifier, description) in enumerate(warnings)]
     evidence = {"schema_version": EVIDENCE_VERSION, "title": media.stem,
                 "media": {"path": str(media), "sha256": media_hash, **metadata,
                           "clip_start": start, "clip_end": end},
-                "segments": segments, "issues": issues, "models": {"asr": asr_model}}
+                "segments": segments}
     write_json(out / "evidence.json", evidence)
+    write_json(out / "extraction-diagnostics.json", {
+        "schema_version": 1, "evidence_fingerprint": fingerprint(evidence),
+        "models": {"asr": asr_model},
+        "segments": [{key: segment[key] for key in ("id", "words", "diagnostics")}
+                     for segment in transcribed],
+        "warnings": [{"id": f"issue_{position:04d}", "description": description,
+                      "evidence_ids": [identifier]}
+                     for position, (identifier, description) in enumerate(warnings)],
+    })
     write_json(out / "extraction-timings.json",
                {"scope": "current extraction invocation",
                 "audio_asr_seconds": time.monotonic() - started})

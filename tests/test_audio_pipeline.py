@@ -10,13 +10,12 @@ from unittest.mock import Mock
 import pytest
 
 from shad_helper import cli, extraction, local_worker, notes, rendering
-from shad_helper.jobs import AUDIO_CONFIG, check_audio_job, read_json, write_json
+from shad_helper.jobs import AUDIO_CONFIG, check_audio_job, fingerprint, read_json, write_json
 
 
 def audio_evidence():
-    return {"schema_version": 2, "title": "Лекция", "media": {"duration": 120},
-            "segments": [{"id": "speech", "start": 0, "end": 120, "text": "Определение"}],
-            "issues": [], "models": {"asr": "fake"}}
+    return {"schema_version": 3, "title": "Лекция", "media": {"duration": 120},
+            "segments": [{"id": "speech", "start": 0, "end": 120, "text": "Определение"}]}
 
 
 @pytest.mark.parametrize("stream_duration,format_duration,expected", [
@@ -109,13 +108,17 @@ def test_asr_input_changes_invalidate_checkpoint(tmp_path, monkeypatch, changed)
 
 @pytest.mark.parametrize("operation", ["extract", "notes", "render", "resolve", "review"])
 @pytest.mark.parametrize("with_config", [False, True])
-def test_legacy_jobs_are_rejected_without_changes(tmp_path, operation, with_config, capsys):
-    data = {"schema_version": 1, "video": {"duration": 120}, "segments": [],
-            "visuals": [], "sources": [], "issues": []}
+@pytest.mark.parametrize("version", [1, 2])
+def test_legacy_jobs_are_rejected_without_changes(tmp_path, operation, with_config, version, capsys):
+    data = ({"schema_version": 1, "video": {"duration": 120}, "segments": [],
+             "visuals": [], "sources": [], "issues": []} if version == 1 else
+            {**audio_evidence(), "schema_version": 2, "issues": [], "models": {"asr": "fake"}})
     write_json(tmp_path / "evidence.json", data)
     write_json(tmp_path / "checkpoints/notes/ch001.json", {"preserve": True})
     if with_config:
-        write_json(tmp_path / "extraction-config.json", {"vision_mode": "pages"})
+        write_json(tmp_path / "extraction-config.json",
+                   {"vision_mode": "pages"} if version == 1 else
+                   {"schema_version": 2, "pipeline": "audio"})
     before = {path.relative_to(tmp_path): path.read_bytes()
               for path in tmp_path.rglob("*") if path.is_file()}
     if operation == "review":
@@ -173,7 +176,9 @@ def test_real_audio_and_multistream_video_use_the_same_soundtrack(tmp_path, monk
                     "color=c=black:s=32x32:r=2:d=2", "-map", "2:v:0", "-map", "0:a:0",
                     "-map", "1:a:0", "-c:v", "mpeg4", "-c:a", "pcm_s16le", str(video)], check=True)
     transcribe = Mock(return_value={"segments": [
-        {"start": 0.2, "end": 1.5, "text": "Теорема", "avg_logprob": -1.5}], "language": "ru"})
+        {"start": 0.2, "end": 1.5, "text": "Теорема", "avg_logprob": -1.5,
+         "words": [{"start": 0.2, "end": 1.5, "word": "Теорема", "probability": 0.1}]}],
+        "language": "ru"})
     monkeypatch.setitem(sys.modules, "mlx_whisper", SimpleNamespace(transcribe=transcribe))
     monkeypatch.setattr(extraction, "_worker",
                         lambda job, request: local_worker.run({"job": str(job), **request}))
@@ -182,11 +187,27 @@ def test_real_audio_and_multistream_video_use_the_same_soundtrack(tmp_path, monk
         job = tmp_path / media.suffix[1:]
         path = extraction.extract(media, job, start=0.5, duration=1)
         evidence = read_json(path)
-        assert set(evidence) == {"schema_version", "title", "media", "segments", "issues", "models"}
-        assert evidence["schema_version"] == 2
+        assert set(evidence) == {"schema_version", "title", "media", "segments"}
+        assert evidence["schema_version"] == 3
+        assert all(set(segment) == {"id", "start", "end", "text"}
+                   for segment in evidence["segments"])
         assert (evidence["media"]["clip_start"], evidence["media"]["clip_end"]) == (0.5, 1.5)
         assert evidence["segments"][0]["start"] == 0.5
-        assert evidence["issues"][0]["evidence_ids"] == ["segment_00000"]
+        diagnostics = read_json(job / "extraction-diagnostics.json")
+        assert set(diagnostics) == {"schema_version", "evidence_fingerprint", "models",
+                                    "segments", "warnings"}
+        assert diagnostics["schema_version"] == 1
+        assert diagnostics["evidence_fingerprint"] == fingerprint(evidence)
+        assert diagnostics["models"] == {"asr": extraction.ASR_MODEL}
+        assert diagnostics["segments"] == [{
+            "id": "segment_00000", "words": [
+                {"start": 0.2, "end": 1.5, "word": "Теорема", "probability": 0.1}],
+            "diagnostics": {"avg_logprob": -1.5}}]
+        assert len(diagnostics["warnings"]) == 2
+        assert all(set(warning) == {"id", "description", "evidence_ids"}
+                   and warning["evidence_ids"] == ["segment_00000"]
+                   for warning in diagnostics["warnings"])
+        assert read_json(job / "transcript.json") == evidence["segments"]
         assert read_json(job / "extraction-config.json") == AUDIO_CONFIG
         assert "00:00:00,500 --> 00:00:01,500" in (job / "transcript.srt").read_text()
         with wave.open(str(job / "audio/chunk_0000.wav")) as chunk:
@@ -208,6 +229,9 @@ def test_silent_audio_retains_extraction_artifacts(tmp_path, monkeypatch):
     monkeypatch.setattr(extraction, "_worker", lambda *args: {"items": []})
     evidence = read_json(extraction.extract(media, out))
     assert evidence["segments"] == []
+    diagnostics = read_json(out / "extraction-diagnostics.json")
+    assert diagnostics["segments"] == diagnostics["warnings"] == []
+    assert diagnostics["evidence_fingerprint"] == fingerprint(evidence)
     assert read_json(out / "transcript.json") == []
     assert (out / "transcript.srt").read_text() == ""
     assert (out / "transcript.vtt").read_text() == "WEBVTT\n\n"

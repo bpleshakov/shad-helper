@@ -165,7 +165,9 @@ class RenderingTests(unittest.TestCase):
 
     def test_evidence_fingerprint_ignores_formatting_and_rejects_changed_content(self):
         evidence_path = self.job / "evidence.json"
-        evidence = {"schema_version": 2, "media": {"duration": 1800}, "segments": [{"id": "ev-1", "text": "Исходная формулировка"}], "issues": []}
+        evidence = {"schema_version": 3, "title": "Лекция", "media": {"duration": 1800},
+                    "segments": [{"id": "ev-1", "start": 61, "end": 125,
+                                  "text": "Исходная формулировка"}]}
         evidence_path.write_text(json.dumps(evidence, ensure_ascii=False))
         root, manifest = self.project()
         self.assertEqual(manifest["evidence_fingerprint"], fingerprint(evidence))
@@ -187,7 +189,7 @@ class RenderingTests(unittest.TestCase):
         _, manifest = self.project()
         self.assertIsNone(manifest["evidence_fingerprint"])
         evidence_path = self.job / "evidence.json"
-        evidence_path.write_text('{"schema_version": 2, "media": {"duration": 1800}, "segments": []}')
+        evidence_path.write_text('{"schema_version": 3, "title": "Лекция", "media": {"duration": 1800}, "segments": []}')
         with self.assertRaisesRegex(rendering.RenderError, "Evidence changed"):
             rendering.render(self.job)
         self.project()
@@ -197,7 +199,8 @@ class RenderingTests(unittest.TestCase):
 
     def test_review_refresh_preserves_edits_and_uncertain_blocks_keep_draft(self):
         evidence_path = self.job / "evidence.json"
-        evidence = {"schema_version": 2, "media": {"duration": 1800}, "issues": [{"id": "issue-1", "status": "open"}]}
+        evidence = {"schema_version": 3, "title": "Лекция", "media": {"duration": 1800},
+                    "segments": []}
         evidence_path.write_text(json.dumps(evidence))
         root, _ = self.project()
         edited_paths = [root / "chapters/chapter-1.tex", root / "figures/diagram-diagram-1.tex", root / "code/code-1.txt"]
@@ -210,8 +213,6 @@ class RenderingTests(unittest.TestCase):
         self.notes["title"] = "Название не должно перезаписать TEX"
         self.notes["glossary"][0]["definition"] = "Не заменять авторское определение"
         self.notes["issues"][0].update(status="resolved", resolution=r"Уточнено: \(i = 1\).")
-        evidence["issues"][0]["status"] = "resolved"
-        evidence_path.write_text(json.dumps(evidence))
         self.assertEqual(rendering.refresh_review(self.job, self.notes), main_path)
         manifest = json.loads((root / "project.json").read_text())
         self.assertEqual(manifest["evidence_fingerprint"], fingerprint(evidence))

@@ -13,14 +13,11 @@ from shad_helper.schemas import LectureNotes
 def evidence(duration=900, *, dense=False):
     segments = [
         {"id": f"s{number:03d}", "start": number * 60 + 10,
-         "end": number * 60 + 12, "text": f"Definition {number}. " + "x" * (9000 if dense else 10),
-         "words": [{"word": "Definition", "start": number * 60 + 10,
-                    "end": number * 60 + 11, "probability": 0.91}],
-         "diagnostics": {"avg_logprob": -0.1, "no_speech_prob": 0.01}}
+         "end": number * 60 + 12, "text": f"Definition {number}. " + "x" * (9000 if dense else 10)}
         for number in range(int(duration // 60))
     ]
-    data = {"schema_version": 2, "title": "Лекция", "media": {"duration": duration},
-            "segments": segments, "issues": []}
+    data = {"schema_version": 3, "title": "Лекция", "media": {"duration": duration},
+            "segments": segments}
     return data
 
 
@@ -31,15 +28,14 @@ def prepare_job(job, data, outline=None):
 
 
 def payload_from_prompt(prompt):
-    payload, _ = json.JSONDecoder().raw_decode(prompt[prompt.index("{"):])
-    assert "context" in payload, "A whole-lecture outline request is forbidden"
-    assert "chapter" in payload["context"]
+    payload = json.loads(prompt)
+    assert set(payload) == {"lecture_title", "glossary", "chapter", "segments"}
     return payload
 
 
 def chapter_reply(payload):
-    chapter = payload["context"]["chapter"]
-    segments = payload["context"]["segments"]
+    chapter = payload["chapter"]
+    segments = payload["segments"]
     citations = [segments[0]["id"]] if segments else []
     return {"title": "Лекция с тематическими названиями", "language": "ru", "chapters": [
         {**chapter, "title": f"Определения и доказательства {chapter['id']}", "blocks": [
@@ -97,7 +93,7 @@ def test_preflight_splits_without_losing_text(tmp_path):
     assert data == original
     assert outline == notes.default_outline(data)
     contexts = assert_coverage(bounded, data)
-    assert all(set(context) == {"chapter", "segments", "issues"} for context in contexts)
+    assert all(set(context) == {"chapter", "segments"} for context in contexts)
 
 
 def test_automatic_requests_fit_budget_and_use_only_chapters(tmp_path):
@@ -109,15 +105,16 @@ def test_automatic_requests_fit_budget_and_use_only_chapters(tmp_path):
     assert result.exists() and len(client.calls) > 1
     saved = read_json(tmp_path / "outline.json")
     assert_coverage(saved, data)
-    assert [call["payload"]["context"]["chapter"]["id"] for call in client.calls] == [
+    assert [call["payload"]["chapter"]["id"] for call in client.calls] == [
         chapter["id"] for chapter in saved["chapters"]]
     assert not (tmp_path / "checkpoints/notes/outline.json").exists()
     assert (tmp_path / "evidence.json").read_bytes() == canonical
     for call in client.calls:
+        assert call["instructions"] == notes.INSTRUCTIONS
         text_bytes = len((call["instructions"] + call["prompt"] + json.dumps(
             call["schema"], ensure_ascii=False, separators=(",", ":"))).encode("utf-8"))
         assert text_bytes <= notes.MAX_CHAPTER_TEXT_BYTES
-        for segment in call["payload"]["context"]["segments"]:
+        for segment in call["payload"]["segments"]:
             assert set(segment) == {"id", "start", "end", "text"}
 
 
@@ -126,14 +123,15 @@ def test_manual_split_ids_are_persisted_and_import_does_not_split_again(tmp_path
     prepare_job(tmp_path, data)
     folder = notes.generate_notes(tmp_path, tmp_path / "auth", manual=True)
     outline = read_json(tmp_path / "outline.json")
-    assert read_json(folder / "outline.json") == outline
+    assert not (folder / "outline.json").exists()
     assert len(outline["chapters"]) > 1
     contexts = assert_coverage(outline, data)
     replies = tmp_path / "replies"
     replies.mkdir()
     for chapter, context in zip(outline["chapters"], contexts, strict=True):
-        assert read_json(folder / chapter["id"] / "context.json") == notes._model_context(context)
-        write_json(replies / f"{chapter['id']}.json", chapter_reply({"context": context}))
+        model_context = notes._model_context(context, outline, outline["glossary"])
+        assert read_json(folder / "inputs" / chapter["id"] / "context.json") == model_context
+        write_json(replies / f"{chapter['id']}.json", chapter_reply(model_context))
     monkeypatch.setattr(notes, "MAX_CHAPTER_TEXT_BYTES", 1)
     result = notes.generate_notes(tmp_path, tmp_path / "auth", imported=replies)
     assert result.exists()
@@ -147,7 +145,7 @@ def test_typed_context_error_splits_only_failed_chapter_and_retries(tmp_path, er
     prepare_job(tmp_path, data)
 
     def fail_large(payload):
-        chapter = payload["context"]["chapter"]
+        chapter = payload["chapter"]
         if chapter["end"] - chapter["start"] > 450:
             raise error_type("Context limit", code="context_length_exceeded")
 
@@ -158,7 +156,7 @@ def test_typed_context_error_splits_only_failed_chapter_and_retries(tmp_path, er
     outline = read_json(tmp_path / "outline.json")
     assert len(outline["chapters"]) == 2
     assert_coverage(outline, data)
-    assert [call["payload"]["context"]["chapter"]["id"] for call in client.calls[1:]] == [
+    assert [call["payload"]["chapter"]["id"] for call in client.calls[1:]] == [
         chapter["id"] for chapter in outline["chapters"]]
 
 
@@ -175,7 +173,7 @@ def test_other_error_falls_back_once_without_matching_message_text(tmp_path, err
     assert folder == tmp_path / "handoff" and len(client.calls) == 1
     assert read_json(tmp_path / "outline.json") == notes.default_outline(data)
     assert read_json(folder / "status.json")["status"] == "manual_required"
-    assert read_json(folder / "ch001/context.json")["segments"] == notes.chapter_context(
+    assert read_json(folder / "inputs/ch001/context.json")["segments"] == notes.chapter_context(
         data, notes.default_outline(data)["chapters"][0])["segments"]
 
 
@@ -191,7 +189,7 @@ def test_irreducible_text_budget_preserves_all_evidence_in_manual_handoff(tmp_pa
     assert_coverage(outline, data)
     assert read_json(folder / "status.json")["status"] == "manual_required"
     for chapter in outline["chapters"]:
-        assert read_json(folder / chapter["id"] / "context.json")["segments"][0]["text"] == "x" * 150000
+        assert read_json(folder / "inputs" / chapter["id"] / "context.json")["segments"][0]["text"] == "x" * 150000
 
 
 
@@ -208,7 +206,7 @@ def test_irreducible_context_error_stops_at_minimum_chapter(tmp_path):
     folder = notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
     assert folder == tmp_path / "handoff" and len(client.calls) == 1
     assert read_json(tmp_path / "outline.json") == notes.default_outline(data)
-    assert read_json(folder / "ch001/context.json")["segments"][0]["id"] == "s000"
+    assert read_json(folder / "inputs/ch001/context.json")["segments"][0]["id"] == "s000"
 
 
 @pytest.mark.parametrize("error_type", [ResponseError, PlanAccessError])
@@ -217,13 +215,13 @@ def test_runtime_split_keeps_earlier_success_and_caches_both_children(tmp_path, 
     prepare_job(tmp_path, data)
 
     def fail_second(payload):
-        chapter = payload["context"]["chapter"]
+        chapter = payload["chapter"]
         if chapter["id"] == "ch002":
             raise error_type("Context limit", code="context_length_exceeded")
 
     client = FakeClient(fail_second)
     assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client).exists()
-    ids = [call["payload"]["context"]["chapter"]["id"] for call in client.calls]
+    ids = [call["payload"]["chapter"]["id"] for call in client.calls]
     assert len(ids) == 4 and ids[:2] == ["ch001", "ch002"]
     assert ids.count("ch001") == 1
     outline = read_json(tmp_path / "outline.json")
@@ -242,7 +240,7 @@ def test_resume_reuses_successful_chapters_with_generated_titles_and_glossary(tm
     prepare_job(tmp_path, data, outline)
 
     def fail_second(payload):
-        if payload["context"]["chapter"]["id"] == "ch002":
+        if payload["chapter"]["id"] == "ch002":
             raise ResponseError("Temporary failure", code="server_error")
 
     first_client = FakeClient(fail_second)
@@ -252,7 +250,7 @@ def test_resume_reuses_successful_chapters_with_generated_titles_and_glossary(tm
     resumed = FakeClient()
     assert notes.generate_notes(tmp_path, tmp_path / "auth", client=resumed).exists()
     assert len(resumed.calls) == 1
-    assert resumed.calls[0]["payload"]["context"]["chapter"]["id"] == "ch002"
+    assert resumed.calls[0]["payload"]["chapter"]["id"] == "ch002"
     assert {entry["term"] for entry in resumed.calls[0]["payload"]["glossary"]} == {"A", "ch001"}
     assert read_json(tmp_path / "outline.json") == outline
     generated = read_json(tmp_path / "notes.json")

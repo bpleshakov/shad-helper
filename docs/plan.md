@@ -20,10 +20,18 @@ speech-grounded explanations, equations, code, and TikZ/PGFPlots diagrams.
 - Export JSON/SRT/VTT, confidence/repetition warnings, and current-run timings.
   Preserve silent artifacts; reject synthesis without speech.
 
-`evidence.json` uses schema version 2: `title`, `media`, `segments`, `issues`,
-and `models.asr`. Media includes path, SHA-256, duration, and extracted interval.
+`evidence.json` uses schema version 3 and contains exactly `schema_version`,
+`title`, `media`, and `segments`. Each speech segment contains exactly `id`,
+`start`, `end`, and `text`. Media includes path, SHA-256, duration, and extracted
+interval. `transcript.json` is a copy of the clean segment array.
+
+`extraction-diagnostics.json` uses schema version 1 and contains the clean
+evidence fingerprint, `models.asr`, per-segment words and diagnostic scores, and
+informational warnings with `id`, `description`, and `evidence_ids`. It has no
+review statuses or approval gate. Notes never read it.
+
 Before extraction, `extraction-config.json` records
-`{"schema_version": 2, "pipeline": "audio"}` so interrupted jobs can resume.
+`{"schema_version": 3, "pipeline": "audio"}` so interrupted jobs can resume.
 Legacy jobs and nonempty unrecognized directories require a new output directory;
 reject them before any rebuild, review, or rendering writes.
 
@@ -31,13 +39,21 @@ reject them before any rebuild, review, or rendering writes.
 
 - Use consecutive fifteen-minute chapters, bounded neighboring speech context,
   an editable outline, shared glossary, and chapter checkpoints.
-- Send speech IDs, timestamps, and text. Keep diagnostics and existing review
-  issues local. Lecture blocks cite valid chapter-scoped speech evidence.
+- Send speech IDs, timestamps, and text. Isolate extraction diagnostics from
+  generation, checkpoints, review, and render freshness. Lecture blocks cite valid
+  chapter-scoped speech evidence.
 - Split requests above 120,000 UTF-8 bytes and retry typed context-limit failures.
   Stop before parts become shorter than thirty seconds. Preserve all speech in
   manual handoffs when splitting cannot help.
 - Automatic and imported replies use the same schema. Mark added explanations
   and uncertain details; do not invent unspoken formula, code, or diagram details.
+- Use three distinct manual inputs: shared instructions in `prompt.txt`, lecture
+  title/glossary/chapter/speech in `context.json`, and output constraints in
+  `response-schema.json`. Keep them under `handoff/inputs/`, with operator README
+  and fallback status outside it. Export no duplicate outline or transcript.
+- Preserve note-generated issues and explicit resolutions. Review operates on
+  notes only. Bind resolution records and the rendered project to the complete
+  clean evidence fingerprint; diagnostic-only changes leave them valid.
 - Retain confined TeX/code references, disabled shell escape, review-driven draft
   footers, manual-edit preservation, and evidence fingerprints.
 - Compile with LuaLaTeX, retain logs, and render PDF previews. Diagrams use inline
@@ -46,7 +62,8 @@ reject them before any rebuild, review, or rendering writes.
 ## Verification
 
 Cover media routing, intervals, overlap ownership, resume, checkpoint invalidation,
-silence, text-only requests, manual round trips, chapter budgets, citations,
-review persistence, and legacy-file preservation. Use generated audio and
-multistream video with mocked Whisper, and real LuaLaTeX/PyMuPDF for PDF checks.
+silence, diagnostic isolation, distinct manual inputs, manual round trips,
+chapter budgets, citations, review persistence, and legacy-file preservation.
+Use generated audio and multistream video with mocked Whisper, and real
+LuaLaTeX/PyMuPDF for PDF checks.
 Assess real speech accuracy separately on a representative Russian recording.
