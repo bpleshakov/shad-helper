@@ -1,14 +1,12 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "title": "Синтетический пример: линейное преобразование",
-  "video": {"path": "synthetic-example", "duration": 120, "clip_start": 0, "clip_end": 120},
+  "media": {"path": "synthetic-example", "duration": 120, "clip_start": 0, "clip_end": 120},
   "segments": [
     {"id": "s001", "start": 0, "end": 40, "text": "Линейное преобразование сохраняет сложение векторов и умножение на скаляр."},
     {"id": "s002", "start": 40, "end": 80, "text": "Например, матрица с диагональными элементами два и один растягивает первую координату вдвое."},
     {"id": "s003", "start": 80, "end": 120, "text": "Код создает матрицу и применяет ее к вектору с координатами один и один."}
   ],
-  "visuals": [],
-  "sources": [],
   "issues": [],
   "models": {"asr": "synthetic-fixture"}
 }

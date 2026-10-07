@@ -1,12 +1,9 @@
 """Offline unittest checks plus full mocked HTTP tests when dependencies exist."""
 
 import ast
-import base64
 import importlib.util
 import json
-import mimetypes
 import os
-import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -86,7 +83,7 @@ def _client_module():
     auth_tree = ast.parse(auth_path.read_text())
     auth_class = next(node for node in auth_tree.body if isinstance(node, ast.ClassDef) and node.name == "PlanAccessError")
     exec(compile(ast.Module(body=[auth_class], type_ignores=[]), str(auth_path), "exec"), module.__dict__)
-    module.__dict__.update(base64=base64, json=json, mimetypes=mimetypes, Path=Path,
+    module.__dict__.update(json=json, Path=Path,
         RESOURCE="https://api.openai.com/v1", access_token=token_provider,
         resolve_openai_proxy=resolve_proxy, openai_http_client=Client,
         http_error=lambda _: module.PlanAccessError("offline HTTP error"),
@@ -193,50 +190,6 @@ class ClientStdlibTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, code)
         self.assertEqual(caught.exception.request_id, "offline-request")
 
-    def test_plan_contract_inline_evidence_and_exact_payload_boundary(self):
-        module, calls = _client_module()
-        with tempfile.TemporaryDirectory() as directory:
-            image = Path(directory) / "visual_001.png"
-            image.write_bytes(b"original-image-bytes")
-            client = module.PlanClient(Path(directory), token_provider=lambda: "offline-token")
-            self.assertEqual(client.complete("Notes instructions", "Русская лекция", [image]), {})
-            self.assertEqual(client.models(), ["gpt-6-astra"])
-            method, url, request = next(call for call in reversed(calls) if call[0] == "POST")
-            self.assertEqual((method, url), ("POST", "https://api.openai.com/v1/responses"))
-            self.assertEqual(request["headers"]["Content-Type"], "application/json")
-            body = json.loads(request["content"])
-            self.assertEqual(body["model"], "gpt-6-astra")
-            self.assertEqual(body["reasoning"], {"effort": "high"})
-            self.assertFalse(body["store"])
-            self.assertTrue(body["stream"])
-            content = body["input"][0]["content"]
-            self.assertEqual(content[1], {"type": "input_text", "text": "Evidence image: visual_001.png"})
-            self.assertEqual(base64.b64decode(content[2]["image_url"].split(",", 1)[1]), image.read_bytes())
-            self.assertFalse(set(body) & {"tools", "max_output_tokens", "previous_response_id", "background", "temperature"})
-            size = len(request["content"])
-            module.MAX_REQUEST_BYTES = size
-            self.assertEqual(client.complete("Notes instructions", "Русская лекция", [image]), {})
-            count = len(calls)
-            module.MAX_REQUEST_BYTES = size - 1
-            with self.assertRaisesRegex(module.ResponseError, "manual handoff"):
-                client.complete("Notes instructions", "Русская лекция", [image])
-            self.assertEqual(len(calls), count)
-
-    def test_oversized_evidence_is_rejected_before_network(self):
-        module, calls = _client_module()
-        with tempfile.TemporaryDirectory() as directory:
-            image = Path(directory) / "visual.png"
-            image.write_bytes(b"original-evidence" * 100)
-            client = module.PlanClient(Path(directory), token_provider=lambda: "offline-token")
-            with self.assertRaisesRegex(module.ResponseError, "no evidence images were omitted"):
-                client.complete("Instructions", "Text", [image] * 1501)
-            module.MAX_REQUEST_BYTES = 1024
-            with self.assertRaisesRegex(module.ResponseError, "Split the chapter"):
-                client.complete("Instructions", "Text", [image])
-            with self.assertRaisesRegex(module.ResponseError, "512 MB"):
-                client.complete("Instructions", "Лекция" * 100)
-            self.assertEqual(calls, [])
-            self.assertEqual(image.read_bytes(), b"original-evidence" * 100)
 
     def test_unavailable_model_and_invalid_json_never_return_notes(self):
         module, calls = _client_module()
@@ -337,12 +290,10 @@ if _FULL_DEPS:
             PlanClient(tmp_path, transport=httpx.MockTransport(unexpected_network), token_provider=lambda: pytest.fail("Unexpected token access"))
 
 
-    def test_plan_request_contract_and_inline_images(tmp_path):
-        image = tmp_path / "evidence.png"
-        image.write_bytes(b"image-evidence")
+    def test_plan_request_contract_is_text_only(tmp_path):
         schema = {"type": "object", "properties": {"notes": {"type": "string"}}, "required": ["notes"], "additionalProperties": False}
         client, requests = client_for(tmp_path, sse({"type": "response.output_text.delta", "delta": '{"notes":'}, completed('{"notes":"Привет"}')))
-        assert client.complete("Return notes JSON.", "Lecture text.", [image], schema) == {"notes": "Привет"}
+        assert client.complete("Return notes JSON.", "Lecture text.", schema) == {"notes": "Привет"}
         body = json.loads(requests[-1].content)
         assert body["model"] == "gpt-6-astra"
         assert body["reasoning"] == {"effort": "high"}
@@ -350,81 +301,10 @@ if _FULL_DEPS:
         assert body["instructions"] == "Return notes JSON."
         assert isinstance(body["input"], list)
         assert body["input"][0]["role"] == "user"
-        assert body["input"][0]["content"][1] == {"type": "input_text", "text": "Evidence image: evidence.png"}
-        assert body["input"][0]["content"][2]["image_url"].startswith("data:image/png;base64,")
+        assert body["input"][0]["content"] == [{"type": "input_text", "text": "Lecture text."}]
         assert body["text"]["format"]["schema"] == schema
         assert not set(body) & {"tools", "max_output_tokens", "previous_response_id", "background", "temperature"}
         assert client.models() == ["gpt-6-astra"]
-
-
-    def test_svg_evidence_is_rendered_without_changing_source_or_provenance(tmp_path, monkeypatch):
-        pymupdf = pytest.importorskip("pymupdf")
-        image = tmp_path / "notebook-chart.svg"
-        original = (b'<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300">'
-                    b'<rect width="400" height="300" fill="white"/>'
-                    b'<path d="M20 280 L200 20 L380 280" fill="none" stroke="blue"/>'
-                    b'<text x="20" y="150" font-size="20">x+y=1</text></svg>')
-        image.write_bytes(original)
-        client, requests = client_for(tmp_path, sse(completed("{}")))
-        assert client.complete("Instructions", "Lecture text", [image]) == {}
-        body = json.loads(requests[-1].content)
-        content = body["input"][0]["content"]
-        assert content[1] == {"type": "input_text", "text": "Evidence image: notebook-chart.svg"}
-        assert content[2]["image_url"].startswith("data:image/png;base64,")
-        rendered = base64.b64decode(content[2]["image_url"].split(",", 1)[1])
-        assert rendered.startswith(b"\x89PNG\r\n\x1a\n")
-        raster = pymupdf.Pixmap(rendered)
-        assert (raster.width, raster.height) == (800, 600)
-        assert image.read_bytes() == original
-
-        # The limit uses rasterized bytes, including base64 overhead, rather than SVG size.
-        monkeypatch.setattr(openai_client, "MAX_REQUEST_BYTES", len(requests[-1].content) - 1)
-        count = len(requests)
-        with pytest.raises(ResponseError, match="512 MB"):
-            client.complete("Instructions", "Lecture text", [image])
-        assert len(requests) == count
-        assert image.read_bytes() == original
-
-
-    def test_oversized_image_count_never_makes_network_requests(tmp_path):
-        client, requests = client_for(tmp_path, "")
-        with pytest.raises(ResponseError, match="no evidence images were omitted"):
-            client.complete("Instructions", "Text", [tmp_path / "image.png"] * 1501)
-        assert not requests
-
-
-    def test_oversized_image_payload_never_makes_network_requests(tmp_path, monkeypatch):
-        image = tmp_path / "image.png"
-        image.write_bytes(b"evidence" * 100)
-        client, requests = client_for(tmp_path, "")
-        monkeypatch.setattr(openai_client, "MAX_REQUEST_BYTES", 1024)
-        with pytest.raises(ResponseError, match="Split the chapter"):
-            client.complete("Instructions", "Text", [image])
-        assert not requests
-        assert image.read_bytes() == b"evidence" * 100
-
-
-    def test_exact_payload_size_includes_unicode_text_and_schema(tmp_path, monkeypatch):
-        client, requests = client_for(tmp_path, "")
-        monkeypatch.setattr(openai_client, "MAX_REQUEST_BYTES", 1024)
-        with pytest.raises(ResponseError, match="512 MB"):
-            client.complete("Instructions", "Лекция" * 100)
-        assert not requests
-
-
-    def test_payload_accepts_exact_byte_boundary_and_rejects_one_byte_less(tmp_path, monkeypatch):
-        image = tmp_path / "visual_001.png"
-        image.write_bytes(b"original-image")
-        client, requests = client_for(tmp_path, sse(completed("{}")))
-        assert client.complete("Instructions", "Русская лекция", [image]) == {}
-        size = len(requests[-1].content)
-        monkeypatch.setattr(openai_client, "MAX_REQUEST_BYTES", size)
-        assert client.complete("Instructions", "Русская лекция", [image]) == {}
-        count = len(requests)
-        monkeypatch.setattr(openai_client, "MAX_REQUEST_BYTES", size - 1)
-        with pytest.raises(ResponseError, match="manual handoff"):
-            client.complete("Instructions", "Русская лекция", [image])
-        assert len(requests) == count
 
 
     def test_strict_schema_recursively_requires_properties_without_mutating_input():

@@ -1,26 +1,18 @@
 [project]
 name = "shad-helper"
 version = "0.1.0"
-description = "Local Russian lecture extraction and source-grounded LaTeX notes"
+description = "Local Russian audio transcription and transcript-grounded LaTeX notes"
 requires-python = ">=3.14"
 dependencies = [
     "httpx>=0.28.1",
-    "numpy>=2.3",
-    "opencv-python>=4.12.0.88",
-    "pillow>=11.3",
     "pydantic>=2.12",
     "PyJWT[crypto]>=2.10",
     "pymupdf>=1.26",
-    "python-pptx>=1.0.2",
-    "tqdm>=4.67",
 ]
 
 [project.optional-dependencies]
 local = [
     "mlx-whisper>=0.4.3",
-    "mlx-vlm>=0.7.6",
-    "pyobjc-framework-Vision>=12.2.2; sys_platform == 'darwin'",
-    "pyobjc-framework-Quartz>=12.2.2; sys_platform == 'darwin'",
 ]
 
 [project.scripts]

@@ -1,8 +1,6 @@
 """Streaming Responses API through the user's authorized ChatGPT plan."""
 
-import base64
 import json
-import mimetypes
 from pathlib import Path
 
 import httpx
@@ -12,11 +10,6 @@ from shad_helper.network import openai_http_client, resolve_openai_proxy
 
 DEFAULT_MODEL = "gpt-6-astra"
 DEFAULT_REASONING_EFFORT = "high"
-
-# https://developers.openai.com/api/docs/guides/images-vision
-MAX_REQUEST_BYTES = 512_000_000
-MAX_IMAGES = 1_500
-
 
 class ResponseError(RuntimeError):
     def __init__(self, message, *, code=None):
@@ -46,13 +39,6 @@ def _strict_schema(value):
 
 def _serialize(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
-
-
-def _image_payload_error():
-    return ResponseError(
-        "Evidence exceeds the image count or 512 MB request limit. "
-        "Split the chapter or use the manual handoff; no evidence images were omitted."
-    )
 
 
 def _events(response):
@@ -138,47 +124,12 @@ class PlanClient:
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
             raise ResponseError("ChatGPT returned an invalid account-specific model catalog.") from exc
 
-    def complete(self, instructions: str, text: str, images: list[Path] | None = None, schema: dict | None = None) -> dict:
-        images = images or []
-        if len(images) > MAX_IMAGES:
-            raise _image_payload_error()
+    def complete(self, instructions: str, text: str, schema: dict | None = None) -> dict:
         content = [{"type": "input_text", "text": text}]
         body = {"model": self.model, "reasoning": {"effort": DEFAULT_REASONING_EFFORT}, "instructions": instructions, "input": [{"role": "user", "content": content}], "store": False, "stream": True}
         if schema is not None:
             body["text"] = {"format": {"type": "json_schema", "name": "lecture_notes", "schema": _strict_schema(schema), "strict": True}}
-        estimated_size = len(_serialize(body))
-        if estimated_size > MAX_REQUEST_BYTES:
-            raise _image_payload_error()
-        for image in images:
-            image = Path(image)
-            mime = mimetypes.guess_type(image.name)[0]
-            rendered = None
-            if mime == "image/svg+xml":
-                import pymupdf
-
-                try:
-                    with (pymupdf.open(image) as vector,
-                          pymupdf.open(stream=vector.convert_to_pdf(), filetype="pdf") as pdf):
-                        rendered = pdf[0].get_pixmap(
-                            matrix=pymupdf.Matrix(2, 2), alpha=False).tobytes("png")
-                except (RuntimeError, ValueError) as exc:
-                    raise ResponseError(f"Cannot render evidence SVG: {image.name}.") from exc
-                mime = "image/png"
-            if mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
-                raise ResponseError(f"Unsupported evidence image format: {image.suffix}.")
-            # Vision does not receive filenames; make the provenance mapping explicit.
-            label = {"type": "input_text", "text": f"Evidence image: {image.name}"}
-            item = {"type": "input_image", "image_url": f"data:{mime};base64,", "detail": "high"}
-            image_size = len(rendered) if rendered is not None else image.stat().st_size
-            estimated_size += len(_serialize([label, item])) - 1 + 4 * ((image_size + 2) // 3)
-            if estimated_size > MAX_REQUEST_BYTES:
-                raise _image_payload_error()
-            encoded = base64.b64encode(rendered if rendered is not None else image.read_bytes()).decode("ascii")
-            item["image_url"] += encoded
-            content.extend([label, item])
         payload = _serialize(body)
-        if len(payload) > MAX_REQUEST_BYTES:
-            raise _image_payload_error()
         available = self.models() if self._available_models is None else self._available_models
         if self.model not in available:
             raise PlanAccessError(f"{self.model} is unavailable for the signed-in ChatGPT account.", code="model_unavailable")

@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from shad_helper import rendering
-from shad_helper.jobs import fingerprint
+from shad_helper.jobs import AUDIO_CONFIG, fingerprint, write_json
 
 
 def sample_notes():
@@ -28,8 +28,7 @@ def sample_notes():
         }],
         "glossary": [{"term": "Ожидание", "definition": r"Среднее значение \(X\)."}],
         "issues": [{"id": "issue-1", "description": "Неясный индекс", "status": "open", "resolution": "", "evidence_ids": ["ev-1"]}],
-        "illustrations": [],
-        "evidence_index": {"ev-1": "Видео 00:01:05 - 00:01:12"},
+        "evidence_index": {"ev-1": "Аудио 00:01:05 - 00:01:12"},
     }
 
 
@@ -38,6 +37,7 @@ class RenderingTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.job = Path(self.directory.name)
         self.notes = sample_notes()
+        write_json(self.job / "extraction-config.json", AUDIO_CONFIG)
 
     def tearDown(self):
         self.directory.cleanup()
@@ -66,7 +66,7 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("Пояснение", chapter)
         self.assertEqual((root / "code/code-1.txt").read_text(), self.notes["chapters"][0]["blocks"][2]["content"])
         self.assertEqual(len(manifest["review"]), 2)
-        self.assertIn("Видео 00:01:05", chapter)
+        self.assertIn("Аудио 00:01:05", chapter)
 
     def test_invalid_inline_math_is_blocked(self):
         for content in (r"Не закрыто \(x", r"Опасно \(\input{secret}\)"):
@@ -108,10 +108,6 @@ class RenderingTests(unittest.TestCase):
                 with self.assertRaises(rendering.RenderError):
                     self.project()
 
-    def test_source_image_paths_cannot_be_declared(self):
-        self.notes["illustrations"] = [{"id": "figure-1", "chapter_id": "chapter-1", "prompt": "Сгенерировать схему", "caption": "Схема", "path": "../evidence/frame.png"}]
-        with self.assertRaises(rendering.RenderError):
-            self.project()
 
     def test_manual_tex_edits_are_preserved_and_report_is_written(self):
         root, _ = self.project()
@@ -156,67 +152,6 @@ class RenderingTests(unittest.TestCase):
         with self.assertRaises(rendering.RenderError):
             rendering._validate_project(root, manifest)
 
-    def test_illustrations_import_by_id_and_sources_are_never_fallback(self):
-        self.notes["illustrations"] = [{"id": "figure-1", "chapter_id": "chapter-1", "prompt": "Create a probability distribution illustration", "caption": "Распределение"}]
-        root, manifest = self.project()
-        rendering._validate_project(root, manifest)
-        images = self.job / "generated"
-        images.mkdir()
-        (images / "figure-1.png").write_bytes(b"explicit generated asset")
-        with patch.object(rendering, "_check_image"):
-            missing = rendering._import_illustrations(self.job, root, manifest["illustration_ids"], images)
-        self.assertEqual(missing, [])
-        self.assertEqual((root / "figures/illustrations/figure-1.png").read_bytes(), b"explicit generated asset")
-        self.assertEqual(json.loads((root / "illustrations.json").read_text())[0]["prompt"], self.notes["illustrations"][0]["prompt"])
-        (root / "figures/illustrations/figure-1.png").unlink()
-        evidence = self.job / "evidence"
-        evidence.mkdir()
-        (evidence / "figure-1.png").write_bytes(b"source screenshot")
-        self.assertEqual(rendering._import_illustrations(self.job, root, ["figure-1"], None), ["figure-1"])
-        with self.assertRaises(rendering.RenderError):
-            rendering._import_illustrations(self.job, root, ["figure-1"], evidence)
-        self.assertFalse((root / "figures/illustrations/figure-1.png").exists())
-
-    def test_source_screenshot_copy_outside_evidence_is_rejected(self):
-        root, _ = self.project()
-        evidence = self.job / "frames"
-        images = self.job / "generated"
-        evidence.mkdir()
-        images.mkdir()
-        (evidence / "frame-005.png").write_bytes(b"identical source screenshot")
-        (images / "figure-1.png").write_bytes(b"identical source screenshot")
-        with self.assertRaises(rendering.RenderError):
-            rendering._import_illustrations(self.job, root, ["figure-1"], images)
-        self.assertFalse((root / "figures/illustrations/figure-1.png").exists())
-
-    def test_original_source_images_and_renamed_copies_are_rejected(self):
-        root, _ = self.project()
-        originals = self.job / "source_originals"
-        images = self.job / "generated"
-        originals.mkdir()
-        images.mkdir()
-        (originals / "figure-1.png").write_bytes(b"whiteboard screenshot")
-        (images / "figure-1.png").write_bytes(b"whiteboard screenshot")
-        for directory in (originals, images):
-            with self.subTest(directory=directory.name), patch.object(rendering, "_check_image") as decode:
-                with self.assertRaisesRegex(rendering.RenderError, "[Ss]ource evidence"):
-                    rendering._import_illustrations(self.job, root, ["figure-1"], directory)
-                decode.assert_not_called()
-        self.assertFalse((root / "figures/illustrations/figure-1.png").exists())
-
-    def test_image_destination_cannot_alias_manual_tex(self):
-        root, _ = self.project()
-        main = root / "main.tex"
-        original = main.read_bytes()
-        destination = root / "figures/illustrations"
-        destination.mkdir()
-        (destination / "figure-1.png").symlink_to(main)
-        images = self.job / "generated"
-        images.mkdir()
-        (images / "figure-1.png").write_bytes(b"generated illustration")
-        with patch.object(rendering, "_check_image"), self.assertRaises(rendering.RenderError):
-            rendering._import_illustrations(self.job, root, ["figure-1"], images)
-        self.assertEqual(main.read_bytes(), original)
 
     def test_resolved_notes_have_no_draft_footer(self):
         self.notes["issues"][0]["status"] = "resolved"
@@ -230,7 +165,7 @@ class RenderingTests(unittest.TestCase):
 
     def test_evidence_fingerprint_ignores_formatting_and_rejects_changed_content(self):
         evidence_path = self.job / "evidence.json"
-        evidence = {"segments": [{"id": "ev-1", "text": "Исходная формулировка"}], "issues": []}
+        evidence = {"schema_version": 2, "media": {"duration": 1800}, "segments": [{"id": "ev-1", "text": "Исходная формулировка"}], "issues": []}
         evidence_path.write_text(json.dumps(evidence, ensure_ascii=False))
         root, manifest = self.project()
         self.assertEqual(manifest["evidence_fingerprint"], fingerprint(evidence))
@@ -252,7 +187,7 @@ class RenderingTests(unittest.TestCase):
         _, manifest = self.project()
         self.assertIsNone(manifest["evidence_fingerprint"])
         evidence_path = self.job / "evidence.json"
-        evidence_path.write_text('{"segments": []}')
+        evidence_path.write_text('{"schema_version": 2, "media": {"duration": 1800}, "segments": []}')
         with self.assertRaisesRegex(rendering.RenderError, "Evidence changed"):
             rendering.render(self.job)
         self.project()
@@ -262,7 +197,7 @@ class RenderingTests(unittest.TestCase):
 
     def test_review_refresh_preserves_edits_and_uncertain_blocks_keep_draft(self):
         evidence_path = self.job / "evidence.json"
-        evidence = {"issues": [{"id": "issue-1", "status": "open"}]}
+        evidence = {"schema_version": 2, "media": {"duration": 1800}, "issues": [{"id": "issue-1", "status": "open"}]}
         evidence_path.write_text(json.dumps(evidence))
         root, _ = self.project()
         edited_paths = [root / "chapters/chapter-1.tex", root / "figures/diagram-diagram-1.tex", root / "code/code-1.txt"]
@@ -295,7 +230,7 @@ class RenderingTests(unittest.TestCase):
         self.assertFalse(manifest["draft"])
         self.assertEqual(manifest["review"], [])
         self.assertNotIn("ЧЕРНОВИК", main_path.read_text())
-        self.assertEqual(main_path.read_text(), original_main.replace(rendering._draft_footer([], [{"id": "uncertain-1"}]), ""))
+        self.assertEqual(main_path.read_text(), original_main.replace(rendering._draft_footer([{"id": "uncertain-1"}]), ""))
         for path, content in edited.items():
             self.assertEqual(path.read_bytes(), content)
         rendering._validate_project(root, manifest)
@@ -327,6 +262,23 @@ class RenderingTests(unittest.TestCase):
         report = json.loads((root / "render-report.json").read_text())
         self.assertEqual(report["status"], "failed")
         self.assertTrue(report["missing_fonts"])
+
+    def test_font_database_initialization_is_not_a_missing_font(self):
+        root, _ = self.project()
+        notice = "luaotfload | db : Font names database not found, generating new one."
+        error = "Font missing: fontspec error - Requested Font cannot be found"
+
+        def compiler(arguments, *, stdout, **kwargs):
+            stdout.write(notice + "\n" + error + "\n")
+            (root / "main.pdf").write_bytes(b"%PDF-1.7\n")
+            return subprocess.CompletedProcess(arguments, 0)
+
+        with patch.object(rendering.shutil, "which", return_value="/bin/test"), \
+                patch.object(rendering.subprocess, "run", side_effect=compiler), \
+                patch.object(rendering, "_qa", return_value=1):
+            rendering.render(self.job)
+        report = json.loads((root / "render-report.json").read_text())
+        self.assertEqual(report["missing_fonts"], [error])
 
     @unittest.skipUnless(shutil.which("latexmk") and shutil.which("lualatex") and importlib.util.find_spec("pymupdf"), "LuaLaTeX, latexmk, and PyMuPDF are required")
     def test_actual_cyrillic_math_diagram_code_pdf_and_qa(self):

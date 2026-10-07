@@ -16,54 +16,34 @@ from shad_helper.notes import (
 
 
 def evidence():
-    return {"title": "Линейная алгебра", "video": {"duration": 1800},
+    return {"schema_version": 2, "title": "Линейная алгебра", "media": {"duration": 1800},
             "segments": [{"id": "s1", "start": 10, "end": 12, "text": "Матрица"},
                          {"id": "s2", "start": 1200, "end": 1205, "text": "Следующий раздел"}],
-            "visuals": [{"id": "v1", "timestamp": 11, "image": "evidence/frame.png",
-                         "regions": [{"id": "r1", "kind": "formula", "text": "A^T"}]},
-                        {"id": "pv1", "timestamp": None, "source_id": "p1",
-                         "image": "evidence/source.png", "regions": []}],
-            "sources": [{"id": "p1", "kind": "pdf", "source": "slides.pdf",
-                         "location": "page 1", "matched_visual_ids": ["v1"], "text": "A^T"},
-                        {"id": "p2", "kind": "pdf", "source": "other.pdf",
-                         "location": "page 2", "matched_visual_ids": [], "text": "Unrelated"}],
             "issues": [{"id": "issue1", "description": "Неясный индекс",
-                        "evidence_ids": ["r1"], "status": "open", "resolution": ""}]}
+                        "evidence_ids": ["s1"], "status": "open", "resolution": ""}]}
 
 
 def reply():
     return {"title": "Линейная алгебра", "language": "ru", "chapters": [
         {"id": "ch001", "title": "Матрицы", "start": 0, "end": 900,
          "blocks": [{"id": "ch001_b1", "kind": "math", "content": "A^T",
-                     "evidence_ids": ["r1"]}]}], "glossary": [], "issues": [], "illustrations": []}
+                     "evidence_ids": ["s1"]}]}], "glossary": [], "issues": []}
 
 
 class NotesContextTests(unittest.TestCase):
-    def test_context_includes_only_matched_sources(self):
+    def test_context_includes_only_scoped_speech_and_issues(self):
         context = chapter_context(evidence(), {"id": "ch001", "start": 0, "end": 900})
+        self.assertEqual(set(context), {"chapter", "segments", "issues"})
         self.assertEqual([s["id"] for s in context["segments"]], ["s1"])
-        self.assertEqual([s["id"] for s in context["sources"]], ["p1"])
-        self.assertEqual([v["id"] for v in context["visuals"]], ["v1", "pv1"])
         self.assertEqual([i["id"] for i in context["issues"]], ["issue1"])
 
     def test_clip_outline_keeps_original_timestamps(self):
         data = evidence()
-        data["video"].update(clip_start=500, clip_end=650)
+        data["media"].update(clip_start=500, clip_end=650)
         outline = default_outline(data)
         self.assertEqual(outline["chapters"][0]["start"], 500)
         self.assertEqual(outline["chapters"][0]["end"], 650)
 
-    def test_persistent_slide_and_matched_source_carry_into_next_chapter(self):
-        context = chapter_context(evidence(), {"id": "ch002", "start": 900, "end": 1800})
-        self.assertEqual([v["id"] for v in context["visuals"]], ["v1", "pv1"])
-        self.assertEqual([s["id"] for s in context["sources"]], ["p1"])
-
-    def test_newer_slide_replaces_persistent_context(self):
-        data = evidence()
-        data["visuals"].append({"id": "v2", "timestamp": 800, "regions": []})
-        context = chapter_context(data, {"id": "ch002", "start": 900, "end": 1800})
-        self.assertEqual([v["id"] for v in context["visuals"]], ["v2"])
-        self.assertEqual(context["sources"], [])
 
     def test_resolved_issue_does_not_make_uncertain_content_ready(self):
         data = reply()
@@ -76,7 +56,7 @@ class NotesContextTests(unittest.TestCase):
             write_json(job / "evidence.json", evidence())
             with self.assertRaises(ValueError):
                 resolve_issue(job, "issue1", "")
-            resolve_issue(job, "issue1", "Проверен нижний индекс i; исправлен текст OCR")
+            resolve_issue(job, "issue1", "Проверен нижний индекс i; исправлена транскрипция")
             self.assertTrue(read_json(job / "review.json")["ready"])
             self.assertEqual(read_json(job / "evidence.json")["issues"][0]["status"], "resolved")
             self.assertIn("evidence_fingerprint", read_json(job / "review-resolutions.json")["issue1"])
@@ -128,10 +108,10 @@ class NotesValidationTests(unittest.TestCase):
     def test_explicit_resolution_survives_import_but_changed_evidence_invalidates_it(self):
         data = reply()
         data["issues"] = [{"id": "note_issue", "description": "Неясный знак",
-                           "evidence_ids": ["r1"], "status": "open", "resolution": ""}]
+                           "evidence_ids": ["s1"], "status": "open", "resolution": ""}]
         source = evidence()
         signature = fingerprint({key: value for key, value in source.items() if key != "issues"})
-        records = {"note_issue": {"description": "Неясный знак", "evidence_ids": ["r1"],
+        records = {"note_issue": {"description": "Неясный знак", "evidence_ids": ["s1"],
                                   "resolution": "Проверено: плюс", "evidence_fingerprint": signature}}
         self.assertEqual(_validate_evidence(data, source, records)["issues"][0]["status"], "resolved")
         source["segments"][0]["text"] = "Другой материал"
@@ -142,7 +122,7 @@ class NotesValidationTests(unittest.TestCase):
         signature = fingerprint({key: value for key, value in source.items() if key != "issues"})
         source["issues"][0].update(status="resolved", resolution="Checked")
         records = {"issue1": dict(source["issues"][0], evidence_fingerprint=signature)}
-        source["video"]["sha256"] = "changed-video"
+        source["media"]["sha256"] = "changed-media"
         issues = _validate_evidence(reply(), source, records)["issues"]
         self.assertEqual(issues[0]["status"], "open")
 
@@ -155,11 +135,6 @@ class NotesValidationTests(unittest.TestCase):
             with self.subTest(identifier=identifier), self.assertRaises(ValueError):
                 validate_notes(data, evidence())
 
-    def test_unmatched_source_cannot_become_lecture_content(self):
-        data = reply()
-        data["chapters"][0]["blocks"][0]["evidence_ids"] = ["p2"]
-        with self.assertRaises(ValueError):
-            _validate_evidence(data, evidence())
 
     def test_hallucinated_source_id_is_rejected(self):
         data = reply()
@@ -173,12 +148,6 @@ class NotesValidationTests(unittest.TestCase):
         notes = _validate_evidence(data, evidence())
         self.assertEqual(notes["issues"][0]["status"], "open")
 
-    def test_illustration_cannot_reference_evidence_image(self):
-        data = reply()
-        data["illustrations"] = [{"id": "fig1", "chapter_id": "ch001", "prompt": "Draw",
-                                  "caption": "Example", "path": "evidence/frame.png"}]
-        with self.assertRaises(ValueError):
-            _validate_evidence(data, evidence())
 
     @unittest.skipUnless(importlib.util.find_spec("pydantic"), "requires installed pydantic")
     def test_manual_handoff_and_import_have_same_notes_contract(self):
@@ -186,8 +155,7 @@ class NotesValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             job = Path(temporary).resolve()
             data = evidence()
-            data["video"]["duration"] = 900
-            data["visuals"], data["sources"] = [], []
+            data["media"]["duration"] = 900
             data["issues"] = []
             write_json(job / "evidence.json", data)
             write_json(job / "outline.json", default_outline(evidence()))
@@ -216,8 +184,8 @@ class NotesValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             job = Path(temporary).resolve()
             data = evidence()
-            data["video"]["duration"] = 900
-            data["visuals"], data["sources"], data["issues"] = [], [], []
+            data["media"]["duration"] = 900
+            data["issues"] = []
             write_json(job / "evidence.json", data)
             with patch.dict(os.environ, {"SHAD_HELPER_OPENAI_PROXY": ""}), \
                     patch("shad_helper.network.httpx.Client") as client:

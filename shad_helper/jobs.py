@@ -7,6 +7,32 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+EVIDENCE_VERSION = 2
+AUDIO_CONFIG = {"schema_version": EVIDENCE_VERSION, "pipeline": "audio"}
+
+
+def check_audio_job(job: Path) -> None:
+    """Allow empty/new jobs or resumable audio jobs, without migrating old files."""
+    job = Path(job)
+    config = job / "extraction-config.json"
+    if config.exists():
+        if read_json(config) != AUDIO_CONFIG:
+            raise ValueError("Unsupported job format; use a new output directory for audio extraction.")
+    elif job.exists() and any(job.iterdir()):
+        evidence = job / "evidence.json"
+        if not evidence.is_file():
+            raise ValueError("Existing job requires a new output directory for audio extraction.")
+    evidence = job / "evidence.json"
+    if evidence.exists():
+        validate_audio_evidence(read_json(evidence))
+
+
+def validate_audio_evidence(evidence: dict) -> dict:
+    if (evidence.get("schema_version") != EVIDENCE_VERSION or "media" not in evidence
+            or any(key in evidence for key in ("video", "visuals", "sources", "visual_processing"))):
+        raise ValueError("Unsupported evidence format; use a new output directory for audio extraction.")
+    return evidence
+
 
 def read_json(path: Path) -> Any:
     return json.loads(Path(path).read_text(encoding="utf-8"))
@@ -59,27 +85,8 @@ def checkpoint(job: Path, key: str, inputs: Any, action: Callable[[], Any]) -> A
 
 
 def evidence_index(evidence: dict) -> dict[str, str]:
-    index = {}
-    for segment in evidence.get("segments", []):
-        index[segment["id"]] = f"Видео {timestamp(segment['start'])}"
-    for visual in evidence.get("visuals", []):
-        if visual.get("timestamp") is None:
-            source = next((s for s in evidence.get("sources", [])
-                           if s["id"] == visual.get("source_id")), {})
-            description = f"{source.get('source', 'Материал')}: {source.get('location', '')}"
-        elif visual.get("page_id"):
-            description = (f"Видео {timestamp(visual['page_start'])}–{timestamp(visual['page_end'])}; "
-                           f"итог страницы доски, кадр {timestamp(visual['timestamp'])}")
-        else:
-            description = f"Видео {timestamp(visual['timestamp'])}"
-        if visual.get("status") in {"deferred", "failed"}:
-            description += "; визуальные данные не обработаны"
-        index[visual["id"]] = description
-        for region in visual.get("regions", []):
-            index[region["id"]] = description
-    for source in evidence.get("sources", []):
-        index[source["id"]] = f"{source['source']}: {source['location']}"
-    return index
+    return {segment["id"]: f"Аудио {timestamp(segment['start'])}"
+            for segment in evidence.get("segments", [])}
 
 
 def timestamp(seconds: float) -> str:

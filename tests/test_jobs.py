@@ -29,18 +29,13 @@ class CheckpointTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     checkpoint(Path(temporary), key, {}, lambda: None)
 
-    def test_unicode_json_and_source_visual_reference(self):
+    def test_unicode_json_and_audio_reference(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "evidence.json"
-            evidence = {"segments": [{"id": "s1", "start": 65}],
-                        "visuals": [{"id": "v1", "timestamp": None, "source_id": "p1",
-                                     "regions": [{"id": "r1"}]}],
-                        "sources": [{"id": "p1", "source": "лекция.pdf", "location": "page 2"}]}
+            evidence = {"segments": [{"id": "s1", "start": 65, "text": "Теорема"}]}
             write_json(path, evidence)
             self.assertEqual(read_json(path), evidence)
-            index = evidence_index(evidence)
-            self.assertEqual(index["s1"], "Видео 00:01:05")
-            self.assertEqual(index["r1"], "лекция.pdf: page 2")
+            self.assertEqual(evidence_index(evidence), {"s1": "Аудио 00:01:05"})
 
 
 if __name__ == "__main__":

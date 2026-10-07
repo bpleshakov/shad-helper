@@ -39,67 +39,6 @@ def test_login_forwards_proxy_flag_or_none(monkeypatch, tmp_path, capsys, proxy,
     assert capsys.readouterr().err == ""
 
 
-@pytest.mark.parametrize("vision_mode", [None, "pages", "content", "baseline", "sparse"])
-def test_extract_forwards_vision_mode_without_resolving_or_writing(monkeypatch, tmp_path, vision_mode):
-    extract = Mock(return_value=tmp_path / "evidence.json")
-    monkeypatch.setitem(sys.modules, "shad_helper.extraction", SimpleNamespace(extract=extract))
-    video, out = tmp_path / "lecture.mp4", tmp_path / "job"
-    arguments = ["extract", str(video), "--out", str(out)]
-    if vision_mode is not None:
-        arguments.extend(["--vision-mode", vision_mode])
-    assert main(arguments) == 0
-    extract.assert_called_once_with(video, [], out, language="ru", start=0, duration=None,
-                                    vision_mode=vision_mode)
-    assert not out.exists()
-
-
-def test_vision_mode_help_describes_pages_default(capsys):
-    with pytest.raises(SystemExit) as stopped:
-        main(["extract", "--help"])
-    assert stopped.value.code == 0
-    help_text = capsys.readouterr().out
-    assert "new jobs: pages" in help_text
-    assert "--vision-mode {pages,content,baseline,sparse}" in help_text
-
-
-def test_extract_forwards_explicit_qwen_budget(monkeypatch, tmp_path):
-    extract = Mock(return_value=tmp_path / "evidence.json")
-    monkeypatch.setitem(sys.modules, "shad_helper.extraction", SimpleNamespace(extract=extract))
-    assert main(["extract", "lecture.mp4", "--out", str(tmp_path), "--vision-mode", "sparse",
-                 "--vision-budget-minutes", "30"]) == 0
-    assert extract.call_args.kwargs["vision_budget_minutes"] == 30
-
-
-def test_extract_rejects_unknown_vision_mode_before_any_work(monkeypatch, tmp_path):
-    extract = Mock()
-    monkeypatch.setitem(sys.modules, "shad_helper.extraction", SimpleNamespace(extract=extract))
-    with pytest.raises(SystemExit):
-        main(["extract", "lecture.mp4", "--out", str(tmp_path / "job"),
-              "--vision-mode", "unknown"])
-    extract.assert_not_called()
-    assert not (tmp_path / "job").exists()
-
-
-@pytest.mark.parametrize(("platform_name", "missing", "healthy"), [
-    ("darwin", "Vision", False), ("darwin", "Quartz", False),
-    ("darwin", None, True), ("linux", "Vision", True),
-])
-def test_doctor_checks_apple_vision_dependencies_only_on_macos(monkeypatch, capsys,
-                                                            platform_name, missing, healthy):
-    find_spec = Mock(side_effect=lambda name: None if name == missing else SimpleNamespace())
-    monkeypatch.setattr(cli.importlib.util, "find_spec", find_spec)
-    monkeypatch.setattr(cli.sys, "platform", platform_name)
-    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
-    assert cli.doctor() is healthy
-    packages = json.loads(capsys.readouterr().out)["packages"]
-    if platform_name == "darwin":
-        assert packages["Vision"] is (missing != "Vision")
-        assert packages["Quartz"] is (missing != "Quartz")
-    else:
-        assert "Vision" not in packages and "Quartz" not in packages
-        assert not any(call.args[0] in {"Vision", "Quartz"} for call in find_spec.call_args_list)
-
-
 @pytest.fixture
 def doctor_catalog(monkeypatch, tmp_path):
     monkeypatch.setattr(cli.importlib.util, "find_spec", lambda name: SimpleNamespace())
@@ -183,10 +122,10 @@ def test_doctor_catalog_error_preserves_local_dependency_failure(doctor_catalog,
     state_dir, _, models = doctor_catalog
     models.side_effect = RuntimeError("unavailable")
     monkeypatch.setattr(cli.importlib.util, "find_spec",
-                        lambda name: None if name == "cv2" else SimpleNamespace())
+                        lambda name: None if name == "mlx_whisper" else SimpleNamespace())
     assert main(["--state-dir", str(state_dir), "doctor"]) == 1
     report = json.loads(capsys.readouterr().out)
-    assert report["packages"]["cv2"] is False
+    assert report["packages"]["mlx_whisper"] is False
     assert report["openai"]["status"] == "error"
 
 
@@ -229,3 +168,48 @@ def test_notes_forwards_proxy_flag_or_none(monkeypatch, tmp_path, capsys, proxy,
     generate_notes.assert_called_once_with(job, state_dir, imported=None,
                                           manual=False, rebuild=False, proxy=proxy)
     assert capsys.readouterr().err == ""
+
+@pytest.mark.parametrize("media", ["lecture.mp4", "lecture.m4a", "lecture.wav"])
+def test_extract_forwards_audio_options_without_writing(monkeypatch, tmp_path, media):
+    extract = Mock(return_value=tmp_path / "evidence.json")
+    monkeypatch.setitem(sys.modules, "shad_helper.extraction", SimpleNamespace(extract=extract))
+    out = tmp_path / "job"
+    assert main(["extract", media, "--out", str(out), "--start", "30",
+                 "--duration", "60", "--language", "ru"]) == 0
+    extract.assert_called_once_with(
+        cli.Path(media), out, language="ru", start=30, duration=60)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("command,flag", [
+    ("extract", "--source"), ("extract", "--vision-mode"),
+    ("extract", "--vision-budget-minutes"), ("render", "--images"),
+])
+def test_removed_options_are_rejected_before_work(tmp_path, command, flag):
+    arguments = [command, "lecture.mp4" if command == "extract" else str(tmp_path)]
+    if command == "extract":
+        arguments.extend(["--out", str(tmp_path / "job")])
+    with pytest.raises(SystemExit) as caught:
+        main([*arguments, flag, "unused"])
+    assert caught.value.code == 2
+    assert not (tmp_path / "job").exists()
+
+
+def test_doctor_checks_only_audio_notes_and_render_dependencies(monkeypatch, capsys):
+    expected = {"httpx", "jwt", "pydantic", "pymupdf", "mlx", "mlx_whisper"}
+    monkeypatch.setattr(cli.importlib.util, "find_spec",
+                        lambda name: SimpleNamespace() if name in expected else None)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert cli.doctor()
+    report = json.loads(capsys.readouterr().out)
+    assert set(report["packages"]) == expected
+    assert set(report["tools"]) == {"ffmpeg", "ffprobe", "latexmk", "lualatex"}
+
+
+def test_doctor_smoke_runs_only_transcription(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "doctor", Mock(return_value=True))
+    extract = Mock()
+    monkeypatch.setitem(sys.modules, "shad_helper.extraction", SimpleNamespace(extract=extract))
+    assert main(["doctor", "--smoke", "lecture.wav"]) == 0
+    extract.assert_called_once_with(cli.Path("lecture.wav"), cli.Path(".shad-helper/smoke"),
+                                    duration=30)

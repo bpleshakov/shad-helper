@@ -10,8 +10,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .vision_mode import VISION_MODES
-
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Local Russian lecture extraction and LaTeX notes")
@@ -21,20 +19,14 @@ def parser() -> argparse.ArgumentParser:
                         "(or SHAD_HELPER_OPENAI_PROXY; required for online commands)")
     commands = result.add_subparsers(dest="command", required=True)
     check = commands.add_parser("doctor", help="Check local dependencies and account-available models")
-    check.add_argument("--smoke", type=Path, help="Run all local models on a short video excerpt")
+    check.add_argument("--smoke", type=Path, help="Transcribe a thirty-second audio or video excerpt")
     login = commands.add_parser("login", help="Authorize this local app to use your ChatGPT plan")
     extract = commands.add_parser("extract", help="Extract resumable local lecture evidence")
-    extract.add_argument("video", type=Path)
-    extract.add_argument("--source", type=Path, action="append", default=[])
+    extract.add_argument("media", type=Path, help="Audio file or video soundtrack")
     extract.add_argument("--out", type=Path, required=True)
     extract.add_argument("--start", type=float, default=0)
     extract.add_argument("--duration", type=float, help="Process a pilot interval, in seconds")
     extract.add_argument("--language", default="ru")
-    extract.add_argument("--vision-mode", choices=VISION_MODES, default=None,
-                         help="Visual selection mode (new jobs: pages until sparse benchmark qualifies; "
-                              "existing jobs keep their mode)")
-    extract.add_argument("--vision-budget-minutes", type=float,
-                         help="Cumulative Qwen budget in sparse mode; default: 30 minutes per video hour")
     notes = commands.add_parser("notes", help="Generate notes or export/import a ChatGPT handoff")
     notes.add_argument("job", type=Path)
     mode = notes.add_mutually_exclusive_group()
@@ -46,7 +38,6 @@ def parser() -> argparse.ArgumentParser:
                              help="HTTP/HTTPS proxy URL for OpenAI requests")
     render = commands.add_parser("render", help="Compile editable LaTeX and create PDF QA images")
     render.add_argument("job", type=Path)
-    render.add_argument("--images", type=Path, help="Manual illustrations named FIGURE_ID.png/jpg/pdf")
     review = commands.add_parser("review", help="Show review issues or record a verified correction")
     review.add_argument("job", type=Path)
     review.add_argument("--resolve", help="Review issue ID")
@@ -58,18 +49,11 @@ def parser() -> argparse.ArgumentParser:
 
 def doctor(state_dir: Path = Path(".shad-helper/auth"), *, proxy: str | None = None) -> bool:
     packages = {name: importlib.util.find_spec(name) is not None for name in (
-        "httpx", "jwt", "pydantic", "fitz", "cv2", "numpy", "PIL", "pptx")}
+        "httpx", "jwt", "pydantic", "pymupdf")}
     # find_spec on a dotted name imports its parent, so check MLX top-level only.
     packages.update({name: importlib.util.find_spec(name) is not None
-                     for name in ("mlx", "mlx_whisper", "mlx_vlm")})
-    if sys.platform == "darwin":
-        packages.update({name: importlib.util.find_spec(name) is not None
-                         for name in ("Vision", "Quartz")})
+                     for name in ("mlx", "mlx_whisper")})
     tools = {name: shutil.which(name) for name in ("ffmpeg", "ffprobe", "latexmk", "lualatex")}
-    tools["libreoffice"] = shutil.which("libreoffice") or shutil.which("soffice")
-    app = Path("/Applications/LibreOffice.app/Contents/MacOS/soffice")
-    if not tools["libreoffice"] and app.exists():
-        tools["libreoffice"] = str(app)
     openai = {"status": "not_checked", "models": [], "default_model": "gpt-6-astra",
               "default_model_available": None}
     configured_proxy = os.environ.get("SHAD_HELPER_OPENAI_PROXY") if proxy is None else proxy
@@ -116,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
             healthy = doctor(args.state_dir, proxy=args.openai_proxy)
             if args.smoke:
                 from .extraction import extract
-                extract(args.smoke, [], Path(".shad-helper/smoke"), duration=30)
+                extract(args.smoke, Path(".shad-helper/smoke"), duration=30)
             return 0 if healthy else 1
         if args.command == "login":
             from .auth import login
@@ -124,19 +108,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Signed in: {account.get('email') or account.get('subject')}")
         elif args.command == "extract":
             from .extraction import extract
-            budget = ({"vision_budget_minutes": args.vision_budget_minutes}
-                      if args.vision_budget_minutes is not None else {})
-            print(extract(args.video, args.source, args.out, language=args.language,
-                          start=args.start, duration=args.duration, vision_mode=args.vision_mode, **budget))
+            print(extract(args.media, args.out, language=args.language,
+                          start=args.start, duration=args.duration))
         elif args.command == "notes":
             from .notes import generate_notes
             print(generate_notes(args.job, args.state_dir, imported=args.imported,
                                  manual=args.manual, rebuild=args.rebuild, proxy=args.openai_proxy))
         elif args.command == "render":
             from .rendering import render
-            print(render(args.job, images_dir=args.images))
+            print(render(args.job))
         elif args.command == "review":
-            from .jobs import read_json
+            from .jobs import check_audio_job, read_json, validate_audio_evidence
+            check_audio_job(args.job)
+            validate_audio_evidence(read_json(args.job / "evidence.json"))
             if args.resolve:
                 if not args.resolution:
                     raise ValueError("--resolve requires --resolution describing your correction")

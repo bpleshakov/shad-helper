@@ -10,7 +10,7 @@ from shad_helper.openai_client import ResponseError
 from shad_helper.schemas import LectureNotes
 
 
-def evidence(duration=900, *, dense=False, images=False):
+def evidence(duration=900, *, dense=False):
     segments = [
         {"id": f"s{number:03d}", "start": number * 60 + 10,
          "end": number * 60 + 12, "text": f"Definition {number}. " + "x" * (9000 if dense else 10),
@@ -19,24 +19,8 @@ def evidence(duration=900, *, dense=False, images=False):
          "diagnostics": {"avg_logprob": -0.1, "no_speech_prob": 0.01}}
         for number in range(int(duration // 60))
     ]
-    data = {"title": "Лекция", "video": {"duration": duration}, "segments": segments,
-            "visuals": [], "sources": [], "issues": []}
-    if dense or images:
-        board = {"id": "board", "timestamp": duration - 1, "page_id": "page1",
-                 "page_start": 0, "page_end": duration, "image": "frames/board.png",
-                 "original_image": "originals/board.png", "regions": [
-                     {"id": "formula", "kind": "formula", "image": "crops/formula.png"},
-                     {"id": "duplicate_crop", "kind": "text", "image": "crops/formula.png"}]}
-        data["visuals"] = [board, {**board, "id": "board_alias", "regions": []}]
-        data["sources"] = [{"id": "source1", "kind": "pdf", "source": "slides.pdf",
-                            "location": "page 1", "matched_visual_ids": ["board"],
-                            "images": ["assets/chart.png", "assets/chart.png"]}]
-    if images:
-        data["visuals"].extend(
-            {"id": f"v{number:03d}", "timestamp": number * 28 + 14,
-             "image": f"frames/{number:03d}.png", "regions": []}
-            for number in range(32)
-        )
+    data = {"schema_version": 2, "title": "Лекция", "media": {"duration": duration},
+            "segments": segments, "issues": []}
     return data
 
 
@@ -44,11 +28,6 @@ def prepare_job(job, data, outline=None):
     write_json(job / "evidence.json", data)
     if outline is not None:
         write_json(job / "outline.json", outline)
-    for reference in notes._context_image_references(
-            {"visuals": data["visuals"], "sources": data["sources"]}):
-        image = job / reference["image"]
-        image.parent.mkdir(parents=True, exist_ok=True)
-        image.write_bytes(b"image")
 
 
 def payload_from_prompt(prompt):
@@ -67,7 +46,7 @@ def chapter_reply(payload):
             {"id": f"{chapter['id']}_b1", "kind": "text" if citations else "clarification",
              "content": "Определение и объяснение", "evidence_ids": citations}]}],
         "glossary": [{"term": chapter["id"], "definition": "Обозначение из этой главы"}],
-        "issues": [], "illustrations": []}
+        "issues": []}
 
 
 class FakeClient:
@@ -77,10 +56,10 @@ class FakeClient:
         self.calls = []
         self.fail = fail
 
-    def complete(self, instructions, prompt, images=None, schema=None):
+    def complete(self, instructions, prompt, schema=None):
         payload = payload_from_prompt(prompt)
         self.calls.append({"payload": payload, "instructions": instructions, "prompt": prompt,
-                           "images": list(images or []), "schema": schema})
+                           "schema": schema})
         if self.fail:
             self.fail(payload)
         return chapter_reply(payload)
@@ -104,35 +83,25 @@ def assert_coverage(outline, data):
     contexts = [notes.chapter_context(data, chapter) for chapter in outline["chapters"]]
     assert {segment["id"] for context in contexts for segment in context["segments"]} == {
         segment["id"] for segment in data["segments"]}
-    assert {visual["id"] for context in contexts for visual in context["visuals"]} == {
-        visual["id"] for visual in data["visuals"]}
     return contexts
 
 
-@pytest.mark.parametrize("dense,images", [(True, False), (False, True)])
-def test_preflight_splits_without_losing_text_or_long_board_page(tmp_path, dense, images):
-    data = evidence(dense=dense, images=images)
+def test_preflight_splits_without_losing_text(tmp_path):
+    data = evidence(dense=True)
     outline = notes.default_outline(data)
     original = copy.deepcopy(data)
     prepare_job(tmp_path, data)
-    bounded = notes._bounded_outline(tmp_path, data, outline)
+    bounded = notes._bounded_outline(data, outline)
     assert len(bounded["chapters"]) > 1
-    assert bounded == notes._bounded_outline(tmp_path, data, outline)
+    assert bounded == notes._bounded_outline(data, outline)
     assert data == original
     assert outline == notes.default_outline(data)
     contexts = assert_coverage(bounded, data)
-    for context in contexts:
-        assert {"board", "board_alias"}.issubset({visual["id"] for visual in context["visuals"]})
-        references = notes._context_image_references(context)
-        paths = [reference["image"] for reference in references]
-        assert len(paths) == len(set(paths)) <= notes.MAX_CHAPTER_IMAGES
-        assert paths.count("crops/formula.png") == 1
-        assert paths.count("assets/chart.png") == 1
+    assert all(set(context) == {"chapter", "segments", "issues"} for context in contexts)
 
 
-@pytest.mark.parametrize("dense,images", [(True, False), (False, True)])
-def test_automatic_requests_fit_budget_and_use_only_chapters(tmp_path, dense, images):
-    data = evidence(dense=dense, images=images)
+def test_automatic_requests_fit_budget_and_use_only_chapters(tmp_path):
+    data = evidence(dense=True)
     prepare_job(tmp_path, data)
     canonical = (tmp_path / "evidence.json").read_bytes()
     client = FakeClient()
@@ -148,7 +117,6 @@ def test_automatic_requests_fit_budget_and_use_only_chapters(tmp_path, dense, im
         text_bytes = len((call["instructions"] + call["prompt"] + json.dumps(
             call["schema"], ensure_ascii=False, separators=(",", ":"))).encode("utf-8"))
         assert text_bytes <= notes.MAX_CHAPTER_TEXT_BYTES
-        assert len(call["images"]) <= notes.MAX_CHAPTER_IMAGES
         for segment in call["payload"]["context"]["segments"]:
             assert set(segment) == {"id", "start", "end", "text"}
 
@@ -226,23 +194,6 @@ def test_irreducible_text_budget_preserves_all_evidence_in_manual_handoff(tmp_pa
         assert read_json(folder / chapter["id"] / "context.json")["segments"][0]["text"] == "x" * 150000
 
 
-def test_irreducible_image_budget_preserves_every_image_in_manual_handoff(tmp_path):
-    data = evidence(duration=120)
-    paths = [f"crops/{number:03d}.png" for number in range(notes.MAX_CHAPTER_IMAGES + 1)]
-    data["visuals"] = [{"id": "board", "timestamp": 119, "page_id": "page1",
-                        "page_start": 0, "page_end": 120, "regions": [
-                            {"id": f"r{number:03d}", "kind": "formula", "image": path}
-                            for number, path in enumerate(paths)]}]
-    prepare_job(tmp_path, data)
-    client = FakeClient()
-    folder = notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
-    assert folder == tmp_path / "handoff" and client.calls == []
-    outline = read_json(tmp_path / "outline.json")
-    assert_coverage(outline, data)
-    for chapter in outline["chapters"]:
-        context = read_json(folder / chapter["id"] / "context.json")
-        assert {reference["image"] for reference in notes._context_image_references(context)} == set(paths)
-        assert all((folder / chapter["id"] / path).read_bytes() == b"image" for path in paths)
 
 
 def test_irreducible_context_error_stops_at_minimum_chapter(tmp_path):
@@ -312,45 +263,42 @@ def test_resume_reuses_successful_chapters_with_generated_titles_and_glossary(tm
     assert cached.calls == []
 
 
-def test_deep_split_long_chapter_id_keeps_deferred_gap_and_issue_ids_unique(tmp_path, monkeypatch):
+def test_deep_split_long_chapter_id_keeps_block_and_issue_ids_unique(tmp_path, monkeypatch):
     data = evidence(dense=True)
     for segment in data["segments"]:
         segment["text"] = "x" * 3000
-    data["visuals"][0]["status"] = "deferred"
     outline = notes.default_outline(data)
     outline["chapters"][0]["id"] = "a" * 80
     prepare_job(tmp_path, data, outline)
     monkeypatch.setattr(notes, "MAX_CHAPTER_TEXT_BYTES", 22000)
-    client = FakeClient()
-    result = notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+
+    class UncertainClient(FakeClient):
+        def complete(self, instructions, prompt, schema=None):
+            reply = super().complete(instructions, prompt, schema=schema)
+            reply["chapters"][0]["blocks"][0]["kind"] = "uncertain"
+            return reply
+
+    result = notes.generate_notes(tmp_path, tmp_path / "auth", client=UncertainClient())
     assert result.exists() and result != tmp_path / "handoff"
     generated = read_json(tmp_path / "notes.json")
     assert len(generated["chapters"]) >= 4
-    gap_blocks = [block for chapter in generated["chapters"] for block in chapter["blocks"]
-                  if block["kind"] == "uncertain" and block["evidence_ids"] == ["board"]]
-    assert len(gap_blocks) == len(generated["chapters"])
     block_ids = [block["id"] for chapter in generated["chapters"] for block in chapter["blocks"]]
     issue_ids = [issue["id"] for issue in generated["issues"]]
     assert len(set(block_ids)) == len(block_ids)
-    assert len(set(issue_ids)) == len(issue_ids) == len(gap_blocks)
+    assert len(set(issue_ids)) == len(issue_ids) == len(generated["chapters"])
     assert all(len(identifier) <= 80 for identifier in [*block_ids, *issue_ids])
-    assert all(issue["status"] == "open" and issue["evidence_ids"] == ["board"]
-               for issue in generated["issues"])
+    assert all(issue["status"] == "open" for issue in generated["issues"])
 
 
 def test_tiny_chapter_reduces_default_neighbor_overlap_but_preserves_core_evidence():
     data = evidence(duration=180)
     data["segments"] = [{"id": "core", "start": 70, "end": 72, "text": "Текст главы"},
                         {"id": "neighbor", "start": 100, "end": 102, "text": "Соседняя глава"}]
-    data["visuals"] = [{"id": "core_visual", "timestamp": 75, "regions": []},
-                       {"id": "neighbor_visual", "timestamp": 110, "regions": []}]
     chapter = {"id": "tiny", "title": "Короткая глава", "start": 60, "end": 90}
     default = notes.chapter_context(data, chapter)
     explicit = notes.chapter_context(data, chapter, overlap=60)
     assert [segment["id"] for segment in default["segments"]] == ["core"]
-    assert [visual["id"] for visual in default["visuals"]] == ["core_visual"]
     assert [segment["id"] for segment in explicit["segments"]] == ["core", "neighbor"]
-    assert [visual["id"] for visual in explicit["visuals"]] == ["core_visual", "neighbor_visual"]
 
 
 def test_response_schema_change_invalidates_chapter_cache(tmp_path, monkeypatch):

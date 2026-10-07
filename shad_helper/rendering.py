@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 
-from .jobs import fingerprint, read_json
+from .jobs import check_audio_job, fingerprint, read_json
 
 
 class RenderError(RuntimeError):
@@ -57,10 +56,10 @@ _PROJECT_COMMANDS = set(
     "title author date maketitle tableofcontents newpage clearpage section "
     "subsection subsubsection paragraph par noindent centering caption "
     "footnote footnotesize scriptsize small normalsize large Large "
-    "textbackslash textasciitilde textasciicircum textcolor includegraphics "
-    "input IfFileExists VerbatimInput pagestyle fancyhf fancyfoot renewcommand "
+    "textbackslash textasciitilde textasciicircum textcolor "
+    "input VerbatimInput pagestyle fancyhf fancyfoot renewcommand "
     "headrulewidth thepage linewidth textwidth medskip bigskip item "
-    "hypersetup emergencystretch newif ifnotesdraft notesdrafttrue fi".split()
+    "hypersetup emergencystretch".split()
 )
 _SYMBOL_COMMANDS = set("\\{}%&#$_~^ ,;:![]()") | {"\n", "\r"}
 _MATH_ENVIRONMENTS = set(
@@ -72,7 +71,7 @@ _MATH_ENVIRONMENTS = set(
 _DRAW_ENVIRONMENTS = {"tikzpicture", "scope", "axis", "groupplot"}
 _ENVIRONMENTS = _MATH_ENVIRONMENTS | _DRAW_ENVIRONMENTS | {"document", "figure", "quote", "center", "itemize", "enumerate", "description"}
 _PACKAGES = set(
-    "geometry fontspec polyglossia unicode-math amsmath amssymb graphicx tikz "
+    "geometry fontspec polyglossia unicode-math amsmath amssymb tikz "
     "pgfplots fvextra fancyhdr xcolor hyperref microtype".split()
 )
 _ESCAPE = {
@@ -80,7 +79,6 @@ _ESCAPE = {
     "&": r"\&", "#": r"\#", "%": r"\%", "_": r"\_",
     "~": r"\textasciitilde{}", "^": r"\textasciicircum{}",
 }
-_SOURCE_DIRS = ("evidence", "sources", "frames", "crops", "source_assets", "source_originals", "raw", "audio", "workers", "checkpoints")
 _DRAFT_START = "% shad-helper: draft footer begin"
 _DRAFT_END = "% shad-helper: draft footer end"
 
@@ -189,32 +187,14 @@ def _evidence(ids: list[str], index: dict) -> str:
     return "\\footnote{Источники: " + "; ".join(descriptions) + "}"
 
 
-def _illustration_tex(identifier: str) -> str:
-    fallback = r"\begin{quote}\textit{Иллюстрация " + escape_text(identifier) + r": изображение ещё не добавлено.}\end{quote}"
-    for extension in reversed(("png", "jpg", "pdf")):
-        reference = f"figures/illustrations/{identifier}.{extension}"
-        fallback = "\\IfFileExists{" + reference + "}{\\includegraphics[width=0.9\\linewidth]{" + reference + "}}{" + fallback + "}"
-    return fallback + "\n"
-
-
-def _draft_footer(identifiers: list[str], review: list[dict]) -> str:
-    marker = r"\scriptsize ЧЕРНОВИК - требуется проверка"
+def _draft_footer(review: list[dict]) -> str:
     if review:
-        return r"\fancyfoot[L]{" + marker + "}\n"
-    if not identifiers:
-        return ""
-    lines = [r"\newif\ifnotesdraft"]
-    for identifier in identifiers:
-        condition = r"\notesdrafttrue"
-        for extension in reversed(("png", "jpg", "pdf")):
-            condition = "\\IfFileExists{figures/illustrations/" + identifier + "." + extension + "}{}{ " + condition + "}"
-        lines.append(condition)
-    lines.append(r"\fancyfoot[L]{\ifnotesdraft " + marker + r"\fi}")
-    return "\n".join(lines) + "\n"
+        return r"\fancyfoot[L]{\scriptsize ЧЕРНОВИК - требуется проверка}" + "\n"
+    return ""
 
 
-def _marked_footer(identifiers: list[str], review: list[dict]) -> str:
-    return _DRAFT_START + "\n" + _draft_footer(identifiers, review) + _DRAFT_END + "\n"
+def _marked_footer(review: list[dict]) -> str:
+    return _DRAFT_START + "\n" + _draft_footer(review) + _DRAFT_END + "\n"
 
 
 def _review_flags(notes: dict) -> list[dict]:
@@ -254,7 +234,7 @@ _PREAMBLE = r"""\documentclass[a4paper,11pt]{article}
 \usepackage{amsmath}
 \usepackage{unicode-math}
 \setmathfont{Latin Modern Math}
-\usepackage{graphicx,tikz,pgfplots,fvextra,fancyhdr,xcolor,hyperref,microtype}
+\usepackage{tikz,pgfplots,fvextra,fancyhdr,xcolor,hyperref,microtype}
 \usetikzlibrary{arrows.meta,positioning,calc,shapes.geometric,fit,matrix}
 \usepgfplotslibrary{groupplots}
 \pgfplotsset{compat=1.18}
@@ -268,26 +248,18 @@ _PREAMBLE = r"""\documentclass[a4paper,11pt]{article}
 
 
 def write_project(job: Path, notes: dict) -> Path:
-    """Create editable sources; evidence images are never note illustrations.
+    """Create editable sources from transcript-grounded notes.
 
     Call this only when replacing the note project is intentional. ``render``
     preserves these sources, including subsequent manual corrections.
     """
+    check_audio_job(job)
     root = job.resolve() / "notes"
     if root.is_symlink() or not root.resolve().is_relative_to(job.resolve()):
         raise RenderError("The notes directory escapes the job")
     index = notes.get("evidence_index", {})
     tex_files = ["main.tex", "review.tex"]
     code_files = []
-    illustrations = notes.get("illustrations", [])
-    declared_ids = set()
-    for illustration in illustrations:
-        identifier = _identifier(illustration["id"])
-        if identifier in declared_ids or illustration.get("path"):
-            raise RenderError("Illustrations require unique IDs and must be imported with images_dir")
-        declared_ids.add(identifier)
-        _write(root, f"figures/illustration-{identifier}.tex", _illustration_tex(identifier))
-        tex_files.append(f"figures/illustration-{identifier}.tex")
     chapter_sources = []
     block_ids = set()
     chapter_ids = set()
@@ -298,7 +270,7 @@ def write_project(job: Path, notes: dict) -> Path:
             raise RenderError("Chapter IDs must be unique")
         chapter_ids.add(chapter_id)
         lines = ["\\section{" + escape_text(chapter["title"]) + "}",
-                 "\\noindent\\textit{Видео: " + _stamp(chapter["start"]) + " - " + _stamp(chapter["end"]) + "}\\par\n"]
+                 "\\noindent\\textit{Аудио: " + _stamp(chapter["start"]) + " - " + _stamp(chapter["end"]) + "}\\par\n"]
         for block in chapter.get("blocks", []):
             block_id = _identifier(block["id"])
             if block_id in block_ids:
@@ -334,27 +306,20 @@ def write_project(job: Path, notes: dict) -> Path:
                 lines.append(_prose(content) + source + "\n")
             else:
                 raise RenderError(f"Unsupported note block kind: {kind}")
-        for illustration in illustrations:
-            if illustration["chapter_id"] == chapter_id:
-                relative = f"figures/illustration-{illustration['id']}.tex"
-                lines.append("\\begin{figure}[htbp]\n\\centering\n\\input{" + relative + "}\n\\caption{" + escape_text(illustration.get("caption", "Иллюстрация")) + "}\n\\end{figure}\n")
         relative = f"chapters/{chapter_id}.tex"
         _write(root, relative, "\n\n".join(lines) + "\n")
         tex_files.append(relative)
         chapter_sources.append("\\input{" + relative + "}")
-    if any(item["chapter_id"] not in chapter_ids for item in illustrations):
-        raise RenderError("An illustration refers to a nonexistent chapter")
     appendix = []
     if notes.get("glossary"):
         appendix.append(r"\section{Глоссарий}")
         for entry in notes["glossary"]:
             appendix.append("\\paragraph{" + _prose(entry["term"]) + "} " + _prose(entry["definition"]))
     _write(root, "review.tex", _review_section(notes))
-    main = _PREAMBLE + _marked_footer(sorted(declared_ids), review) + "\\title{" + escape_text(notes["title"]) + "}\n\\author{}\n\\date{}\n\\begin{document}\n\\maketitle\n\\tableofcontents\n\\newpage\n" + "\n".join(chapter_sources + appendix + [r"\input{review.tex}"]) + "\n\\end{document}\n"
+    main = _PREAMBLE + _marked_footer(review) + "\\title{" + escape_text(notes["title"]) + "}\n\\author{}\n\\date{}\n\\begin{document}\n\\maketitle\n\\tableofcontents\n\\newpage\n" + "\n".join(chapter_sources + appendix + [r"\input{review.tex}"]) + "\n\\end{document}\n"
     _write(root, "main.tex", main)
-    _write(root, "illustrations.json", json.dumps(illustrations, ensure_ascii=False, indent=2) + "\n")
-    manifest = {"version": 1, "draft": bool(review or declared_ids), "tex_files": tex_files,
-                "code_files": code_files, "illustration_ids": sorted(declared_ids), "review": review,
+    manifest = {"version": 2, "draft": bool(review), "tex_files": tex_files,
+                "code_files": code_files, "review": review,
                 "issues": notes.get("issues", []), "evidence_fingerprint": _evidence_fingerprint(job)}
     _write(root, "project.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     return root / "main.tex"
@@ -367,10 +332,13 @@ def refresh_review(job: Path, notes: dict) -> Path:
     This operation then binds it to the post-resolution evidence fingerprint.
     It updates only review.tex, project.json, and the marked footer in main.tex.
     """
+    check_audio_job(job)
     root = job.resolve() / "notes"
     if root.is_symlink() or not root.resolve().is_relative_to(job.resolve()):
         raise RenderError("The notes directory escapes the job")
     manifest = read_json(_confined(root, "project.json"))
+    if manifest.get("version") != 2:
+        raise RenderError("Unsupported note project; use a new output directory.")
     main_path = _confined(root, "main.tex")
     main = main_path.read_text(encoding="utf-8")
     if ("review.tex" not in manifest["tex_files"] or main.count(_DRAFT_START) != 1
@@ -382,12 +350,9 @@ def refresh_review(job: Path, notes: dict) -> Path:
     review = _review_flags(notes)
     appendix = _review_section(notes)
     _validate_commands(appendix, project=True)
-    identifiers = manifest["illustration_ids"]
-    footer = _marked_footer(identifiers, review)
+    footer = _marked_footer(review)
     main = re.sub(pattern, lambda _: footer, main, count=1, flags=re.DOTALL)
-    missing = any(not any(_confined(root, f"figures/illustrations/{identifier}.{extension}").is_file()
-                          for extension in ("png", "jpg", "pdf")) for identifier in identifiers)
-    manifest.update(review=review, issues=notes.get("issues", []), draft=bool(review or missing),
+    manifest.update(review=review, issues=notes.get("issues", []), draft=bool(review),
                     evidence_fingerprint=_evidence_fingerprint(job))
     _write(root, "review.tex", appendix)
     _write(root, "main.tex", main)
@@ -398,10 +363,7 @@ def refresh_review(job: Path, notes: dict) -> Path:
 def _validate_project(root: Path, manifest: dict) -> None:
     tex_files = set(manifest["tex_files"])
     code_files = set(manifest["code_files"])
-    image_files = {f"figures/illustrations/{_identifier(identifier)}.{extension}"
-                   for identifier in manifest["illustration_ids"] for extension in ("png", "jpg", "pdf")}
-    reference_commands = {"input": tex_files, "VerbatimInput": code_files,
-                          "includegraphics": image_files, "IfFileExists": image_files}
+    reference_commands = {"input": tex_files, "VerbatimInput": code_files}
     total = 0
     for relative in tex_files:
         if not relative.endswith(".tex"):
@@ -437,8 +399,6 @@ def _validate_project(root: Path, manifest: dict) -> None:
                 raise RenderError(f"Use the configured {expected} font")
         if len(re.findall(r"\\renewcommand\s*\{\\headrulewidth\}\s*\{0pt\}", clean)) != len(re.findall(r"\\renewcommand\b", clean)):
             raise RenderError("Only the page header rule may be redefined")
-        if len(re.findall(r"\\newif\s*\\ifnotesdraft\b", clean)) != len(re.findall(r"\\newif\b", clean)):
-            raise RenderError("Only the note draft flag may be declared")
         if re.search(r"\\(?:addplot|path|draw|fill|filldraw)\b[^;]*\b(?:file|table|graphics|shell|external)\b", clean, re.I):
             raise RenderError("Plots cannot load external data files")
     if total > 4 * _MAX_TEX_BYTES or "main.tex" not in tex_files:
@@ -446,81 +406,6 @@ def _validate_project(root: Path, manifest: dict) -> None:
     for relative in code_files:
         if not _confined(root, relative).is_file() or not relative.startswith("code/"):
             raise RenderError("Missing or invalid verbatim code asset")
-
-
-def _image_hash(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _import_illustrations(job: Path, root: Path, identifiers: list[str], images_dir: Path | None) -> list[str]:
-    missing = []
-    evidence_roots = [(job / directory).resolve() for directory in _SOURCE_DIRS]
-    source_hashes = None
-
-    def reject_source_copy(path):
-        nonlocal source_hashes
-        if source_hashes is None:
-            source_hashes = {_image_hash(source) for directory in evidence_roots if directory.is_dir()
-                             for source in directory.rglob("*") if source.is_file() and source.suffix.lower() in {".png", ".jpg", ".jpeg", ".pdf"}}
-        if _image_hash(path) in source_hashes:
-            raise RenderError("A source evidence image was copied as a note illustration")
-
-    for identifier in identifiers:
-        candidates = []
-        if images_dir is not None:
-            candidates = [images_dir / f"{identifier}.{ext}" for ext in ("png", "jpg", "pdf") if (images_dir / f"{identifier}.{ext}").is_file()]
-        if len(candidates) > 1:
-            raise RenderError(f"Multiple illustrations supplied for {identifier}")
-        if candidates:
-            candidate = candidates[0].resolve()
-            if any(candidate.is_relative_to(evidence) for evidence in evidence_roots):
-                raise RenderError("Source evidence images cannot be used as finished-note illustrations")
-            reject_source_copy(candidate)
-            _check_image(candidate)
-            destination = _confined(root, f"figures/illustrations/{identifier}{candidate.suffix}")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if candidate != destination.resolve():
-                shutil.copyfile(candidate, destination)
-            for extension in ("png", "jpg", "pdf"):
-                stale = _confined(root, f"figures/illustrations/{identifier}.{extension}")
-                if stale != destination and stale.exists():
-                    stale.unlink()
-        existing = [_confined(root, f"figures/illustrations/{identifier}.{ext}") for ext in ("png", "jpg", "pdf")]
-        existing = [path for path in existing if path.is_file()]
-        for path in existing:
-            reject_source_copy(path)
-            _check_image(path)
-        if not existing:
-            missing.append(identifier)
-    return missing
-
-
-def _check_image(path: Path) -> None:
-    # Decode only explicitly imported assets; raw evidence is not a fallback.
-    if path.stat().st_size > 50_000_000:
-        raise RenderError(f"Illustration is too large: {path.name}")
-    prefix = path.read_bytes()[:8]
-    expected = {".png": b"\x89PNG\r\n\x1a\n", ".jpg": b"\xff\xd8", ".pdf": b"%PDF-"}
-    if path.suffix not in expected or not prefix.startswith(expected[path.suffix]):
-        raise RenderError(f"Invalid illustration file: {path.name}")
-    try:
-        import pymupdf
-        with pymupdf.open(path) as document:
-            if document.page_count != 1:
-                raise RenderError(f"Illustrations must contain one page: {path.name}")
-            if document[0].rect.width * document[0].rect.height > 50_000_000:
-                raise RenderError(f"Illustration dimensions are too large: {path.name}")
-            document[0].get_pixmap(matrix=pymupdf.Matrix(0.25, 0.25))
-    except ImportError as error:
-        raise RenderError("PyMuPDF is required to validate illustrations") from error
-    except RenderError:
-        raise
-    except Exception as error:
-        raise RenderError(f"Cannot decode illustration {path.name}: {error}") from error
 
 
 def _qa(pdf: Path) -> int:
@@ -539,13 +424,16 @@ def _qa(pdf: Path) -> int:
         return document.page_count
 
 
-def render(job: Path, *, images_dir: Path | None = None) -> Path:
+def render(job: Path) -> Path:
     """Compile existing sources without replacing manual TeX corrections."""
+    check_audio_job(job)
     root = job.resolve() / "notes"
     if root.is_symlink() or not root.resolve().is_relative_to(job.resolve()):
         raise RenderError("The notes directory escapes the job")
     manifest = json.loads(_confined(root, "project.json").read_text(encoding="utf-8"))
-    report = {"draft": bool(manifest.get("review") or manifest["illustration_ids"]), "review": manifest.get("review", []), "missing_illustrations": [],
+    if manifest.get("version") != 2:
+        raise RenderError("Unsupported note project; use a new output directory.")
+    report = {"draft": bool(manifest.get("review")), "review": manifest.get("review", []),
               "missing_fonts": [], "missing_glyphs": [], "overfull": [], "status": "failed"}
     report_path = _confined(root, "render-report.json")
     log_path = _confined(root, "compiler-output.log")
@@ -553,8 +441,6 @@ def render(job: Path, *, images_dir: Path | None = None) -> Path:
         if manifest.get("evidence_fingerprint") != _evidence_fingerprint(job):
             raise RenderError("Evidence changed after these notes were generated; regenerate notes or import corrected notes before rendering")
         _validate_project(root, manifest)
-        report["missing_illustrations"] = _import_illustrations(job.resolve(), root, manifest["illustration_ids"], images_dir)
-        report["draft"] = bool(report["review"] or report["missing_illustrations"])
         if not shutil.which("latexmk") or not shutil.which("lualatex"):
             raise RenderError("Rendering requires latexmk and LuaLaTeX (for example, MacTeX)")
         for extension in ("pdf", "log", "aux", "out", "toc", "fls", "fdb_latexmk", "synctex.gz"):
@@ -571,7 +457,9 @@ def render(job: Path, *, images_dir: Path | None = None) -> Path:
         log = log_path.read_text(encoding="utf-8", errors="replace")
         if (root / "main.log").is_file():
             log += "\n" + (root / "main.log").read_text(encoding="utf-8", errors="replace")
-        report["missing_fonts"] = sorted(set(re.findall(r".*(?:font.*(?:not found|cannot be found)|fontspec.*error).*", log, re.I)))
+        report["missing_fonts"] = sorted({line for line in re.findall(
+            r".*(?:font.*(?:not found|cannot be found)|fontspec.*error).*", log, re.IGNORECASE)
+            if "Font names database not found" not in line})
         report["missing_glyphs"] = sorted(set(re.findall(r".*Missing character:.*", log)))
         report["overfull"] = sorted(set(re.findall(r".*Overfull \\[hv]box.*", log)))
         pdf = _confined(root, "main.pdf")

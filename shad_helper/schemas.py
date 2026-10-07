@@ -53,33 +53,20 @@ class GlossaryTerm(StrictModel):
     definition: str
 
 
-class Illustration(StrictModel):
-    id: Identifier
-    chapter_id: Identifier
-    prompt: str
-    caption: str
-    path: str = ""
-
-
 class LectureNotes(StrictModel):
     title: str = Field(min_length=1)
     language: Literal["ru"] = "ru"
     chapters: list[Chapter] = Field(min_length=1)
     glossary: list[GlossaryTerm] = Field(default_factory=list)
     issues: list[ReviewIssue] = Field(default_factory=list)
-    illustrations: list[Illustration] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def stable_identifiers(self):
         identifiers = [chapter.id for chapter in self.chapters]
         identifiers += [block.id for chapter in self.chapters for block in chapter.blocks]
         identifiers += [issue.id for issue in self.issues]
-        identifiers += [figure.id for figure in self.illustrations]
         if len(set(identifiers)) != len(identifiers):
-            raise ValueError("Note, chapter, issue, and illustration IDs must be unique")
-        chapter_ids = {chapter.id for chapter in self.chapters}
-        if any(figure.chapter_id not in chapter_ids for figure in self.illustrations):
-            raise ValueError("An illustration references a missing chapter")
+            raise ValueError("Note, chapter, and issue IDs must be unique")
         return self
 
 
