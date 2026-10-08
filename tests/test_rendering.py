@@ -113,6 +113,25 @@ class RenderingTests(unittest.TestCase):
         self.assertIn(r"\(" + expression + r"\)", chapter)
         self.assertIn("\\[\n" + expression + "\n\\]", chapter)
 
+    def test_norm_conditional_and_tilde_commands_are_supported(self):
+        expressions = (r"w_j = \|x-x_{(j)}\|^{-1}",
+                       r"P(Y=1\mid X=x)", r"\tilde{x}=x-\bar{x}")
+        for expression in expressions:
+            with self.subTest(expression=expression):
+                self.notes["chapters"][0]["blocks"][0]["content"] = r"Формула \(" + expression + r"\)."
+                self.notes["chapters"][0]["blocks"][1]["content"] = expression
+                root, manifest = self.project()
+                rendering._validate_project(root, manifest)
+                chapter = (root / "chapters/chapter-1.tex").read_text()
+                self.assertIn(r"\(" + expression + r"\)", chapter)
+                self.assertIn("\\[\n" + expression + "\n\\]", chapter)
+
+    def test_safe_math_commands_do_not_allow_unsafe_commands(self):
+        for name, command in (("input", r"\input{secret}"), ("write", r"\write18{ls}"),
+                              ("directlua", r"\directlua{os.execute('id')}")):
+            with self.subTest(command=command), self.assertRaisesRegex(rendering.RenderError, name):
+                rendering._validate_commands(r"\|\tilde{x}\|\mid y " + command)
+
     def test_inner_math_environments_are_wrapped_but_display_environments_are_not(self):
         inner = {
             "aligned": r"a &= b \\ c &= d",
@@ -321,7 +340,9 @@ class RenderingTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("latexmk") and shutil.which("lualatex") and importlib.util.find_spec("pymupdf"), "LuaLaTeX, latexmk, and PyMuPDF are required")
     def test_actual_cyrillic_math_diagram_code_pdf_and_qa(self):
-        self.notes["chapters"][0]["blocks"][1]["content"] = r"f\colon \mathbb{R} \to \mathbb{R},\quad x \mapsto x^2"
+        self.notes["chapters"][0]["blocks"][1]["content"] = (
+            r"f\colon \mathbb{R} \to \mathbb{R},\quad x \mapsto x^2,\quad "
+            r"\|\tilde{x}\|,\quad P(Y=1\mid X=x)")
         self.project()
         pdf = rendering.render(self.job)
         self.assertGreater(pdf.stat().st_size, 1000)

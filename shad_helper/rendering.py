@@ -35,8 +35,8 @@ _MATH_COMMANDS = set(
     "to mapsto rightarrow leftarrow leftrightarrow Rightarrow Leftarrow "
     "Leftrightarrow longrightarrow longleftarrow Longrightarrow Longleftrightarrow "
     "uparrow downarrow updownarrow iff implies forall exists nexists neg land lor "
-    "wedge vee top bot perp parallel angle triangle square checkmark "
-    "ldots cdots vdots ddots dots dot ddot hat widehat bar overline underline "
+    "wedge vee top bot perp parallel mid angle triangle square checkmark "
+    "ldots cdots vdots ddots dots dot ddot hat widehat tilde bar overline underline "
     "vec overrightarrow overbrace underbrace overset underset stackrel "
     "mathrm mathbf mathit mathsf mathtt mathcal mathbb mathscr boldsymbol "
     "operatorname text textrm textsf texttt textbf textit mathop limits nolimits "
@@ -61,7 +61,7 @@ _PROJECT_COMMANDS = set(
     "headrulewidth thepage linewidth textwidth medskip bigskip item "
     "hypersetup emergencystretch".split()
 )
-_SYMBOL_COMMANDS = set("\\{}%&#$_~^ ,;:![]()") | {"\n", "\r"}
+_SYMBOL_COMMANDS = set("\\{}%&#$_~^ ,;:![]()|") | {"\n", "\r"}
 _MATH_ENVIRONMENTS = set(
     "equation equation* "
     "align align* aligned alignedat gather gather* gathered multline multline* "
