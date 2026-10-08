@@ -50,7 +50,7 @@ class FakeClient:
 
 
 def assert_model_context(context, data):
-    assert set(context) == {"lecture_title", "glossary", "chapter", "segments", "writing_budget"}
+    assert set(context) == {"lecture_title", "glossary", "topics", "chapter", "segments", "writing_budget"}
     assert context["lecture_title"] == data["title"]
     assert context["segments"] == data["segments"]
     assert "UPSTREAM_DIAGNOSTIC" not in json.dumps(context)

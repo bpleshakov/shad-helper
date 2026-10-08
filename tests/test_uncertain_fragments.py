@@ -18,7 +18,7 @@ def fragment(text, evidence_ids=None):
     return {"text": text, "evidence_ids": ["s1"] if evidence_ids is None else evidence_ids}
 
 
-@pytest.mark.parametrize("kind", ["text", "clarification", "uncertain"])
+@pytest.mark.parametrize("kind", ["text", "definition", "theorem", "proof", "clarification", "uncertain"])
 def test_prose_fragments_preserve_cyrillic_and_complete_inline_math(kind):
     content = r"Оценка \(\hat{x}=x_1\) несмещённая, а дисперсия мала."
     selections = [fragment(r"Оценка \(\hat{x}=x_1\)"), fragment("дисперсия мала", ["s2"])]
@@ -29,6 +29,16 @@ def test_prose_fragments_preserve_cyrillic_and_complete_inline_math(kind):
 
 def test_existing_blocks_default_to_no_fragments():
     block = NoteBlock(id="b1", kind="math", content="x=1")
+    assert block.uncertain_fragments == []
+    assert block.topic == ""
+
+
+@pytest.mark.parametrize("kind", ["definition", "theorem", "proof"])
+def test_formal_blocks_preserve_topic_and_prose(kind):
+    content = "Первый шаг.\n\nВторой шаг с \\(x_1\\)."
+    block = NoteBlock(id="b1", kind=kind, topic="Линейная регрессия", content=content)
+    assert block.topic == "Линейная регрессия"
+    assert block.content == content
     assert block.uncertain_fragments == []
 
 
@@ -72,17 +82,19 @@ def test_fragments_require_a_prose_block(kind):
         note_block("x=1", [fragment("x=1")], kind=kind)
 
 
-def test_fragment_cannot_add_evidence_outside_its_block():
+@pytest.mark.parametrize("kind", ["text", "definition", "theorem", "proof"])
+def test_fragment_cannot_add_evidence_outside_its_block(kind):
     with pytest.raises(ValidationError, match="must belong to the block"):
-        note_block("Оценка", [fragment("Оценка", ["s1", "other"])])
+        note_block("Оценка", [fragment("Оценка", ["s1", "other"])], kind=kind)
 
 
 @pytest.mark.parametrize("selection", [
     "x_1", r"\(x_1", r"x_1\)", "(x_1", r"Оценка \(", r"\) несмещённая.",
 ])
-def test_fragment_boundaries_cannot_cut_inline_math(selection):
+@pytest.mark.parametrize("kind", ["text", "definition", "theorem", "proof"])
+def test_fragment_boundaries_cannot_cut_inline_math(selection, kind):
     with pytest.raises(ValidationError, match="complete inline math expression"):
-        note_block(r"Оценка \(x_1\) несмещённая.", [fragment(selection)])
+        note_block(r"Оценка \(x_1\) несмещённая.", [fragment(selection)], kind=kind)
 
 
 def test_a_complete_inline_formula_can_be_selected_alone():

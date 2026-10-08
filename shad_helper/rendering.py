@@ -60,7 +60,7 @@ _PROJECT_COMMANDS = set(
     "textbackslash textasciitilde textasciicircum textcolor "
     "input VerbatimInput pagestyle fancyhf fancyfoot renewcommand "
     "headrulewidth thepage linewidth textwidth medskip bigskip item "
-    "hypersetup emergencystretch".split()
+    "hypersetup emergencystretch newtheorem theoremstyle".split()
 )
 _SYMBOL_COMMANDS = set("\\{}%&#$_~^ ,;:![]()|") | {"\n", "\r"}
 _MATH_ENVIRONMENTS = set(
@@ -70,9 +70,9 @@ _MATH_ENVIRONMENTS = set(
     "array".split()
 )
 _DRAW_ENVIRONMENTS = {"tikzpicture", "scope", "axis", "groupplot"}
-_ENVIRONMENTS = _MATH_ENVIRONMENTS | _DRAW_ENVIRONMENTS | {"document", "figure", "quote", "center", "itemize", "enumerate", "description"}
+_ENVIRONMENTS = _MATH_ENVIRONMENTS | _DRAW_ENVIRONMENTS | {"document", "figure", "quote", "center", "itemize", "enumerate", "description", "definition", "theorem", "proof"}
 _PACKAGES = set(
-    "geometry fontspec polyglossia unicode-math amsmath amssymb tikz "
+    "geometry fontspec polyglossia unicode-math amsmath amssymb amsthm tikz "
     "pgfplots fvextra fancyhdr xcolor hyperref microtype".split()
 )
 _ESCAPE = {
@@ -266,6 +266,10 @@ _PREAMBLE = r"""\documentclass[a4paper,11pt]{article}
 \setdefaultlanguage{russian}
 \setotherlanguage{english}
 \usepackage{amsmath}
+\usepackage{amsthm}
+\newtheorem{theorem}{Теорема}[section]
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Определение}
 \usepackage{unicode-math}
 \setmathfont{Latin Modern Math}
 \usepackage{tikz,pgfplots,fvextra,fancyhdr,xcolor,hyperref,microtype}
@@ -293,9 +297,10 @@ def write_project(job: Path, notes: dict) -> Path:
         raise RenderError("The notes directory escapes the job")
     tex_files = ["main.tex"]
     code_files = []
-    chapter_sources = []
+    section_sources = []
     block_ids = set()
     chapter_ids = set()
+    topics = {}
     review = _review_flags(notes)
     evidence_times = _evidence_times(job)
     for chapter in notes.get("chapters", []):
@@ -303,15 +308,18 @@ def write_project(job: Path, notes: dict) -> Path:
         if chapter_id in chapter_ids:
             raise RenderError("Chapter IDs must be unique")
         chapter_ids.add(chapter_id)
-        if not chapter.get("blocks"):
-            continue
-        lines = ["\\section{" + escape_text(chapter["title"]) + "}",
-                 "\\noindent\\textit{Лекция: " + _stamp(chapter["start"]) + " - " + _stamp(chapter["end"]) + "}\\par\n"]
         for block in chapter.get("blocks", []):
             block_id = _identifier(block["id"])
             if block_id in block_ids:
                 raise RenderError("Block IDs must be unique")
             block_ids.add(block_id)
+            title = " ".join((block.get("topic") or "").split()) or " ".join(chapter["title"].split())
+            _, blocks = topics.setdefault(title.casefold(), (title, []))
+            blocks.append((chapter, block))
+    for number, (title, blocks) in enumerate(topics.values(), 1):
+        lines = ["\\section{" + escape_text(title) + "}"]
+        for chapter, block in blocks:
+            block_id = block["id"]
             content = block["content"]
             kind = block["kind"]
             if kind == "math":
@@ -335,21 +343,25 @@ def write_project(job: Path, notes: dict) -> Path:
                 code_files.append(relative)
                 lines.append("\\VerbatimInput[breaklines,breakanywhere,fontsize=\\small,frame=single]{" + relative + "}\n")
             elif kind in {"text", "clarification", "uncertain"}:
-                prefix = r"\textbf{Пояснение.} " if kind == "clarification" else ""
-                lines.append(prefix + _marked_prose(block, evidence_times, chapter["start"]) + "\n")
+                lines.append(_marked_prose(block, evidence_times, chapter["start"]) + "\n")
+            elif kind in {"definition", "theorem", "proof"}:
+                heading = "[Доказательство]" if kind == "proof" else ""
+                lines.append("\\begin{" + kind + "}" + heading + "\n"
+                             + _marked_prose(block, evidence_times, chapter["start"])
+                             + "\n\\end{" + kind + "}\n")
             else:
                 raise RenderError(f"Unsupported note block kind: {kind}")
-        relative = f"chapters/{chapter_id}.tex"
+        relative = f"chapters/section-{number:03}.tex"
         _write(root, relative, "\n\n".join(lines) + "\n")
         tex_files.append(relative)
-        chapter_sources.append("\\input{" + relative + "}")
+        section_sources.append("\\input{" + relative + "}")
     appendix = []
     if notes.get("glossary"):
         appendix.append(r"\section{Глоссарий}")
         for entry in notes["glossary"]:
             appendix.append("\\paragraph{" + _prose(entry["term"]) + "} " + _prose(entry["definition"]))
     _confined(root, "review.tex").unlink(missing_ok=True)
-    main = _PREAMBLE + _marked_footer(review) + "\\begin{document}\n\\begin{center}\\Large " + escape_text(notes["title"]) + "\\end{center}\n" + "\n".join(chapter_sources + appendix) + "\n\\end{document}\n"
+    main = _PREAMBLE + _marked_footer(review) + "\\begin{document}\n\\begin{center}\\Large " + escape_text(notes["title"]) + "\\end{center}\n" + "\n".join(section_sources + appendix) + "\n\\end{document}\n"
     _write(root, "main.tex", main)
     manifest = {"version": 2, "draft": bool(review), "tex_files": tex_files,
                 "code_files": code_files, "review": review,
@@ -401,7 +413,7 @@ def _validate_project(root: Path, manifest: dict) -> None:
         total += len(source.encode("utf-8"))
         _validate_commands(source, diagram=relative.startswith("figures/diagram-"), project=True)
         clean = _uncomment(source)
-        if relative != "main.tex" and re.search(r"\\(?:documentclass|usepackage|setmainfont|renewcommand)\b", clean):
+        if relative != "main.tex" and re.search(r"\\(?:documentclass|usepackage|setmainfont|renewcommand|newtheorem|theoremstyle)\b", clean):
             raise RenderError("Preamble commands are allowed only in main.tex")
         for command, allowed in reference_commands.items():
             matches = list(re.finditer(r"\\" + command + r"\s*(?:\[[^\]\n]*\]\s*)?\{([^{}]*)\}", clean))
@@ -427,6 +439,12 @@ def _validate_project(root: Path, manifest: dict) -> None:
                 raise RenderError(f"Use the configured {expected} font")
         if len(re.findall(r"\\renewcommand\s*\{\\headrulewidth\}\s*\{0pt\}", clean)) != len(re.findall(r"\\renewcommand\b", clean)):
             raise RenderError("Only the page header rule may be redefined")
+        declarations = re.findall(
+            r"\\newtheorem(?:\{theorem\}\{Теорема\}\[section\]|\{definition\}\[theorem\]\{Определение\})", clean)
+        if len(declarations) != len(re.findall(r"\\newtheorem\b", clean)):
+            raise RenderError("Only the configured theorem and definition environments may be declared")
+        if len(re.findall(r"\\theoremstyle\{definition\}", clean)) != len(re.findall(r"\\theoremstyle\b", clean)):
+            raise RenderError("Only the configured definition style is supported")
         if re.search(r"\\(?:addplot|path|draw|fill|filldraw)\b[^;]*\b(?:file|table|graphics|shell|external)\b", clean, re.I):
             raise RenderError("Plots cannot load external data files")
     if total > 4 * _MAX_TEX_BYTES or "main.tex" not in tex_files:

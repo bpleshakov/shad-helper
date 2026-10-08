@@ -66,16 +66,17 @@ class RenderingTests(unittest.TestCase):
         root, manifest = self.project()
         rendering._validate_project(root, manifest)
         main = (root / "main.tex").read_text()
-        chapter = (root / "chapters/chapter-1.tex").read_text()
+        chapter = (root / "chapters/section-001.tex").read_text()
         self.assertIn("CMU Serif", main)
         self.assertIn("CMU Typewriter Text", main)
         self.assertIn("Latin Modern Math", main)
         self.assertIn("ЧЕРНОВИК", main)
         self.assertIn(r"\(X \in \mathbb{R}\)", chapter)
         self.assertIn(r"p\_value \& 50\%", chapter)
-        self.assertIn("00:01:01 - 00:02:05", chapter)
+        self.assertNotIn("Лекция:", chapter)
         self.assertNotIn("Требует проверки", chapter)
-        self.assertIn(r"\textbf{Пояснение.} Условие:", chapter)
+        self.assertIn(r"Условие: \(p > 0\).", chapter)
+        self.assertNotIn("Пояснение.", chapter)
         self.assertNotIn(r"\begin{quote}", chapter)
         self.assertIn(r"\textcolor{blue!60!black}{Проверьте индекс.}\footnote{00:01:01}", chapter)
         self.assertEqual((root / "code/code-1.txt").read_text(), self.notes["chapters"][0]["blocks"][2]["content"])
@@ -118,7 +119,7 @@ class RenderingTests(unittest.TestCase):
                       [("frame-1", 3723.7)])
         root, manifest = self.project()
         rendering._validate_project(root, manifest)
-        chapter = (root / "chapters/chapter-1.tex").read_text()
+        chapter = (root / "chapters/section-001.tex").read_text()
         self.assertIn(r"Матрица симметрична, \textcolor{blue!60!black}{\(X_1 \in \mathbb{R}\)}, "
                       r"\textcolor{blue!60!black}{индекс \(j\)}.\footnote{01:01:01, 01:02:03}", chapter)
         self.assertEqual(chapter.count(r"\footnote"), 1)
@@ -140,7 +141,7 @@ class RenderingTests(unittest.TestCase):
         self.evidence([(f"ev-{index}", 60 * index) for index in range(5)])
         root, manifest = self.project()
         rendering._validate_project(root, manifest)
-        chapter = (root / "chapters/chapter-1.tex").read_text()
+        chapter = (root / "chapters/section-001.tex").read_text()
         self.assertIn(r"\textcolor{blue!60!black}{Первое} утверждение.\footnote{00:00:00–00:03:00}", chapter)
         self.assertIn(r"\textcolor{blue!60!black}{Второе} утверждение.\footnote{00:04:00}", chapter)
         self.assertEqual(chapter.count(r"\footnote"), 2)
@@ -180,7 +181,110 @@ class RenderingTests(unittest.TestCase):
         self.assertNotIn(r"\tableofcontents", main)
         self.assertNotIn(r"\newpage", main)
         self.assertNotIn(r"\maketitle", main)
-        self.assertIn(r"\input{chapters/chapter-1.tex}", main)
+        self.assertIn(r"\input{chapters/section-001.tex}", main)
+
+    def test_sections_follow_topics_across_processing_chapters(self):
+        self.notes["glossary"] = []
+        self.notes["chapters"][0]["blocks"] = [
+            {"id": "knn-1", "kind": "text", "topic": "  Метод   ближайших соседей  ",
+             "content": "Первое определение."},
+            {"id": "regression-1", "kind": "text", "topic": "Линейная регрессия",
+             "content": "Модель регрессии."},
+        ]
+        self.notes["chapters"].append({
+            "id": "chapter-2", "title": "Второй интервал", "start": 125, "end": 190,
+            "blocks": [
+                {"id": "knn-2", "kind": "text", "topic": "метод ближайших\nсоседей",
+                 "content": "Продолжение первой темы."},
+                {"id": "regression-2", "kind": "text", "topic": "Линейная регрессия",
+                 "content": "Продолжение второй темы."},
+            ],
+        })
+        root, manifest = self.project()
+        rendering._validate_project(root, manifest)
+        self.assertEqual(manifest["tex_files"], ["main.tex", "chapters/section-001.tex",
+                                               "chapters/section-002.tex"])
+        first = (root / "chapters/section-001.tex").read_text()
+        second = (root / "chapters/section-002.tex").read_text()
+        self.assertEqual(first.count(r"\section"), 1)
+        self.assertIn(r"\section{Метод ближайших соседей}", first)
+        self.assertLess(first.index("Первое определение."), first.index("Продолжение первой темы."))
+        self.assertNotIn("Модель регрессии.", first)
+        self.assertIn(r"\section{Линейная регрессия}", second)
+        self.assertLess(second.index("Модель регрессии."), second.index("Продолжение второй темы."))
+        self.assertNotIn("Второй интервал", first + second)
+        self.assertNotIn("Лекция:", first + second)
+
+    def test_legacy_blocks_use_chapter_title_and_topics_cannot_set_asset_paths(self):
+        self.notes["chapters"][0]["blocks"] = [
+            {"id": "legacy", "kind": "text", "topic": "", "content": "Старый блок."},
+            {"id": "blank-topic", "kind": "text", "topic": " \n ", "content": "Продолжение."},
+            {"id": "new", "kind": "text", "topic": r"../../Матрицы & \input{secret}",
+             "content": "Новая тема."},
+        ]
+        root, manifest = self.project()
+        rendering._validate_project(root, manifest)
+        self.assertIn(r"\section{Случайные величины}", (root / "chapters/section-001.tex").read_text())
+        self.assertIn("Продолжение.", (root / "chapters/section-001.tex").read_text())
+        self.assertIn(r"\section{../../Матрицы \& \textbackslash{}input\{secret\}}",
+                      (root / "chapters/section-002.tex").read_text())
+
+    def test_formal_blocks_keep_inline_math_and_uncertainty_inside_environments(self):
+        self.notes["chapters"][0]["blocks"] = [
+            {"id": kind, "kind": kind, "topic": "Линейная алгебра",
+             "content": r"Матрица \(A\) симметрична.", "evidence_ids": ["ev-1"],
+             "uncertain_fragments": [{"text": "симметрична", "evidence_ids": ["ev-1"]}]}
+            for kind in ("definition", "theorem", "proof")
+        ]
+        self.evidence([("ev-1", 3661)])
+        root, manifest = self.project()
+        rendering._validate_project(root, manifest)
+        main = (root / "main.tex").read_text()
+        chapter = (root / "chapters/section-001.tex").read_text()
+        self.assertIn(r"\usepackage{amsthm}", main)
+        self.assertIn(r"\newtheorem{theorem}{Теорема}[section]", main)
+        self.assertIn(r"\newtheorem{definition}[theorem]{Определение}", main)
+        for kind in ("definition", "theorem", "proof"):
+            heading = "[Доказательство]" if kind == "proof" else ""
+            self.assertIn("\\begin{" + kind + "}" + heading + "\n"
+                          + r"Матрица \(A\) \textcolor{blue!60!black}{симметрична}.\footnote{01:01:01}"
+                          + "\n\\end{" + kind + "}", chapter)
+        self.assertEqual(chapter.count(r"\footnote"), 3)
+        self.assertTrue(manifest["draft"])
+
+    def test_formal_block_prose_cannot_inject_tex_environments(self):
+        self.notes["chapters"][0]["blocks"] = [
+            {"id": "definition", "kind": "definition",
+             "content": r"\end{definition}\input{secret}"},
+        ]
+        root, manifest = self.project()
+        rendering._validate_project(root, manifest)
+        chapter = (root / "chapters/section-001.tex").read_text()
+        self.assertIn(r"\textbackslash{}end\{definition\}\textbackslash{}input\{secret\}", chapter)
+        for command in (r"\newtheorem{other}{Другое}", r"\theoremstyle{plain}",
+                        r"\begin{proof}x\end{proof}"):
+            self.notes["chapters"][0]["blocks"][0]["content"] = r"\(" + command + r"\)"
+            with self.subTest(command=command), self.assertRaises(rendering.RenderError):
+                self.project()
+
+    def test_only_fixed_formal_environment_declarations_are_allowed(self):
+        root, manifest = self.project()
+        main = root / "main.tex"
+        original = main.read_text()
+        declarations = (r"\newtheorem{other}{Другое}", r"\newtheorem*{theorem}{Теорема}",
+                        r"\newtheorem{theorem}{Другое}[section]", r"\theoremstyle{plain}",
+                        r"\newtheorem{input}{Теорема}")
+        for declaration in declarations:
+            main.write_text(original + declaration)
+            with self.subTest(declaration=declaration), self.assertRaises(rendering.RenderError):
+                rendering._validate_project(root, manifest)
+        main.write_text(original)
+        chapter = root / "chapters/section-001.tex"
+        original = chapter.read_text()
+        for declaration in (r"\newtheorem{theorem}{Теорема}[section]", r"\theoremstyle{definition}"):
+            chapter.write_text(original + declaration)
+            with self.subTest(declaration=declaration), self.assertRaisesRegex(rendering.RenderError, "only in main.tex"):
+                rendering._validate_project(root, manifest)
 
     def test_regeneration_removes_obsolete_review_appendix(self):
         root, _ = self.project()
@@ -202,7 +306,7 @@ class RenderingTests(unittest.TestCase):
         expression = "\\(a\n\nb\\)"
         self.notes["chapters"][0]["blocks"][0]["content"] = "Формула " + expression
         root, _ = self.project()
-        self.assertIn(expression, (root / "chapters/chapter-1.tex").read_text())
+        self.assertIn(expression, (root / "chapters/section-001.tex").read_text())
 
     def test_function_colon_is_supported_in_inline_and_display_math(self):
         expression = r"f\colon \mathbb{R} \to \mathbb{R}"
@@ -210,7 +314,7 @@ class RenderingTests(unittest.TestCase):
         self.notes["chapters"][0]["blocks"][1]["content"] = expression
         root, manifest = self.project()
         rendering._validate_project(root, manifest)
-        chapter = (root / "chapters/chapter-1.tex").read_text()
+        chapter = (root / "chapters/section-001.tex").read_text()
         self.assertIn(r"\(" + expression + r"\)", chapter)
         self.assertIn("\\[\n" + expression + "\n\\]", chapter)
 
@@ -223,7 +327,7 @@ class RenderingTests(unittest.TestCase):
                 self.notes["chapters"][0]["blocks"][1]["content"] = expression
                 root, manifest = self.project()
                 rendering._validate_project(root, manifest)
-                chapter = (root / "chapters/chapter-1.tex").read_text()
+                chapter = (root / "chapters/section-001.tex").read_text()
                 self.assertIn(r"\(" + expression + r"\)", chapter)
                 self.assertIn("\\[\n" + expression + "\n\\]", chapter)
 
@@ -251,7 +355,7 @@ class RenderingTests(unittest.TestCase):
                 self.notes["chapters"][0]["blocks"][1]["content"] = content
                 root, manifest = self.project()
                 rendering._validate_project(root, manifest)
-                chapter = (root / "chapters/chapter-1.tex").read_text()
+                chapter = (root / "chapters/section-001.tex").read_text()
                 display = "\\[\n" + content + "\n\\]"
                 if wrapped:
                     self.assertIn(display, chapter)
@@ -269,7 +373,7 @@ class RenderingTests(unittest.TestCase):
 
     def test_manual_tex_edits_are_preserved_and_report_is_written(self):
         root, _ = self.project()
-        source = root / "chapters/chapter-1.tex"
+        source = root / "chapters/section-001.tex"
         corrected = source.read_text() + "\nИсправленная формулировка.\n"
         source.write_text(corrected)
 
@@ -292,7 +396,7 @@ class RenderingTests(unittest.TestCase):
 
     def test_manual_evidence_reference_is_rejected(self):
         root, manifest = self.project()
-        source = root / "chapters/chapter-1.tex"
+        source = root / "chapters/section-001.tex"
         for malicious in (r"\includegraphics{../evidence/frame.png}", r"\input{../sources/slides.tex}", r"\usepackage{shellesc}", r"\renewcommand\input{bad}", r"\setmainfont[Path=../]{CMU Serif}"):
             original = source.read_text()
             source.write_text(original + malicious)
@@ -302,7 +406,7 @@ class RenderingTests(unittest.TestCase):
 
     def test_symlink_asset_escape_is_rejected(self):
         root, manifest = self.project()
-        source = root / "chapters/chapter-1.tex"
+        source = root / "chapters/section-001.tex"
         source.unlink()
         outside = self.job / "outside.tex"
         outside.write_text("external")
@@ -361,7 +465,7 @@ class RenderingTests(unittest.TestCase):
                     "segments": []}
         evidence_path.write_text(json.dumps(evidence))
         root, _ = self.project()
-        edited_paths = [root / "chapters/chapter-1.tex", root / "figures/diagram-diagram-1.tex", root / "code/code-1.txt"]
+        edited_paths = [root / "chapters/section-001.tex", root / "figures/diagram-diagram-1.tex", root / "code/code-1.txt"]
         for path in edited_paths:
             path.write_text(path.read_text() + "\nРучная правка.\n")
         edited = {path: path.read_bytes() for path in edited_paths}
@@ -447,6 +551,18 @@ class RenderingTests(unittest.TestCase):
         self.notes["chapters"][0]["blocks"][1]["content"] = (
             r"f\colon \mathbb{R} \to \mathbb{R},\quad x \mapsto x^2,\quad "
             r"\|\tilde{x}\|,\quad P(Y=1\mid X=x)")
+        self.notes["chapters"][0]["blocks"].extend([
+            {"id": "definition-1", "kind": "definition",
+             "content": r"Матрица называется симметричной, если \(A = A^{\mathsf{T}}\).",
+             "evidence_ids": ["ev-1"],
+             "uncertain_fragments": [{"text": "симметричной", "evidence_ids": ["ev-1"]}]},
+            {"id": "theorem-1", "kind": "theorem",
+             "content": r"Если \(X\) постоянно, то его дисперсия равна нулю."},
+            {"id": "proof-1", "kind": "proof",
+             "content": r"По определению \(\operatorname{Var}(X) = \mathbb{E}[(X-\mathbb{E}[X])^2] = 0\)."},
+            {"id": "theorem-2", "kind": "theorem", "topic": "Следующая тема",
+             "content": r"Для \(a > 0\) выполнено \(a^2 > 0\)."},
+        ])
         self.project()
         pdf = rendering.render(self.job)
         self.assertGreater(pdf.stat().st_size, 1000)
@@ -458,6 +574,10 @@ class RenderingTests(unittest.TestCase):
         with pymupdf.open(pdf) as document:
             text = "\n".join(page.get_text() for page in document)
         self.assertIn("Случайные величины", text)
+        self.assertRegex(text, r"Определение\s+1\.1")
+        self.assertRegex(text, r"Теорема\s+1\.2")
+        self.assertRegex(text, r"Теорема\s+2\.1")
+        self.assertIn("Доказательство", text)
         self.assertIn("Проверьте индекс.", text)
         self.assertIn("01:01:01", text)
         self.assertNotIn("Требует проверки", text)

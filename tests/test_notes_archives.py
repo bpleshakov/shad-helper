@@ -30,7 +30,8 @@ def chapter_reply(context):
         "title": "Лекция", "language": "ru", "issues": [],
         "glossary": [{"term": chapter["id"], "definition": "Новое обозначение"}],
         "chapters": [{**chapter, "blocks": [{
-            "id": f"{chapter['id']}_b1", "kind": "text", "content": "Определение",
+            "id": f"{chapter['id']}_b1", "kind": "definition", "content": "Определение",
+            "topic": "Метод ближайших соседей",
             "evidence_ids": [context["segments"][0]["id"]],
         }]}],
     }
@@ -74,7 +75,7 @@ def snapshot(folder):
             for path in folder.rglob("*") if path.is_file()}
 
 
-def test_automatic_handoff_matches_calls_including_accumulated_glossary(tmp_path):
+def test_automatic_handoff_matches_calls_including_glossary_and_topics(tmp_path):
     prepare_job(tmp_path, duration=1800)
     client = FakeClient()
     assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client).exists()
@@ -99,7 +100,37 @@ def test_automatic_handoff_matches_calls_including_accumulated_glossary(tmp_path
         assert read_json(attempt / "status.json")["status"] == "success"
     assert json.loads(client.calls[1]["text"])["glossary"] == [
         {"term": "ch001", "definition": "Новое обозначение"}]
+    assert json.loads(client.calls[0]["text"])["topics"] == []
+    assert json.loads(client.calls[1]["text"])["topics"] == ["Метод ближайших соседей"]
     assert "PRIVATE_EXTRACTION_DIAGNOSTIC" not in repr(snapshot(run))
+
+
+def test_cached_chapters_replay_normalized_topics_in_first_appearance_order(tmp_path):
+    prepare_job(tmp_path, duration=2700)
+
+    class TopicClient(FakeClient):
+        def complete(self, instructions, text, schema=None):
+            reply = super().complete(instructions, text, schema)
+            chapter = reply["chapters"][0]
+            if chapter["id"] == "ch002":
+                chapter["blocks"][0]["topic"] = "  метод   ближайших Соседей  "
+                chapter["blocks"].append({**chapter["blocks"][0], "id": "ch002_b2",
+                                           "topic": "Линейная регрессия"})
+            return reply
+
+    first = TopicClient()
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=first)
+    expected = [[], ["Метод ближайших соседей"],
+                ["Метод ближайших соседей", "Линейная регрессия"]]
+    assert [json.loads(call["text"])["topics"] for call in first.calls] == expected
+
+    cached = TopicClient()
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=cached)
+    assert cached.calls == []
+    latest = runs(tmp_path)[-1]
+    assert list(read_json(latest / "chapters.json").values()) == ["cached"] * 3
+    assert [read_json(latest / "inputs" / f"ch{number:03d}" / "context.json")["topics"]
+            for number in range(1, 4)] == expected
 
 
 def test_cached_and_rebuilt_runs_keep_old_archives_and_distinguish_requests(tmp_path):
@@ -168,6 +199,7 @@ def test_each_failed_retry_survives_fallback_with_actual_glossary(tmp_path):
         assert read_json(attempt / "call.json")["text"] == client.calls[-1]["text"]
     context = json.loads(client.calls[-1]["text"])
     assert context["glossary"] == [{"term": "ch001", "definition": "Новое обозначение"}]
+    assert context["topics"] == ["Метод ближайших соседей"]
     for root in (tmp_path / "handoff", run):
         assert read_json(root / "inputs/ch002/context.json") == context
         assert read_json(root / "status.json")["status"] == "manual_required"
@@ -185,6 +217,8 @@ def test_runtime_split_retains_rejected_parent_and_final_child_handoff(tmp_path)
     [run] = runs(tmp_path)
     identifiers = [json.loads(call["text"])["chapter"]["id"] for call in client.calls]
     assert len(identifiers) == 3 and identifiers[0] == "ch001"
+    assert [json.loads(call["text"])["topics"] for call in client.calls] == [
+        [], [], ["Метод ближайших соседей"]]
     assert {path.name for path in (run / "requests").iterdir()} == set(identifiers)
     assert read_json(run / "requests/ch001/attempt-01/status.json")["status"] == "failed"
     outline = read_json(run / "outline.json")

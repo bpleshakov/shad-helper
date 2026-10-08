@@ -53,7 +53,10 @@ reject them before any rebuild, review, or rendering writes.
 ## Notes and rendering
 
 - Use consecutive fifteen-minute chapters, bounded neighboring speech/visual context,
-  an editable outline, shared glossary, and chapter checkpoints.
+  an editable outline, shared glossary, accumulated topic names, and chapter checkpoints.
+  These chapters are processing intervals; group the rendered sections by broad
+  block topics across intervals, in first-appearance order. Preserve block order
+  within a topic and chapter provenance in JSON. Legacy blocks use chapter titles.
 - Send speech IDs, timestamps, text and clean visual records. Include the latest
   preceding frame for a potentially continuing slide. Isolate extraction diagnostics from
   generation, checkpoints, review, and render freshness. Lecture blocks cite valid
@@ -61,8 +64,10 @@ reject them before any rebuild, review, or rendering writes.
 - Split requests above 120,000 UTF-8 bytes and retry typed context-limit failures.
   Stop before parts become shorter than thirty seconds. Preserve all evidence in
   manual handoffs when splitting cannot help.
-- Automatic and imported replies use the same schema. Mark added explanations
-  and only the questionable fragments of useful study material; do not invent
+- Automatic and imported replies use the same schema. Render definitions,
+  theorems, and proofs with LaTeX `amsthm` environments; keep examples,
+  clarifications, and explanations as plain prose. Mark only the questionable
+  fragments of useful study material; do not invent
   missing formula, code, or diagram details. Combine source times into one short
   footnote per affected paragraph; keep diagnostic explanations in local review.
   Cross-check fallible visual extraction against speech. Notebook visuals supply
@@ -73,12 +78,13 @@ reject them before any rebuild, review, or rendering writes.
   duration-scaled word allowance. Omit empty chapters from the PDF, preserve their
   outline intervals, and avoid a standalone title/contents page.
 - Use three distinct manual inputs: shared instructions in `prompt.txt`, lecture
-  title/glossary/writing budget/chapter/speech/visuals in `context.json`, and output constraints in
+  title/glossary/topics/writing budget/chapter/speech/visuals in `context.json`, and output constraints in
   `response-schema.json`. Keep them under `handoff/inputs/`, with operator README
   and fallback status outside it. Do not duplicate the outline or transcript in model inputs.
+  Initial manual topic lists are empty; use consistent broad names across replies.
 - Save the handoff on every notes run, including cache hits and imports. Retain
   separate `handoff/runs/<run ID>/` archives with the run's outline and actual
-  chapter contexts, including accumulated glossary. Save each attempt's exact
+  chapter contexts, including accumulated glossary and topic names. Save each attempt's exact
   outbound API JSON before transmission; keep retries and split-parent requests.
   Exclude credentials and OAuth exchanges; never send after an archive write fails.
 - Preserve note-generated issues and explicit resolutions. Review operates on

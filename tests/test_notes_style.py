@@ -66,6 +66,19 @@ def test_split_chapters_share_the_original_writing_allowance():
     assert budgets == [{"target_words": 125, "dense_words": 250}] * 2
 
 
+def test_topic_catalog_counts_toward_input_budget(monkeypatch):
+    from shad_helper.schemas import LectureNotes
+
+    data = evidence()
+    outline = notes.default_outline(data)
+    context = notes.chapter_context(data, outline["chapters"][0])
+    base = notes.INSTRUCTIONS + notes._chapter_prompt(context, outline, [])
+    base += json.dumps(LectureNotes.model_json_schema(), ensure_ascii=False)
+    monkeypatch.setattr(notes, "MAX_CHAPTER_TEXT_BYTES", len(base.encode("utf-8")))
+    assert notes._chapter_budget_error(context, outline, []) is None
+    assert notes._chapter_budget_error(context, outline, [], ["Линейная регрессия"]) is not None
+
+
 def test_automatic_and_manual_allowances_match_without_truncating_notes(tmp_path):
     data = evidence(start=3600, duration=30)
     write_json(tmp_path / "evidence.json", data)

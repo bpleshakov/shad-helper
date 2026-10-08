@@ -29,7 +29,7 @@ def prepare_job(job, data, outline=None):
 
 def payload_from_prompt(prompt):
     payload = json.loads(prompt)
-    assert set(payload) == {"lecture_title", "glossary", "chapter", "segments", "writing_budget"}
+    assert set(payload) == {"lecture_title", "glossary", "topics", "chapter", "segments", "writing_budget"}
     return payload
 
 
@@ -270,7 +270,9 @@ def test_deep_split_long_chapter_id_keeps_block_and_issue_ids_unique(tmp_path, m
     outline = notes.default_outline(data)
     outline["chapters"][0]["id"] = "a" * 80
     prepare_job(tmp_path, data, outline)
-    monkeypatch.setattr(notes, "MAX_CHAPTER_TEXT_BYTES", 22000)
+    # Keep a small evidence allowance independent of prompt/schema changes.
+    overhead = notes.INSTRUCTIONS + json.dumps(LectureNotes.model_json_schema(), ensure_ascii=False)
+    monkeypatch.setattr(notes, "MAX_CHAPTER_TEXT_BYTES", len(overhead.encode("utf-8")) + 14000)
 
     class UncertainClient(FakeClient):
         def complete(self, instructions, prompt, schema=None):

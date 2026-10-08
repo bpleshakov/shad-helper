@@ -42,8 +42,11 @@ class UncertainFragment(StrictModel):
 
 class NoteBlock(StrictModel):
     id: Identifier
-    kind: Literal["text", "math", "code", "diagram", "clarification", "uncertain"]
+    kind: Literal[
+        "text", "definition", "theorem", "proof", "math", "code", "diagram", "clarification", "uncertain",
+    ]
     content: str = Field(min_length=1)
+    topic: str = ""
     evidence_ids: list[str] = Field(default_factory=list)
     caption: str = ""
     language: str = ""
@@ -53,7 +56,7 @@ class NoteBlock(StrictModel):
     def valid_uncertain_fragments(self):
         if not self.uncertain_fragments:
             return self
-        if self.kind not in {"text", "clarification", "uncertain"}:
+        if self.kind not in {"text", "definition", "theorem", "proof", "clarification", "uncertain"}:
             raise ValueError("Uncertain fragments are supported only in prose blocks")
 
         math_spans = []

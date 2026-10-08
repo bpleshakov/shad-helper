@@ -62,7 +62,7 @@ def test_video_automatic_and_manual_inputs_match_without_private_diagnostics(tmp
     folder = notes.generate_notes(tmp_path, tmp_path / "auth", manual=True)
     manual_context = read_json(folder / "inputs/ch001/context.json")
     assert set(manual_context) == {
-        "lecture_title", "glossary", "chapter", "segments", "visuals", "writing_budget"}
+        "lecture_title", "glossary", "topics", "chapter", "segments", "visuals", "writing_budget"}
     assert manual_context["visuals"] == data["visuals"]
     assert "issues" in manual_context["visuals"][0]["text"]
     assert not list(folder.rglob("*.png"))

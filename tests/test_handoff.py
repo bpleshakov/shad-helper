@@ -71,6 +71,7 @@ def test_reasoning_effort_changes_invalidate_chapter_caches(tmp_path, monkeypatc
 
 def test_handoff_exports_three_distinct_input_types(tmp_path):
     data = evidence()
+    data["segments"][0]["text"] = "UNIQUE_SPEECH_CONTENT"
     write_json(tmp_path / "evidence.json", data)
     outline = notes.default_outline(data)
     outline["title"] = "Unique lecture title"
@@ -83,14 +84,15 @@ def test_handoff_exports_three_distinct_input_types(tmp_path):
     assert {path.name for path in folder.iterdir()} == {"inputs", "README.txt"}
     chapter = inputs / "ch001"
     context = read_json(chapter / "context.json")
-    assert set(context) == {"lecture_title", "glossary", "writing_budget", "chapter", "segments"}
+    assert set(context) == {"lecture_title", "glossary", "topics", "writing_budget", "chapter", "segments"}
+    assert context["topics"] == []
     assert context["lecture_title"] == outline["title"]
     assert context["glossary"] == outline["glossary"]
     assert context["segments"] == data["segments"]
     prompt = (chapter / "prompt.txt").read_text()
     assert prompt == notes.INSTRUCTIONS
     schema_text = (inputs / "response-schema.json").read_text()
-    for unique_data in ("Определение", "Unique lecture title", "Unique glossary term",
+    for unique_data in ("UNIQUE_SPEECH_CONTENT", "Unique lecture title", "Unique glossary term",
                         "Unique definition"):
         assert unique_data not in prompt and unique_data not in schema_text
     assert read_json(inputs / "ch002/context.json")["segments"] == []

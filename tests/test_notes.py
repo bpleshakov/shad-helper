@@ -79,7 +79,7 @@ class NotesContextTests(unittest.TestCase):
             write_json(job / "evidence.json", source)
             write_json(job / "notes.json", notes)
             write_project(job, dict(notes, evidence_index=evidence_index(source)))
-            chapter = job / "notes/chapters/ch001.tex"
+            chapter = job / "notes/chapters/section-001.tex"
             edited = chapter.read_text() + "\nРучная правка.\n"
             chapter.write_text(edited)
             resolve_issue(job, "issue1", "Проверен индекс")

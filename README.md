@@ -140,8 +140,9 @@ attempt, waiting 5, 10, and 20 seconds. Completed chapters remain cached.
 Unavailable access or failure after all four attempts exports a manual handoff.
 
 The app uses `outline.json`, or creates consecutive fifteen-minute chapters.
-Each request contains one chapter, neighboring speech and visual context, and a
-shared glossary. Speech inputs contain only `id`, `start`, `end`, and `text`.
+Each request contains one chapter, neighboring speech and visual context, a
+shared glossary, and the broad topic names used in preceding replies. Speech
+inputs contain only `id`, `start`, `end`, and `text`.
 Video inputs contain the extracted content and timestamps, including the last
 preceding frame when a static slide spans a chapter boundary. Raw frame images,
 local frame paths, confidence and extraction diagnostics are not sent. Only
@@ -164,8 +165,20 @@ the input byte cap; no proof or evidence is truncated to hit a page count. Actua
 pagination depends on formulas and diagrams. Administrative-only chapters may
 have `blocks: []`; their intervals stay in the outline but get no PDF heading.
 
-Lecture blocks cite speech or visual evidence IDs. Added explanations are
-**Пояснение**. Questionable phrases or whole inline formulas are listed in
+PDF sections follow broad topics such as nearest neighbors, linear regression,
+or merge sort. Every new block has a `topic`; matching names are grouped across
+processing chapters into one section, in first-appearance order. Matching ignores
+case and extra whitespace, but does not merge different names automatically.
+Chapter intervals remain in `notes.json` for provenance. Legacy blocks without a
+topic use their chapter title.
+
+Definitions, theorem statements, and proofs use `definition`, `theorem`, and
+`proof` blocks, rendered with LaTeX `amsthm` environments. Definitions and theorems
+share numbering within each section; proofs have a Russian heading. Examples,
+clarifications, and explanations remain plain prose. The model supplies prose and
+inline math, while the renderer supplies the environments.
+
+Lecture blocks cite speech or visual evidence IDs. Questionable phrases or whole inline formulas are listed in
 `uncertain_fragments` with their exact text and supporting evidence IDs. The PDF
 colors only these fragments and adds one short `hh:mm:ss` footnote per affected
 paragraph, combining and deduplicating its timestamps. Longer sets become a time
@@ -175,7 +188,7 @@ be flagged rather than invented. Notebook visuals
 contribute theory, formulas and explanatory comments, not executable code.
 Diagrams remain editable TikZ/PGFPlots; source screenshots are not placed in PDFs.
 Ordinary source citations create no footnotes; only marked uncertainty does.
-The PDF has a compact title followed by content, chapter intervals, and no review
+The PDF has a compact title followed by topical sections, and no review
 appendix. Review issues remain available in the JSON files and through `review`.
 Transcription warnings are informational: inspect or correct them before notes
 when needed. They are ignored by note generation rather than carried into review.
@@ -190,7 +203,7 @@ contexts, and response schema. Each run also gets a separate archive under
 `handoff/runs/<run ID>/`, whose path is printed when the command starts:
 
 - `inputs/`, `README.txt`, and `outline.json`: the run's handoff and chapter plan;
-  automatic contexts include the actual glossary accumulated before each chapter.
+  automatic contexts include the actual glossary and topic names accumulated before each chapter.
 - `run.json` and `chapters.json`: run mode/result and generated versus cached chapters.
 - `requests/<chapter ID>/attempt-01/call.json`: instructions, exact context string,
   application response schema, and model for each generation attempt.
@@ -216,10 +229,13 @@ For each chapter listed in the job's `outline.json`, attach
 `handoff/inputs/CHAPTER_ID/context.json` and the shared
 `handoff/inputs/response-schema.json` in ChatGPT, then paste that chapter's
 `prompt.txt`. These are the three model inputs: instructions, lecture data, and
-response structure. The context contains the lecture title, glossary, writing budget, chapter
+response structure. The context contains the lecture title, glossary, topics, writing budget, chapter
 metadata, speech and (for video jobs) extracted visuals once. `handoff/README.txt`
 and any `status.json` are operator
 instructions and should not be sent to the model.
+Initial manual inputs have an empty `topics` list; use consistent broad topic
+names across replies. Automatic generation accumulates names from both generated
+and cached chapters.
 Save JSON replies without Markdown fences as `CHAPTER_ID.json`:
 
 ```sh

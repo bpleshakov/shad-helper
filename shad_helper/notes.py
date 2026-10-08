@@ -23,6 +23,16 @@ INSTRUCTIONS = r"""Ты составляешь компактный русски
 Данные лекции переданы отдельным JSON-контекстом; схема задает формат ответа.
 Составь ровно одну главу с ID, start и end из поля chapter.
 Дай главе тематическое название по материалу ее интервала.
+Глава — технический интервал обработки, а не раздел готового конспекта.
+Каждому блоку задай непустое поле topic: название широкой учебной темы,
+например «Метод ближайших соседей», «Линейная регрессия», «Сортировка слиянием».
+Не делай отдельные темы для определения, формулы, примера или доказательства.
+Одна тема может продолжаться в нескольких главах; одна глава может содержать
+несколько тем. Поле topics содержит уже использованные названия: повторяй их
+точно для той же темы, включая возвращение к ней после других тем. Для новой
+темы выбери краткое устойчивое название, без номера интервала и временных меток.
+Если topics пуст, используй общепринятые названия, согласованные между ответами.
+В готовом конспекте блоки одной темы будут собраны в один раздел.
 Соседний контекст нужен для понимания; не дублируй его в этой главе.
 Источники — предоставленные сегменты речи и, если есть, visual-записи с ID.
 visuals содержит локально распознанные текст, формулы и описания кадров с
@@ -63,15 +73,25 @@ glossary обычно оставляй пустым: не дублируй оп�
 обычным текстом; исключи исполняемый код, массивы, служебный вывод и интерфейс.
 Не выводи теоретические утверждения из самого кода.
 Не выдумывай символы, подписи, код, результаты исполнения или значения графиков.
-Добавленные объяснения обозначай блоками clarification.
+Определения оформляй блоками kind=definition, формулировки теорем — kind=theorem,
+а их доказательства — kind=proof. В content пиши само содержание, без заголовков
+«Определение», «Теорема», «Доказательство» и без команд begin/end: окружения LaTeX
+добавит рендерер. Сохраняй предпосылки и обозначения, не объявляй обычное наблюдение
+теоремой. Доказательство помещай сразу после соответствующей теоремы с тем же topic;
+оно может содержать несколько абзацев в одном блоке proof. Не выдумывай отсутствующее
+доказательство и не превращай примеры или интуитивные объяснения в доказательства.
+Примеры, уточнения и объяснения пиши обычным текстом kind=text, без специальных
+окружений или служебных заголовков. kind=clarification оставлен для совместимости.
 Не создавай отдельные блоки «Требует проверки» и длинные объяснения сомнений.
 Сомнительный фрагмент оставляй внутри обычного абзаца и добавляй uncertain_fragments:
 text — точная уникальная подстрока content, evidence_ids — относящиеся к ней ID
 из evidence_ids блока. Отмечай только сомнительную часть, а не весь абзац.
-Один текстовый блок — один абзац; несколько сомнений в нем перечисляй в одном
+Один блок text — один абзац; несколько сомнений в нем перечисляй в одном
 uncertain_fragments. Фрагменты не должны пересекаться; встроенную формулу
 включай целиком вместе с \(...\). Для сомнительной формулы используй такой
-текстовый блок вместо math. В остальных блоках uncertain_fragments=[].
+текстовый блок вместо math. В definition, theorem и proof также можно отмечать
+фрагменты; один фрагмент не должен пересекать границу абзаца.
+В блоках без сомнений и в math, code, diagram используй uncertain_fragments=[].
 Не добавляй вручную сноски, цвета и временные метки: рендерер выделит фрагменты
 и объединит их ссылки в короткую сноску с временем источника в формате hh:mm:ss.
 kind=uncertain оставлен для старых ответов; в новом ответе используй фрагменты.
@@ -82,13 +102,14 @@ kind=uncertain оставлен для старых ответов; в ново�
 math — выражение LaTeX без \[\] и без $$; code — точный код без Markdown оград.
 Математические обозначения записывай кодом LaTeX, а не Unicode-символами,
 даже если в источнике использованы готовые символы индексов, степеней или операторов.
-В текстовых блоках, включая clarification и uncertain, и в обоих полях glossary
+В текстовых блоках, включая definition, theorem, proof, clarification и uncertain,
+и в обоих полях glossary
 (term и definition) используй \(...\): \(X_1\), \(X_{nj}\), \(10^{10}\)
 вместо X₁, Xₙⱼ, 10¹⁰. Греческие буквы и математические знаки также записывай
 командами: \(\alpha\), \(\leq\), \(\neq\), \(\infty\) вместо α, ≤, ≠, ∞.
 В math используй ту же LaTeX-запись без внешних разделителей; в diagram
 математические подписи оформляй средствами LaTeX.
-В названиях лекции/глав и caption описывай математические понятия словами, без формул.
+В названиях лекции/глав, topic и caption описывай понятия словами, без формул.
 Обычный русский текст и пунктуацию сохраняй в UTF-8; точный код и его строки не меняй.
 diagram — полный tikzpicture, при необходимости с PGFPlots; никаких input,
 includegraphics, внешних файлов, shell-команд или Lua. Строй диаграммы только
@@ -215,16 +236,18 @@ def _validate_evidence(notes: dict, evidence: dict, resolutions: dict | None = N
     return notes
 
 
-def _model_context(context: dict, outline: dict, glossary: list[dict]) -> dict:
+def _model_context(context: dict, outline: dict, glossary: list[dict],
+                   topics: list[str] | None = None) -> dict:
     duration = context["chapter"]["end"] - context["chapter"]["start"]
-    return {"lecture_title": outline["title"], "glossary": glossary,
+    return {"lecture_title": outline["title"], "glossary": glossary, "topics": topics or [],
             "writing_budget": {"target_words": max(1, math.ceil(duration * 3000 / 10800)),
                                "dense_words": max(1, math.ceil(duration * 6000 / 10800))},
             **{key: context[key] for key in ("chapter", "segments", "visuals") if key in context}}
 
 
-def _chapter_prompt(context: dict, outline: dict, glossary: list[dict]) -> str:
-    return json.dumps(_model_context(context, outline, glossary),
+def _chapter_prompt(context: dict, outline: dict, glossary: list[dict],
+                    topics: list[str] | None = None) -> str:
+    return json.dumps(_model_context(context, outline, glossary, topics),
                       ensure_ascii=False, separators=(",", ":"))
 
 
@@ -254,6 +277,7 @@ def export_handoff(job: Path, evidence: dict, outline: dict, *, contexts: dict |
         "inputs/CHAPTER_ID/prompt.txt (paste or attach the prompt).\n"
         "Lecture data is only in context; instructions and response structure are separate.\n"
         "README.txt and status.json are operator files, not model inputs.\n"
+        "Use consistent broad topic names across replies; initial manual inputs have no accumulated topics.\n"
         "Save its JSON response as CHAPTER_ID.json in a replies directory.\n"
         f"Import using: shad-helper notes {job} --import replies/\n",
         encoding="utf-8")
@@ -350,11 +374,11 @@ MIN_CHAPTER_SECONDS = 30
 
 
 def _chapter_budget_error(context: dict, outline: dict,
-                          glossary: list[dict]) -> str | None:
+                          glossary: list[dict], topics: list[str] | None = None) -> str | None:
     from .schemas import LectureNotes
 
     # Conservative local size caps, not a model-specific token calculation.
-    text = INSTRUCTIONS + _chapter_prompt(context, outline, glossary)
+    text = INSTRUCTIONS + _chapter_prompt(context, outline, glossary, topics)
     text += json.dumps(LectureNotes.model_json_schema(), ensure_ascii=False)
     size = len(text.encode("utf-8"))
     if size > MAX_CHAPTER_TEXT_BYTES:
@@ -499,11 +523,12 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
             parts = []
             chapter_status = {}
             glossary = list(outline["glossary"])
+            topics = {}
             position = 0
             while position < len(outline["chapters"]):
                 chapter = outline["chapters"][position]
                 context = chapter_context(evidence, chapter)
-                reason = _chapter_budget_error(context, outline, glossary)
+                reason = _chapter_budget_error(context, outline, glossary, list(topics.values()))
                 if reason:
                     split = _split_chapter(chapter)
                     if not split:
@@ -513,7 +538,7 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                     write_json(outline_file, outline)
                     _archive_handoff(job, evidence, outline, run, contexts)
                     continue
-                text = _chapter_prompt(context, outline, glossary)
+                text = _chapter_prompt(context, outline, glossary, list(topics.values()))
                 contexts[chapter["id"]] = json.loads(text)
                 for inputs in (handoff / "inputs", run / "inputs"):
                     write_json(inputs / chapter["id"] / "context.json", contexts[chapter["id"]])
@@ -544,6 +569,11 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                 terms = {g["term"]: g for g in glossary}
                 terms.update({g["term"]: g for g in part["glossary"]})
                 glossary = list(terms.values())
+                for result_chapter in part["chapters"]:
+                    for block in result_chapter["blocks"]:
+                        topic = " ".join(block.get("topic", "").split())
+                        if topic:
+                            topics.setdefault(topic.casefold(), topic)
                 position += 1
             notes = _merge_chapters(parts, outline, evidence, resolutions)
         except (PlanAccessError, ResponseError, ValueError) as exc:
