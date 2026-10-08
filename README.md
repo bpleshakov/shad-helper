@@ -122,7 +122,7 @@ UV_CACHE_DIR=.cache/uv uv run shad-helper notes jobs/audio-lecture
 ```
 
 Alternatively, pass `--openai-proxy URL` before the command or after
-`doctor`/`login`/`notes`. The flag overrides the environment variable.
+`doctor`/`login`/`notes`/`anki`. The flag overrides the environment variable.
 URL-encoded proxy credentials are supported; URLs are not saved or printed.
 Requests fail if the proxy is missing, invalid, or unavailable, without direct
 retries. Other proxy environment variables cannot bypass this setting.
@@ -303,4 +303,69 @@ UV_CACHE_DIR=.cache/uv uv run shad-helper render jobs/audio-example
 The synthetic example exercises Russian text, mathematics, a transcript-based
 diagram, and code. See [the pipeline design](docs/plan.md) and the
 [stage contracts](docs/stage-contracts.md) for file structures and validation rules.
-Anki remains a separate, unimplemented command.
+## Create an Anki deck from the finished PDF
+
+After checking and rendering the notes, run:
+
+```sh
+UV_CACHE_DIR=.cache/uv uv run shad-helper anki jobs/audio-lecture
+# Use a separately edited PDF:
+UV_CACHE_DIR=.cache/uv uv run shad-helper anki jobs/audio-lecture --pdf notes.pdf
+# Select a profile when more than one Anki collection exists:
+UV_CACHE_DIR=.cache/uv uv run shad-helper anki jobs/audio-lecture --anki-collection '/path/to/collection.anki2'
+```
+
+The default input is `JOB/notes/main.pdf`. The command sends the complete PDF to
+`gpt-6.1-sol` with high reasoning through the existing ChatGPT sign-in and explicit
+OpenAI proxy. It includes text and page images; it does not use the earlier
+transcript, notes JSON, or pipeline diagnostics as model inputs. The PDF must be
+unencrypted and smaller than 50,000,000 bytes. If the model cannot process the
+whole document or return a complete valid response, the command fails without
+publishing a partial deck. Temporary failures get three retries, after 5, 10 and
+20 seconds.
+
+Import `JOB/anki/deck.apkg` into Anki. Each job has a distinct, persistent deck
+name ending in a short job ID. The package reuses the four existing note types
+`Basic`, `Multistep definition`, `Theorem Full proof`, and `Theorem step by step`,
+with their original fields, model IDs, and template order. It includes the
+templates, cropped PDF figures, and precompiled LaTeX images. All math uses native
+Anki LaTeX: `[$]…[/$]` inline and `[$$]…[/$$]` for display equations. The editable
+LaTeX remains in the fields. Export requires `latex` and `dvipng` (TeX Live/MacTeX);
+the included images display after import without compiling them again.
+
+Card generation separates statements, complete proofs, proof plans and individual
+steps. Definition steps show the common context and complete outline; proof steps
+show the statement and complete proof plan. Up to 15 populated logical steps are
+supported by the existing templates; unused fields create no cards. Alternative
+proofs can be separate steps. The model may supply missing reasoning, marked
+**Дополнено моделью** in the affected answer and tagged `model_supplement`.
+Unresolved content is reported and tagged `needs_review`.
+
+New-card positions follow **first appearance in the PDF**, including order within
+a page. All cards belonging to one note share one position. Immediately before
+export, the command reads the local Anki collection, including its current WAL,
+without modifying it. The first note uses the next free position: the larger of
+Anki's allocation counter and the highest existing new-card position plus one.
+Later notes increment this position by one. Anki need not be running, but its
+collection must be readable; missing or ambiguous profiles require
+`--anki-collection`, and export never silently falls back to position 1.
+Positions reflect the collection at export time: import each deck before exporting
+the next one, and regenerate the package if new cards were added in between.
+In Anki's deck options, choose **New card gather order: Ascending position** and **New card sort
+order: Order gathered**. Sibling burying and daily limits may postpone cards;
+reviews continue to use Anki's scheduling. See the
+[Anki display-order documentation](https://docs.ankiweb.net/manual/deck-options#display-order).
+
+`JOB/anki/notes.json` preserves the structured generated content;
+`JOB/anki/report.json` records source pages, positions, model additions, warnings,
+and image coordinates. `JOB/anki/media/` contains figures and compiled formulas.
+Successful generation is cached against the PDF bytes, model, prompt and schema;
+a cached export needs no model request. Use `anki JOB --rebuild` to regenerate only this
+stage. Reimporting the same output creates no duplicates and preserves existing
+positions, review progress and local template edits. It does not reposition cards
+already imported into Anki. Changing the PDF creates new note
+identities in the same job's deck; remove obsolete imported notes manually.
+
+Anki export tests include real imports into disposable collections, covering
+positions, media, model reuse and repeat-import scheduling. They never modify
+your personal Anki collection.

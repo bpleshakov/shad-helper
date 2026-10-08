@@ -19,6 +19,35 @@ def isolated_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("SHAD_HELPER_OPENAI_PROXY", "http://environment-proxy:8080")
 
 
+@pytest.mark.parametrize("position", ["global", "local"])
+def test_anki_forwards_pdf_rebuild_state_and_proxy(monkeypatch, tmp_path, position):
+    generate = Mock(return_value=tmp_path / "deck.apkg")
+    monkeypatch.setitem(sys.modules, "shad_helper.anki", SimpleNamespace(generate_anki=generate))
+    state, job, pdf = tmp_path / "auth", tmp_path / "lecture", tmp_path / "notes.pdf"
+    collection = tmp_path / "anki-profile" / "collection.anki2"
+    arguments = ["--state-dir", str(state)]
+    proxy = "http://configured-proxy:8080"
+    if position == "global":
+        arguments.extend(["--openai-proxy", proxy])
+    arguments.extend(["anki", str(job), "--pdf", str(pdf), "--rebuild",
+                      "--anki-collection", str(collection)])
+    if position == "local":
+        arguments.extend(["--openai-proxy", proxy])
+    assert main(arguments) == 0
+    generate.assert_called_once_with(job, state, pdf=pdf, rebuild=True, proxy=proxy,
+                                     anki_collection=collection)
+
+
+def test_anki_defaults_and_failure_exit_code(monkeypatch, tmp_path, capsys):
+    generate = Mock(side_effect=ValueError("Anki requires a finished PDF"))
+    monkeypatch.setitem(sys.modules, "shad_helper.anki", SimpleNamespace(generate_anki=generate))
+    job = tmp_path / "lecture"
+    assert main(["anki", str(job)]) == 1
+    generate.assert_called_once_with(job, cli.Path(".shad-helper/auth"),
+                                     pdf=None, rebuild=False, proxy=None, anki_collection=None)
+    assert "finished PDF" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(("proxy", "position"), [
     (None, None), ("http://configured-proxy:8080", "global"),
     ("http://user:secret@configured-proxy:8080", "local")])

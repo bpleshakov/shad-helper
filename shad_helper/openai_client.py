@@ -1,5 +1,6 @@
 """Streaming Responses API through the user's authorized ChatGPT plan."""
 
+import base64
 import json
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from shad_helper.network import openai_http_client, resolve_openai_proxy
 
 DEFAULT_MODEL = "gpt-6.1-sol"
 DEFAULT_REASONING_EFFORT = "high"
+MAX_PDF_BYTES = 50_000_000
 
 class ResponseError(RuntimeError):
     def __init__(self, message, *, code=None):
@@ -84,7 +86,7 @@ def _stream_text(response):
                 raise PlanAccessError(f"ChatGPT plan request failed: {code}.", code=code, request_id=request_id)
             raise ResponseError(f"OpenAI response failed: {code}.", code=code)
         elif kind == "response.incomplete":
-            raise ResponseError("OpenAI response was incomplete; partial notes were discarded.")
+            raise ResponseError("OpenAI response was incomplete; partial output was discarded.")
         elif kind == "response.completed":
             result = event.get("response", {})
             if result.get("status") != "completed":
@@ -93,11 +95,11 @@ def _stream_text(response):
             for item in result.get("output", []):
                 for content in item.get("content", []):
                     if content.get("type") == "refusal":
-                        raise ResponseError("OpenAI refused the note-generation request.")
+                        raise ResponseError("OpenAI refused the generation request.")
                     if content.get("type") == "output_text":
                         output.append(content.get("text", ""))
             return "".join(output or deltas)
-    raise ResponseError("OpenAI stream ended without response.completed; partial notes were discarded.")
+    raise ResponseError("OpenAI stream ended without response.completed; partial output was discarded.")
 
 
 class PlanClient:
@@ -129,8 +131,20 @@ class PlanClient:
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
             raise ResponseError("ChatGPT returned an invalid account-specific model catalog.") from exc
 
-    def complete(self, instructions: str, text: str, schema: dict | None = None) -> dict:
+    def complete(self, instructions: str, text: str, schema: dict | None = None,
+                 *, pdf: Path | None = None) -> dict:
         content = [{"type": "input_text", "text": text}]
+        if pdf is not None:
+            pdf = Path(pdf)
+            with pdf.open("rb") as stream:
+                data = stream.read(MAX_PDF_BYTES)
+            if len(data) >= MAX_PDF_BYTES:
+                raise ValueError("PDF input must be smaller than 50 MB.")
+            if not data.startswith(b"%PDF-"):
+                raise ValueError("PDF input has an invalid PDF signature.")
+            content.append({"type": "input_file", "filename": pdf.name,
+                            "file_data": "data:application/pdf;base64,"
+                            + base64.b64encode(data).decode("ascii")})
         body = {"model": self.model, "reasoning": {"effort": DEFAULT_REASONING_EFFORT}, "instructions": instructions, "input": [{"role": "user", "content": content}], "store": False, "stream": True}
         if schema is not None:
             body["text"] = {"format": {"type": "json_schema", "name": "lecture_notes", "schema": _strict_schema(schema), "strict": True}}
@@ -153,11 +167,11 @@ class PlanClient:
                     except (KeyError, TypeError, AttributeError) as exc:
                         raise ResponseError("OpenAI returned malformed response content.") from exc
         except httpx.HTTPError as exc:
-            raise PlanAccessError("ChatGPT connection was interrupted; partial notes were discarded.") from exc
+            raise PlanAccessError("ChatGPT connection was interrupted; partial output was discarded.") from exc
         try:
             value = json.loads(raw)
         except ValueError as exc:
-            raise ResponseError("OpenAI returned invalid notes JSON.") from exc
+            raise ResponseError("OpenAI returned invalid JSON.") from exc
         if not isinstance(value, dict):
-            raise ResponseError("OpenAI notes output must be a JSON object.")
+            raise ResponseError("OpenAI output must be a JSON object.")
         return value

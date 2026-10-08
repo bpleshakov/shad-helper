@@ -38,17 +38,21 @@ def parser() -> argparse.ArgumentParser:
     mode.add_argument("--manual", action="store_true", help="Export handoff without any network calls")
     mode.add_argument("--import", dest="imported", type=Path, help="JSON response or chapter replies folder")
     notes.add_argument("--rebuild", action="store_true", help="Invalidate synthesized note checkpoints")
-    for command in (check, login, notes):
-        command.add_argument("--openai-proxy", default=argparse.SUPPRESS,
-                             help="HTTP/HTTPS proxy URL for OpenAI requests")
     render = commands.add_parser("render", help="Compile editable LaTeX and create PDF QA images")
     render.add_argument("job", type=Path)
     review = commands.add_parser("review", help="Show review issues or record a verified correction")
     review.add_argument("job", type=Path)
     review.add_argument("--resolve", help="Review issue ID")
     review.add_argument("--resolution", help="Describe the correction made to evidence or notes")
-    anki = commands.add_parser("anki", help="Reserved for a later, separate reviewed-notes step")
+    anki = commands.add_parser("anki", help="Create an importable Anki deck from a finished PDF")
     anki.add_argument("job", type=Path)
+    anki.add_argument("--pdf", type=Path, help="Input PDF (default: JOB/notes/main.pdf)")
+    anki.add_argument("--rebuild", action="store_true", help="Regenerate Anki notes from the PDF")
+    anki.add_argument("--anki-collection", type=Path,
+                      help="Anki collection.anki2 to read positions from (default: unique local profile)")
+    for command in (check, login, notes, anki):
+        command.add_argument("--openai-proxy", default=argparse.SUPPRESS,
+                             help="HTTP/HTTPS proxy URL for OpenAI requests")
     return result
 
 
@@ -142,8 +146,10 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  Correction: {issue['resolution']}")
             print(f"{sum(i['status'] == 'open' for i in issues)} unresolved issue(s)")
         elif args.command == "anki":
-            print("Anki generation is not implemented. The future step will require reviewed notes.")
-            return 2
+            from .anki import generate_anki
+            print(generate_anki(args.job, args.state_dir, pdf=args.pdf,
+                                rebuild=args.rebuild, proxy=args.openai_proxy,
+                                anki_collection=args.anki_collection))
         return 0
     except ModuleNotFoundError as exc:
         print(f"Missing dependency {exc.name}. Run: UV_CACHE_DIR=.cache/uv uv sync --extra local", file=sys.stderr)

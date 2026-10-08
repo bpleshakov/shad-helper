@@ -1,6 +1,7 @@
 """Offline unittest checks plus full mocked HTTP tests when dependencies exist."""
 
 import ast
+import base64
 import importlib.util
 import json
 import os
@@ -83,7 +84,7 @@ def _client_module():
     auth_tree = ast.parse(auth_path.read_text())
     auth_class = next(node for node in auth_tree.body if isinstance(node, ast.ClassDef) and node.name == "PlanAccessError")
     exec(compile(ast.Module(body=[auth_class], type_ignores=[]), str(auth_path), "exec"), module.__dict__)
-    module.__dict__.update(json=json, Path=Path,
+    module.__dict__.update(base64=base64, json=json, Path=Path,
         RESOURCE="https://api.openai.com/v1", access_token=token_provider,
         resolve_openai_proxy=resolve_proxy, openai_http_client=Client,
         http_error=lambda _: module.PlanAccessError("offline HTTP error"),
@@ -216,7 +217,7 @@ class ClientStdlibTests(unittest.TestCase):
             client.complete("Instructions", "Text")
         self.assertEqual(calls, [])
         client._available_models = ["gpt-6.1-sol"]
-        for output, message in [("not JSON", "invalid notes JSON"), ("[]", "JSON object")]:
+        for output, message in [("not JSON", "invalid JSON"), ("[]", "JSON object")]:
             module.response_events = [_completed(output)]
             with self.subTest(output=output), self.assertRaisesRegex(module.ResponseError, message):
                 client.complete("Instructions", "Text")
@@ -322,6 +323,69 @@ if _FULL_DEPS:
         assert body["text"]["format"]["schema"] == schema
         assert not set(body) & {"tools", "max_output_tokens", "previous_response_id", "background", "temperature"}
         assert client.models() == ["gpt-6.1-sol"]
+
+
+    @pytest.mark.parametrize("size", [12, 63])
+    def test_pdf_request_contains_exact_bytes_filename_and_strict_schema(
+            tmp_path, monkeypatch, size):
+        monkeypatch.setattr(openai_client, "MAX_PDF_BYTES", 64)
+        data = b"%PDF-1.7\n" + b"\x00\xff" + b"x" * (size - 11)
+        pdf = tmp_path / "Конспект.pdf"
+        pdf.write_bytes(data)
+        schema = {"type": "object", "properties": {"cards": {
+            "type": "array", "items": {"type": "string"}, "default": []}}}
+        client, requests = client_for(tmp_path, sse(completed('{"cards":[]}')))
+        records = []
+        client.request_recorder = lambda *args: records.append(args)
+
+        assert client.complete("Create cards.", "PDF order.", schema, pdf=pdf) == {"cards": []}
+
+        expected = {"model": "gpt-6.1-sol", "reasoning": {"effort": "high"},
+            "instructions": "Create cards.", "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "PDF order."},
+                {"type": "input_file", "filename": pdf.name,
+                 "file_data": "data:application/pdf;base64,"
+                 + base64.b64encode(data).decode("ascii")}]}],
+            "store": False, "stream": True, "text": {"format": {"type": "json_schema",
+                "name": "lecture_notes", "schema": _strict_schema(schema), "strict": True}}}
+        assert requests[-1].content == json.dumps(
+            expected, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        assert records[-1] == ("POST", str(requests[-1].url), requests[-1].content)
+        assert str(tmp_path).encode() not in requests[-1].content
+        assert [request.url.path for request in requests] == ["/v1/models", "/v1/responses"]
+
+
+    @pytest.mark.parametrize("kind", [
+        "missing", "directory", "unreadable", "empty", "invalid", "at_limit", "over_limit",
+    ])
+    def test_invalid_pdf_fails_before_tokens_recording_or_network(tmp_path, monkeypatch, kind):
+        monkeypatch.setattr(openai_client, "MAX_PDF_BYTES", 64)
+        pdf = tmp_path / "notes.pdf"
+        error = OSError if kind in {"missing", "directory", "unreadable"} else ValueError
+        if kind == "directory":
+            pdf.mkdir()
+        elif kind != "missing":
+            data = {"empty": b"", "invalid": b"not a PDF", "unreadable": b"%PDF-1.7\n",
+                    "at_limit": b"%PDF-" + b"x" * 59,
+                    "over_limit": b"%PDF-" + b"x" * 60}[kind]
+            pdf.write_bytes(data)
+        if kind == "unreadable":
+            original_open = Path.open
+
+            def unreadable(path, *args, **kwargs):
+                if path == pdf:
+                    raise PermissionError("PDF cannot be read")
+                return original_open(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "open", unreadable)
+        client, requests = client_for(tmp_path, sse(completed("{}")))
+        client.token_provider = lambda: pytest.fail("Invalid PDF must not access credentials")
+        client.request_recorder = lambda *args: pytest.fail("Invalid PDF must not record requests")
+
+        with pytest.raises(error):
+            client.complete("Create cards.", "PDF order.", pdf=pdf)
+
+        assert requests == []
 
 
     def test_recorder_runs_before_transport_with_exact_request_bytes(tmp_path):
@@ -432,7 +496,7 @@ if _FULL_DEPS:
         ([{"type": "error", "code": "subscription_sharing_user_not_eligible"}], PlanAccessError, "not_eligible"),
         ([{"type": "response.failed", "response": {"error": {"code": "bad_output"}}}], ResponseError, "bad_output"),
         ([{"type": "response.completed", "response": {"status": "incomplete"}}], ResponseError, "did not confirm"),
-        ([completed("not JSON")], ResponseError, "invalid notes JSON"),
+        ([completed("not JSON")], ResponseError, "invalid JSON"),
         ([completed("[]")], ResponseError, "JSON object"),
     ])
     def test_stream_failures_never_return_partial_notes(tmp_path, events, error, message):

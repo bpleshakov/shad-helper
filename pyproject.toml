@@ -8,6 +8,7 @@ dependencies = [
     "pydantic>=2.12",
     "PyJWT[crypto]>=2.10",
     "pymupdf>=1.26",
+    "genanki==0.13.1",
 ]
 
 [project.optional-dependencies]
@@ -30,7 +31,7 @@ build-backend = "setuptools.build_meta"
 include = ["shad_helper*"]
 
 [dependency-groups]
-dev = ["pytest>=8.4", "ruff>=0.13"]
+dev = ["pytest>=8.4", "ruff>=0.13", "anki==26.9.3"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
