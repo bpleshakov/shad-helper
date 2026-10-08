@@ -162,7 +162,10 @@ def test_silent_extraction_cannot_generate_notes_or_clear_checkpoints(tmp_path, 
         notes.generate_notes(tmp_path, tmp_path / "auth", manual=manual, rebuild=True)
     assert read_json(tmp_path / "checkpoints/notes/ch001.json") == {"preserve": True}
     assert not (tmp_path / "outline.json").exists()
-    assert not (tmp_path / "handoff").exists()
+    [run] = (tmp_path / "handoff/runs").iterdir()
+    assert read_json(run / "run.json")["status"] == "failed"
+    assert not (run / "inputs").exists()
+    assert not (tmp_path / "handoff/inputs").exists()
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),

@@ -97,6 +97,23 @@ def _client_module():
 
 
 class ClientStdlibTests(unittest.TestCase):
+    def test_request_recorder_receives_the_sent_body_without_credentials(self):
+        module, calls = _client_module()
+        records = []
+
+        def record(method, url, payload):
+            self.assertEqual(len(calls), len(records))
+            self.assertEqual(len(module.token_requests), len(records) + 1)
+            records.append((method, url, payload))
+
+        client = module.PlanClient(Path("auth-state"), request_recorder=record)
+        self.assertEqual(client.complete("Instructions", "Лекция"), {})
+        self.assertEqual(records, [
+            ("GET", "https://api.openai.com/v1/models", None),
+            ("POST", "https://api.openai.com/v1/responses", calls[-1][2]["content"])])
+        self.assertNotIn("offline-token", repr(records))
+        self.assertNotIn("offline-proxy", repr(records))
+
     def test_same_proxy_reaches_catalog_stream_and_token_refresh(self):
         module, calls = _client_module()
         transport = object()
@@ -305,6 +322,78 @@ if _FULL_DEPS:
         assert body["text"]["format"]["schema"] == schema
         assert not set(body) & {"tools", "max_output_tokens", "previous_response_id", "background", "temperature"}
         assert client.models() == ["gpt-6-astra"]
+
+
+    def test_recorder_runs_before_transport_with_exact_request_bytes(tmp_path):
+        events = []
+        records = []
+        schema = {"type": "object", "properties": {"notes": {"type": "string", "default": ""}}}
+
+        def record(method, url, payload):
+            events.append(("record", method))
+            records.append((method, url, payload))
+
+        def token():
+            events.append(("token", None))
+            return "private-plan-token"
+
+        def handle(request):
+            assert records[-1] == (request.method, str(request.url), request.content or None)
+            assert request.headers["Authorization"] == "Bearer private-plan-token"
+            events.append(("transport", request.method))
+            if request.method == "GET":
+                return httpx.Response(200, json={"models": [{"slug": "gpt-6-astra", "visibility": "list"}]})
+            return httpx.Response(200, text=sse(completed("{}")))
+
+        client = PlanClient(tmp_path, proxy="http://private-proxy:8080", transport=httpx.MockTransport(handle),
+            token_provider=token, request_recorder=record)
+        assert client.complete("Return notes JSON.", "Лекция.", schema) == {}
+        assert events == [("token", None), ("record", "GET"), ("transport", "GET"),
+            ("token", None), ("record", "POST"), ("transport", "POST")]
+        body = json.loads(records[-1][2])
+        assert body == {"model": "gpt-6-astra", "reasoning": {"effort": "high"},
+            "instructions": "Return notes JSON.",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "Лекция."}]}],
+            "store": False, "stream": True, "text": {"format": {"type": "json_schema",
+                "name": "lecture_notes", "schema": _strict_schema(schema), "strict": True}}}
+        assert "private-plan-token" not in repr(records)
+        assert "private-proxy" not in repr(records)
+
+
+    @pytest.mark.parametrize("method", ["GET", "POST"])
+    @pytest.mark.parametrize("error", [OSError("disk full"), ValueError("invalid archive"), httpx.HTTPError("recorder failed")])
+    def test_recorder_failure_blocks_unrecorded_network_request(tmp_path, method, error):
+        client, requests = client_for(tmp_path, sse(completed("{}")))
+        if method == "POST":
+            client._available_models = ["gpt-6-astra"]
+
+        def fail_record(recorded_method, url, payload):
+            assert recorded_method == method
+            raise error
+
+        client.request_recorder = fail_record
+        with pytest.raises(type(error)) as caught:
+            client.complete("Instructions", "Lecture text")
+        assert caught.value is error
+        assert requests == []
+
+
+    @pytest.mark.parametrize("method", ["GET", "POST"])
+    def test_failed_http_requests_are_recorded(tmp_path, method):
+        records = []
+
+        def fail(request):
+            assert records[-1] == (request.method, str(request.url), request.content or None)
+            raise httpx.ConnectError("Offline", request=request)
+
+        client = PlanClient(tmp_path, transport=httpx.MockTransport(fail), token_provider=lambda: "token",
+            request_recorder=lambda *args: records.append(args))
+        if method == "POST":
+            client._available_models = ["gpt-6-astra"]
+        with pytest.raises(PlanAccessError):
+            client.complete("Instructions", "Lecture text")
+        assert len(records) == 1
+        assert records[0][0] == method
 
 
     def test_strict_schema_recursively_requires_properties_without_mutating_input():

@@ -154,20 +154,55 @@ Irreducible context is exported manually without dropping speech or visuals.
 Editable outlines must cover the entire interval consecutively in chapters
 of at most twenty minutes.
 
+Notes focus on facts, definitions, formulas, theorem conditions and proof steps,
+and useful explanations. Speaker narration, administrative discussion, repetition,
+and redundant glossary entries are omitted. The editorial target is about ten
+pages per three hours, up to twenty for dense lectures. Each chapter receives
+duration-scaled guidance of 3,000/6,000 words per three hours (`writing_budget`),
+including captions and glossary. This is a soft output allowance, separate from
+the input byte cap; no proof or evidence is truncated to hit a page count. Actual
+pagination depends on formulas and diagrams. Administrative-only chapters may
+have `blocks: []`; their intervals stay in the outline but get no PDF heading.
+
 Lecture blocks cite speech or visual evidence IDs. Added explanations are
-**Пояснение**; uncertain claims are **Требует проверки**. Missing or conflicting
-formula/diagram details must be flagged rather than invented. Notebook visuals
+**Пояснение**. Questionable phrases or whole inline formulas are listed in
+`uncertain_fragments` with their exact text and supporting evidence IDs. The PDF
+colors only these fragments and adds one short `hh:mm:ss` footnote per affected
+paragraph, combining and deduplicating its timestamps. Longer sets become a time
+range. Detailed uncertainty explanations remain in local review JSON instead of
+large “Требует проверки” passages. Missing essential formula/diagram details must
+be flagged rather than invented. Notebook visuals
 contribute theory, formulas and explanatory comments, not executable code.
 Diagrams remain editable TikZ/PGFPlots; source screenshots are not placed in PDFs.
-The PDF omits audio source footnotes and the list of review issues. Chapter
-audio intervals and inline uncertainty labels remain; review issues are stored
-in the JSON files and available through `review`.
+Ordinary source citations create no footnotes; only marked uncertainty does.
+The PDF has a compact title followed by content, chapter intervals, and no review
+appendix. Review issues remain available in the JSON files and through `review`.
 Transcription warnings are informational: inspect or correct them before notes
 when needed. They are ignored by note generation rather than carried into review.
 
 Outputs are `notes.json`, `review.json`, and editable `notes/` LaTeX sources.
 `notes` regenerates the project; `--rebuild` invalidates synthesis checkpoints.
 Keep manual TeX edits for the subsequent `render` step.
+
+Every `notes` run saves a handoff, including successful automatic generation,
+cache reuse, and imports. `handoff/inputs/` contains the current chapter prompts,
+contexts, and response schema. Each run also gets a separate archive under
+`handoff/runs/<run ID>/`, whose path is printed when the command starts:
+
+- `inputs/`, `README.txt`, and `outline.json`: the run's handoff and chapter plan;
+  automatic contexts include the actual glossary accumulated before each chapter.
+- `run.json` and `chapters.json`: run mode/result and generated versus cached chapters.
+- `requests/<chapter ID>/attempt-01/call.json`: instructions, exact context string,
+  application response schema, and model for each generation attempt.
+- `http-*.request.json` and `http-*.body.json` within each attempt: request method/URL
+  and exact outgoing JSON bytes, including model settings and the API-normalized schema.
+
+Requests are saved before transmission, including retries and failed parent
+requests that lead to chapter splitting. If saving fails, the request is not sent.
+Cached, manual, and imported chapters create no HTTP request records. Earlier
+run archives survive later runs and `--rebuild`. Authentication headers, tokens,
+proxy credentials, and OAuth exchanges are excluded. A run that fails before
+inputs can be prepared still has a failed `run.json` record.
 
 ## Manual ChatGPT workflow
 
@@ -181,7 +216,7 @@ For each chapter listed in the job's `outline.json`, attach
 `handoff/inputs/CHAPTER_ID/context.json` and the shared
 `handoff/inputs/response-schema.json` in ChatGPT, then paste that chapter's
 `prompt.txt`. These are the three model inputs: instructions, lecture data, and
-response structure. The context contains the lecture title, glossary, chapter
+response structure. The context contains the lecture title, glossary, writing budget, chapter
 metadata, speech and (for video jobs) extracted visuals once. `handoff/README.txt`
 and any `status.json` are operator
 instructions and should not be sent to the model.
@@ -193,7 +228,8 @@ UV_CACHE_DIR=.cache/uv uv run shad-helper notes jobs/audio-lecture --import repl
 
 All expected replies must be present. A complete combined response can also
 be imported with `--import response.json`. Automatic and manual responses use
-the same schema and evidence validation. Success and imports skip handoff export.
+the same schema and evidence validation. Success and imports refresh and archive
+the handoff without making additional model calls.
 
 ## Review and render PDF
 
@@ -211,8 +247,9 @@ UV_CACHE_DIR=.cache/uv uv run shad-helper render jobs/audio-lecture
 ```
 
 Resolving an issue refreshes the project metadata and draft footer while
-preserving chapter edits. An uncertain block stays tentative until its content
-and kind are corrected. Resolutions survive imports only while issue and evidence match.
+preserving chapter edits. A marked fragment or legacy uncertain block stays
+tentative until its content is corrected and its markers removed or kind updated.
+Resolutions survive imports only while issue and evidence match.
 Review commands resolve note issues only; they do not edit evidence or extraction
 warnings. Editing the diagnostic report does not invalidate notes or rendering.
 

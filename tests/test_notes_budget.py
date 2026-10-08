@@ -29,7 +29,7 @@ def prepare_job(job, data, outline=None):
 
 def payload_from_prompt(prompt):
     payload = json.loads(prompt)
-    assert set(payload) == {"lecture_title", "glossary", "chapter", "segments"}
+    assert set(payload) == {"lecture_title", "glossary", "chapter", "segments", "writing_budget"}
     return payload
 
 

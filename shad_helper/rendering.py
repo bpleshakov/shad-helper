@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 from .jobs import check_job, fingerprint, read_json
+from .schemas import NoteBlock
 
 
 class RenderError(RuntimeError):
@@ -175,6 +176,63 @@ def _stamp(seconds: float) -> str:
     return f"{total // 3600:02}:{total // 60 % 60:02}:{total % 60:02}"
 
 
+def _evidence_times(job: Path) -> dict[str, float]:
+    path = job / "evidence.json"
+    if not path.exists():
+        return {}
+    evidence = read_json(path)
+    return {**{item["id"]: item["start"] for item in evidence.get("segments", [])},
+            **{item["id"]: item["timestamp"] for item in evidence.get("visuals", [])}}
+
+
+def _timestamp_footnote(evidence_ids: list[str], times: dict[str, float],
+                        fallback: float, *, precise: bool) -> str:
+    missing = set(evidence_ids) - times.keys()
+    if precise and missing:
+        raise RenderError("Uncertain fragments reference evidence without timestamps: "
+                          + ", ".join(sorted(missing)))
+    seconds = sorted({int(times[identifier]) for identifier in evidence_ids if identifier in times})
+    stamps = [_stamp(second) for second in seconds] or [_stamp(fallback)]
+    label = "–".join((stamps[0], stamps[-1])) if len(stamps) > 3 else ", ".join(stamps)
+    return "\\footnote{" + label + "}"
+
+
+def _marked_prose(block: dict, times: dict[str, float], fallback: float) -> str:
+    fragments = block.get("uncertain_fragments", [])
+    if not fragments and block["kind"] != "uncertain":
+        return _prose(block["content"])
+    if fragments:
+        try:
+            NoteBlock.model_validate(block)
+        except ValueError as error:
+            raise RenderError(f"Invalid uncertain fragments: {error}") from error
+    paragraphs = []
+    for paragraph in re.split(r"\n[ \t]*\n", block["content"]):
+        if not paragraph.strip():
+            continue
+        selected = sorted((paragraph.index(fragment["text"]), fragment)
+                          for fragment in fragments if fragment["text"] in paragraph)
+        if not selected and (fragments or block["kind"] != "uncertain"):
+            paragraphs.append(_prose(paragraph))
+            continue
+        parts = []
+        evidence_ids = []
+        previous = 0
+        for start, fragment in selected:
+            parts.extend((_prose(paragraph[previous:start]),
+                          "\\textcolor{blue!60!black}{" + _prose(fragment["text"]) + "}"))
+            evidence_ids.extend(fragment["evidence_ids"])
+            previous = start + len(fragment["text"])
+        if selected:
+            parts.append(_prose(paragraph[previous:]))
+        else:
+            parts.append("\\textcolor{blue!60!black}{" + _prose(paragraph) + "}")
+            evidence_ids = block.get("evidence_ids", [])
+        parts.append(_timestamp_footnote(evidence_ids, times, fallback, precise=bool(fragments)))
+        paragraphs.append("".join(parts))
+    return "\n\n".join(paragraphs)
+
+
 def _draft_footer(review: list[dict]) -> str:
     if review:
         return r"\fancyfoot[L]{\scriptsize ЧЕРНОВИК - требуется проверка}" + "\n"
@@ -188,7 +246,7 @@ def _marked_footer(review: list[dict]) -> str:
 def _review_flags(notes: dict) -> list[dict]:
     flags = [{"id": block["id"], "description": block["content"]}
              for chapter in notes.get("chapters", []) for block in chapter.get("blocks", [])
-             if block["kind"] == "uncertain"]
+             if block["kind"] == "uncertain" or block.get("uncertain_fragments")]
     flags.extend({"id": issue["id"], "description": issue["description"]}
                  for issue in notes.get("issues", []) if issue["status"] != "resolved")
     return flags
@@ -239,11 +297,14 @@ def write_project(job: Path, notes: dict) -> Path:
     block_ids = set()
     chapter_ids = set()
     review = _review_flags(notes)
+    evidence_times = _evidence_times(job)
     for chapter in notes.get("chapters", []):
         chapter_id = _identifier(chapter["id"])
         if chapter_id in chapter_ids:
             raise RenderError("Chapter IDs must be unique")
         chapter_ids.add(chapter_id)
+        if not chapter.get("blocks"):
+            continue
         lines = ["\\section{" + escape_text(chapter["title"]) + "}",
                  "\\noindent\\textit{Лекция: " + _stamp(chapter["start"]) + " - " + _stamp(chapter["end"]) + "}\\par\n"]
         for block in chapter.get("blocks", []):
@@ -273,11 +334,9 @@ def write_project(job: Path, notes: dict) -> Path:
                 _write(root, relative, content)
                 code_files.append(relative)
                 lines.append("\\VerbatimInput[breaklines,breakanywhere,fontsize=\\small,frame=single]{" + relative + "}\n")
-            elif kind in {"clarification", "uncertain"}:
-                label = "Пояснение" if kind == "clarification" else "Требует проверки"
-                lines.append("\\begin{quote}\\textbf{" + label + ".} " + _prose(content) + "\\end{quote}\n")
-            elif kind == "text":
-                lines.append(_prose(content) + "\n")
+            elif kind in {"text", "clarification", "uncertain"}:
+                prefix = r"\textbf{Пояснение.} " if kind == "clarification" else ""
+                lines.append(prefix + _marked_prose(block, evidence_times, chapter["start"]) + "\n")
             else:
                 raise RenderError(f"Unsupported note block kind: {kind}")
         relative = f"chapters/{chapter_id}.tex"
@@ -290,7 +349,7 @@ def write_project(job: Path, notes: dict) -> Path:
         for entry in notes["glossary"]:
             appendix.append("\\paragraph{" + _prose(entry["term"]) + "} " + _prose(entry["definition"]))
     _confined(root, "review.tex").unlink(missing_ok=True)
-    main = _PREAMBLE + _marked_footer(review) + "\\title{" + escape_text(notes["title"]) + "}\n\\author{}\n\\date{}\n\\begin{document}\n\\maketitle\n\\tableofcontents\n\\newpage\n" + "\n".join(chapter_sources + appendix) + "\n\\end{document}\n"
+    main = _PREAMBLE + _marked_footer(review) + "\\begin{document}\n\\begin{center}\\Large " + escape_text(notes["title"]) + "\\end{center}\n" + "\n".join(chapter_sources + appendix) + "\n\\end{document}\n"
     _write(root, "main.tex", main)
     manifest = {"version": 2, "draft": bool(review), "tex_files": tex_files,
                 "code_files": code_files, "review": review,

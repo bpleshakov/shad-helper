@@ -101,19 +101,24 @@ def _stream_text(response):
 
 
 class PlanClient:
-    def __init__(self, state_dir: Path, model=DEFAULT_MODEL, *, proxy=None, transport=None, token_provider=None):
+    def __init__(self, state_dir: Path, model=DEFAULT_MODEL, *, proxy=None, transport=None, token_provider=None, request_recorder=None):
         self.state_dir = Path(state_dir)
         self.model = model
         self.proxy = resolve_openai_proxy(proxy)
         self.transport = transport
         self.token_provider = token_provider or (lambda: access_token(
             self.state_dir, proxy=self.proxy, transport=self.transport))
+        self.request_recorder = request_recorder
         self._available_models = None
 
     def models(self) -> list[str]:
+        url = f"{RESOURCE}/models"
+        headers = {"Authorization": f"Bearer {self.token_provider()}"}
+        if self.request_recorder is not None:
+            self.request_recorder("GET", url, None)
         try:
             with openai_http_client(proxy=self.proxy, transport=self.transport, timeout=30) as client:
-                response = client.get(f"{RESOURCE}/models", headers={"Authorization": f"Bearer {self.token_provider()}"})
+                response = client.get(url, headers=headers)
             if not response.is_success:
                 raise http_error(response)
             body = response.json()
@@ -133,9 +138,13 @@ class PlanClient:
         available = self.models() if self._available_models is None else self._available_models
         if self.model not in available:
             raise PlanAccessError(f"{self.model} is unavailable for the signed-in ChatGPT account.", code="model_unavailable")
+        url = f"{RESOURCE}/responses"
+        headers = {"Authorization": f"Bearer {self.token_provider()}", "Content-Type": "application/json"}
+        if self.request_recorder is not None:
+            self.request_recorder("POST", url, payload)
         try:
             with openai_http_client(proxy=self.proxy, transport=self.transport, timeout=httpx.Timeout(600, connect=30)) as client:
-                with client.stream("POST", f"{RESOURCE}/responses", headers={"Authorization": f"Bearer {self.token_provider()}", "Content-Type": "application/json"}, content=payload) as response:
+                with client.stream("POST", url, headers=headers, content=payload) as response:
                     if not response.is_success:
                         response.read()
                         raise http_error(response)

@@ -38,7 +38,7 @@ a raster fallback. Importing original slides or notebook files is unsupported.
 | Extract video | Local selection and vision worker started by `extract`, after ASR exits or is skipped | Original recording, selected frames, vision checkpoints | Frame images, recognized content, separate local diagnostics | Every selected frame has complete or incomplete extraction status |
 | Assemble evidence | Internal part of `extract` | Raw worker responses | Clean evidence, separate diagnostics, transcript copies, extraction timings | `extract` returns the path to `evidence.json` |
 | Prepare chapters | Internal part of `notes` | Evidence, optional saved outline | Saved outline and in-memory chapter contexts | A consecutive outline covers the extracted interval |
-| Synthesize or import | `notes`, optionally `--manual` or `--import` | Chapter contexts, schema, optional replies and resolutions | Notes, review summary, LaTeX project; or a manual handoff | A project path means notes were generated; a handoff path means replies are still required |
+| Synthesize or import | `notes`, optionally `--manual` or `--import` | Chapter contexts, schema, optional replies and resolutions | Handoff and run archive on every run; notes, review summary, and LaTeX project on success | A project path means notes were generated; a handoff path means replies are still required |
 | Review | `review`, optionally `--resolve` | Clean evidence, notes, review files and project | Resolution ledger, updated note issues and review metadata | A named note issue has an explicit correction recorded |
 | Render | `render` | Existing LaTeX project, manifest, current evidence | PDF, page previews, report and compiler files | PDF compilation and page preview generation both complete |
 
@@ -49,8 +49,8 @@ files provide an alternative way to obtain the same note response format.
 
 Review is optional in the command sequence. Open issues do not prevent rendering;
 they produce a draft footer and remain available in the review JSON files and
-the `review` command. The PDF contains no review appendix or audio source
-footnotes.
+the `review` command. The PDF contains no review appendix. Only questionable
+fragments receive source-time footnotes, combined per paragraph.
 Extraction warnings are separate informational data. Notes ignore them without
 requiring a resolution or an acknowledgment. A note issue instead records a
 missing explanation, formula detail, or other uncertainty discovered during
@@ -86,9 +86,21 @@ JOB/
 ├── transcript.vtt
 ├── extraction-timings.json
 ├── outline.json
-├── handoff/                                  # manual export or automatic fallback
+├── handoff/                                  # current inputs, saved on every notes run
 │   ├── README.txt
 │   ├── status.json                           # fallback or unresolved size warning
+│   ├── runs/<run ID>/                        # separate history, retained across rebuilds
+│   │   ├── run.json                         # mode and completion state
+│   │   ├── outline.json                     # this run's final chapter plan
+│   │   ├── inputs/                          # this run's handoff inputs
+│   │   ├── README.txt
+│   │   ├── chapters.json                    # generated/cached automatic chapters
+│   │   ├── status.json                      # fallback, when applicable
+│   │   └── requests/<chapter ID>/attempt-01/
+│   │       ├── call.json                    # application-level model call
+│   │       ├── status.json                  # attempt result
+│   │       ├── http-001.request.json        # method, URL, body filename
+│   │       └── http-002.body.json           # exact POST bytes; GET has no body
 │   └── inputs/
 │       ├── response-schema.json
 │       └── ch001/
@@ -947,6 +959,7 @@ audio-only shape, also saved as a manual `context.json`, is:
 {
   "lecture_title": "lecture",
   "glossary": [],
+  "writing_budget": {"target_words": 34, "dense_words": 67},
   "chapter": {
     "id": "ch001",
     "title": "Часть 1: 00:30:00–00:32:00",
@@ -968,6 +981,7 @@ audio-only shape, also saved as a manual `context.json`, is:
 | --- | --- | --- |
 | `lecture_title` | string | Root outline title used for the lecture |
 | `glossary` | array of `{term, definition}` | Seed terms for manual export; seed plus accumulated prior chapter terms during automatic synthesis |
+| `writing_budget` | object with integer `target_words` and `dense_words` | Soft output allowance, scaled to the chapter's core duration at 3,000/6,000 words per three hours, rounded up with a minimum of one |
 | `chapter` | Outline chapter object | Required single chapter and its bounds |
 | `segments` | Array of clean speech segments | Chapter and neighboring speech, included once |
 | `visuals` | Array of clean visual objects, version 4 only | Timestamped text, formulas, diagram descriptions, status, and unreadable regions |
@@ -981,6 +995,16 @@ neighboring context and the carried preceding frame. The prompt asks the model
 to use neighboring content for understanding without duplicating it in the
 chapter; that editorial rule is not enforced by timestamp filtering of the
 reply's prose.
+
+The normal editorial target is about ten pages per three hours, up to twenty
+for dense lectures. Word allowances include all chapter content and glossary;
+they exclude neighboring context duration. They are not minimum quotas, hard
+truncation limits, or guarantees about rendered page counts. Definitions,
+conditions, and proof logic take priority over exact length. Empty administrative
+intervals retain their chapter bounds but return `blocks: []`. The prompt excludes
+speaker narration, routine logistics, repeated explanations, and redundant
+glossary entries. Mathematical notation uses LaTeX rather than Unicode math
+glyphs; ordinary Russian text remains UTF-8.
 
 ### Request size and chapter splitting
 
@@ -1019,7 +1043,7 @@ generation.
 ### Automatic request and reply
 
 Automatic synthesis submits text only. The user input is the compact JSON
-model context: lecture title, current glossary, chapter, speech, and optional
+model context: lecture title, current glossary, writing budget, chapter, speech, and optional
 clean visuals. Images and local recognition artifacts are never attached. Russian
 instructions request one chapter with the provided ID and timestamps,
 evidence-grounded content, source citations, and explicit uncertainty.
@@ -1033,20 +1057,23 @@ JSON Schema format, the client recursively removes schema defaults, requires
 every declared object property, and sets `additionalProperties: false`.
 Application-level provenance and review validators still run afterward.
 
-Raw HTTP requests, streaming events, and raw note replies are not written as
-job artifacts. Incomplete streams are discarded. Only a successfully validated
-chapter result is checkpointed.
+Exact outgoing model request bodies are saved before transmission under
+`handoff/runs/<run ID>/requests/<chapter ID>/attempt-NN/`. Streaming events and
+raw note replies are not archived; incomplete streams are discarded. Only a
+successfully validated chapter result is checkpointed.
 
 ### Manual handoff files
 
-`notes JOB --manual` creates the files below without network calls. Automatic
-synthesis also creates them when plan access, response processing, or generation
-validation fails inside the synthesis loop.
+Every notes run prepares the files below, including successful automatic runs,
+cache reuse, manual mode, and imports. Automatic inputs are saved before client
+creation and updated with each chapter's actual accumulated glossary before
+checkpoint lookup. Imports save a reconstructed handoff after validating replies;
+they do not claim those reconstructed inputs were sent to a model.
 
 | File | Structure | Producer and consumer |
 | --- | --- | --- |
 | `handoff/inputs/response-schema.json` | Full JSON Schema generated by `LectureNotes.model_json_schema()` | Shared response constraints attached to ChatGPT for every chapter |
-| `handoff/inputs/<chapter ID>/context.json` | Model-facing context shown above | All lecture data attached to ChatGPT once |
+| `handoff/inputs/<chapter ID>/context.json` | Model-facing context shown above | Prepared context; automatic chapters visited in the run retain the actual accumulated glossary |
 | `handoff/inputs/<chapter ID>/prompt.txt` | Russian synthesis instructions only, byte-identical to automatic API instructions | Pasted into ChatGPT |
 | `handoff/README.txt` | Plain English instructions for attaching files, saving replies, and importing | Human operator |
 | `handoff/status.json` | Status and explanatory reason | User or automation deciding whether manual work remains |
@@ -1054,8 +1081,8 @@ validation fails inside the synthesis loop.
 For a chapter, send only its prompt, its context, and the shared response schema.
 Their responsibilities are distinct: instructions, lecture data, and response
 structure. The root `outline.json` remains the authoritative chapter plan and
-determines which replies must be imported. It is not exported again or attached
-to the model. There is no chapter `transcript.txt`; it would repeat speech already
+determines which replies must be imported. A copy is retained in each run archive,
+but is not attached to the model. There is no chapter `transcript.txt`; it would repeat speech already
 included in context. Operator README and status files stay outside `inputs/` and
 are not model inputs.
 
@@ -1078,8 +1105,8 @@ A fallback status file has this complete shape:
 `reason` contains the actual exception message or chapter budget warnings;
 the displayed message is illustrative. Normal manual export within the budget
 does not need a status file. Successful synthesis or import removes a previous
-status file. Those paths do not otherwise refresh model inputs, so an existing
-handoff can become stale after successful generation or import.
+status file. Those paths also refresh model inputs and retain a separate run
+archive, so a current handoff exists after successful generation and import.
 
 Every export checks job and evidence compatibility, then deletes and rebuilds
 the generator-owned `handoff/inputs/` subtree. This removes obsolete chapter
@@ -1089,6 +1116,42 @@ instructions, while the calling workflow manages `status.json`. The current root
 `outline.json` determines the exported chapter IDs. Send one chapter's three
 inputs per request. An interrupted export can leave only part of the rebuilt
 input tree; rerun export before attaching it.
+
+### Per-run inputs and outbound request archive
+
+After the initial job compatibility check, each invocation creates
+`handoff/runs/<UTC timestamp plus unique suffix>/run.json` and prints its path.
+`mode` is `automatic`, `manual`, or `import`; `status` begins as `running` and
+ends as `completed`, `handoff`, or `failed`. A forcibly terminated process can
+leave `running`; a failure before valid inputs exist can leave only the run record.
+`rebuild` records the flag without affecting older run archives.
+
+Each prepared run has its own `inputs/`, `README.txt`, and `outline.json`.
+The archived outline follows runtime splitting; rejected parent requests remain
+in the request history even when only leaf chapters remain in the handoff.
+During automatic generation, `chapters.json` maps completed chapter IDs to
+`generated` or `cached`. Manual and imported runs make no model requests, and
+cache hits are never logged as transmissions.
+
+Every generation attempt gets `requests/<chapter ID>/attempt-NN/call.json`
+containing `instructions`, the exact serialized context `text`, application
+`schema`, and `model`. Its `status.json` records `success` or `failed` plus the
+exception type/code on handled failures. A crash or local write failure may leave
+an incomplete attempt record. Retries have separate directories, even when their
+inputs match byte for byte.
+
+At the HTTP boundary, `PlanClient.request_recorder` saves the exact byte payload
+passed to `client.stream` as `http-NNN.body.json`. Its paired
+`http-NNN.request.json` contains `method`, `url`, and `body` (the filename, or null
+for the model-catalog GET). The POST includes the real model/reasoning settings,
+instructions, input, stream/store flags, and strict normalized response schema.
+Saving happens before the HTTP operation; a saved request records an attempt,
+not proof that OpenAI received it. A write failure prevents the HTTP operation.
+
+Archives omit HTTP authorization headers, tokens, proxy credentials, OAuth
+exchanges, and response streams. Raw extraction diagnostics remain outside both
+handoff inputs and model payloads. The current `handoff/inputs/` can be replaced;
+completed `handoff/runs/` archives survive exports, later runs, and `--rebuild`.
 
 ### Manual reply inputs
 
@@ -1137,7 +1200,8 @@ The complete normalized structure is:
           "content": "Событие \\(A\\) имеет вероятность \\(p\\).",
           "evidence_ids": ["segment_00000"],
           "caption": "",
-          "language": ""
+          "language": "",
+          "uncertain_fragments": []
         }
       ]
     }
@@ -1173,7 +1237,7 @@ The complete normalized structure is:
 | Chapter `title` | nonempty string | Required | Generated thematic title |
 | Chapter `start` | number, at least 0 | Required | Chapter interval start |
 | Chapter `end` | number, greater than 0 | Required | Must exceed chapter start |
-| Chapter `blocks` | nonempty array | Required | Ordered content blocks |
+| Chapter `blocks` | array | Required | Ordered content blocks; `[]` omits an interval with no useful study material from the PDF |
 
 Note chapter bounds must lie within the extracted interval with 0.01-second
 tolerance. Each automatic or directory-import reply must also match its
@@ -1194,6 +1258,7 @@ the source-label mapping is computed locally for project generation.
 | `evidence_ids` | array of strings | Default `[]` | Existing speech or visual source IDs |
 | `caption` | string | Default `""` | Diagram caption; other block renderers do not use it |
 | `language` | string | Default `""` | Code-language metadata; current renderer uses plain verbatim output |
+| `uncertain_fragments` | array of `{text, evidence_ids}` | Default `[]` | Exact questionable prose selections with source IDs; renderer supplies highlighting and timestamp footnotes |
 
 | Kind | Content contract | Source requirement and rendering |
 | --- | --- | --- |
@@ -1202,7 +1267,15 @@ the source-label mapping is computed locally for project generation.
 | `code` | Literal code without Markdown fences | At least one permitted evidence ID; written to a text asset and displayed verbatim |
 | `diagram` | Prompt requests a complete `tikzpicture`; PGFPlots may be embedded | At least one permitted evidence ID; diagram commands are validated and written to a TeX asset |
 | `clarification` | Added explanatory prose, with supported inline math | May have no evidence IDs; rendered with a “Пояснение” label |
-| `uncertain` | Missing or ambiguous details, with supported inline math | At least one permitted evidence ID; rendered with a review label and generates an open issue |
+| `uncertain` | Legacy tentative prose, with supported inline math | At least one permitted evidence ID; colored with a compact timestamp footnote and generates an open issue; new responses use fragments |
+
+Fragment annotations are allowed only in `text`, `clarification`, and legacy
+`uncertain` blocks. Each nonblank `text` must occur exactly once in the content;
+selections must not overlap or cross a blank-line paragraph boundary. A selection
+containing inline math must include the entire `\(...\)` expression, including
+delimiters. Each selection has a nonempty evidence list drawn from its block's
+citations. Questionable formulas belong in an annotated prose paragraph rather
+than a separate `math` block. The model supplies no footnotes or timestamps.
 
 For every evidence ID cited by a block, the speech or visual source must exist
 in that chapter's selected context. An empty citation list is accepted only for
@@ -1217,7 +1290,8 @@ ordinary text; notebook code, arrays, service output, and UI are excluded, and
 theory must not be inferred from code alone. Diagram blocks use editable TikZ
 or PGFPlots based on the described labels and relationships, without raster
 fallback. Captions should identify a schematic plot when actual data are missing.
-Unreadable or missing source details require uncertainty. Those content rules
+Unreadable or missing details require marking only when essential to the selected
+study material; discarded diagnostics do not become notes. Those content rules
 require review; they are not semantic facts that the JSON validator can establish.
 
 The renderer accepts math beginning with `\[` or supported
@@ -1238,10 +1312,13 @@ are checked against clean evidence. Each model or imported issue is forced to
 resolved. Only a matching explicit local resolution can restore resolved state.
 No extraction warning is merged into notes.
 
-Every `uncertain` block generates an issue with ID `review_<block ID>`.
+Every block with fragments, and every legacy `uncertain` block, generates one
+issue with ID `review_<block ID>`.
 If that exceeds 80 characters, the ID becomes
 `review_<first 60 characters of block ID>_<12-character block-ID hash>`.
-Its description and citations come from the block. Saved matching explicit
+For annotated blocks, its description joins the selected fragments and its
+citations combine only their references. For legacy blocks they come from the
+whole block. Saved matching explicit
 resolutions can subsequently restore resolved issue status.
 
 ### checkpoints/notes/ch001.json
@@ -1261,7 +1338,9 @@ handling. The fingerprint input object contains:
 | `schema` | Full Pydantic response schema |
 
 These inputs are hashed but are not individually saved alongside the
-checkpoint. A cached chapter result can be reused while later chapters run.
+checkpoint. The handoff/run archive stores the prepared model inputs separately;
+actual calls also retain their exact outbound API payload. A cached chapter result
+can be reused while later chapters run.
 Speech, visual content, prompt, model, outline context, glossary, or schema
 changes can invalidate affected chapter reuse. Diagnostic-report changes cannot. Final
 resolution checks use the complete clean evidence fingerprint even when a
@@ -1310,9 +1389,10 @@ a nonempty description or citation list.
 }
 ~~~
 
-`ready` is true only when there are no open issues and no `uncertain` blocks.
+`ready` is true only when there are no open issues, uncertain fragments, or legacy
+`uncertain` blocks.
 Resolving an issue alone does not change the block's kind or content. A remaining
-uncertain block keeps the notes in draft state even if its generated issue was
+marked fragment or uncertain block keeps the notes in draft state even if its generated issue was
 resolved.
 
 Rendering uses the project's review flags rather than reading this summary as
@@ -1370,8 +1450,12 @@ synthesis or import. **Consumer:** `render`, with optional human source edits.
 The project writer receives the validated notes directly. `evidence_index` is
 used internally to validate source citations; it is neither persisted in
 `notes.json` nor passed to the project writer. Block and issue `evidence_ids`
-remain in the JSON contracts for validation and review, but produce no audio
-source footnotes in the PDF. Review issues are not printed as an appendix.
+remain in the JSON contracts for validation and review. Ordinary citations produce
+no footnotes. Uncertain fragments receive one timestamp-only footnote per affected
+paragraph, derived from speech `start` and visual `timestamp` in local evidence.
+Times are absolute, floored to whole seconds, deduplicated and sorted; more than
+three times are compacted to their earliest/latest range. Review explanations
+are not printed as an appendix or separate warning passages.
 
 Generating or importing notes rewrites generated source paths. Rendering
 compiles the existing project and preserves source edits. To edit content, use
@@ -1417,14 +1501,14 @@ The complete manifest shape is:
 | `draft` | boolean | Whether generation found review flags |
 | `tex_files` | array of relative paths | Declared TeX sources, including `main.tex`, chapters, and any diagrams |
 | `code_files` | array of relative paths | Declared verbatim code assets under `code/` |
-| `review` | array of `{id, description}` | Uncertain blocks followed by unresolved issues |
+| `review` | array of `{id, description}` | Blocks with uncertain fragments or legacy uncertain kind, followed by unresolved issues |
 | `issues` | array of full review issues | Review metadata, including resolved issues; not printed in the PDF |
 | `evidence_fingerprint` | string or null | Fingerprint of complete evidence when the project was written |
 
 Normal synthesis has evidence and writes a fingerprint string. The low-level
 project writer can produce null if no evidence file exists.
 
-`review` entries for uncertain blocks use the block ID. Entries for unresolved
+`review` entries for marked blocks use the block ID. Entries for unresolved
 issues use the issue ID. An uncertain block and its generated issue can both
 appear as separate flags. `draft` is derived from this list during generation;
 the renderer also derives its report's draft flag from the list.
@@ -1446,8 +1530,8 @@ This is the LuaLaTeX entry point. It contains:
 
 1. The fixed preamble and supported packages.
 2. The marked draft footer region.
-3. Escaped lecture title, empty author and date.
-4. Document start, title page content, table of contents, and a new page.
+3. Document start and a compact centered escaped lecture title.
+4. Body content on the same page, without a table of contents or forced page break.
 5. `\input{chapters/<chapter ID>.tex}` entries in note order.
 6. An inline glossary section when terms exist.
 7. Document end.
@@ -1472,7 +1556,9 @@ when editing `main.tex` so a later resolution can refresh the footer.
 
 Each chapter file contains a section heading, a human-readable audio interval,
 then blocks in their original order. Ordinary text is escaped for LaTeX.
-Supported inline math is retained. Source citations do not produce footnotes.
+Supported inline math is retained. Selected uncertain fragments are colored;
+their source times are combined into a footnote. Unmarked source citations
+remain invisible. Empty chapters have no rendered heading or file.
 
 A generated chapter excerpt is:
 
@@ -1564,9 +1650,10 @@ before invoking the compiler.
 
 ### notes/main.pdf
 
-This is the compiled PDF. It includes the title, contents, ordered chapters,
-and optional glossary. It has no audio source footnotes or review appendix.
-Chapter audio intervals and inline uncertainty labels remain. Open review
+This is the compiled PDF. It includes a compact title, nonempty ordered chapters,
+and optional glossary, without a standalone title/contents page or review appendix.
+Chapter intervals and highlighted uncertain fragments with compact timestamp
+footnotes remain. Open review
 flags produce the draft footer. A successful compiler exit and an existing PDF
 are required, followed by successful page preview generation.
 

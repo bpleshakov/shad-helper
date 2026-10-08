@@ -61,7 +61,8 @@ def test_video_automatic_and_manual_inputs_match_without_private_diagnostics(tmp
     client = Client()
     folder = notes.generate_notes(tmp_path, tmp_path / "auth", manual=True)
     manual_context = read_json(folder / "inputs/ch001/context.json")
-    assert set(manual_context) == {"lecture_title", "glossary", "chapter", "segments", "visuals"}
+    assert set(manual_context) == {
+        "lecture_title", "glossary", "chapter", "segments", "visuals", "writing_budget"}
     assert manual_context["visuals"] == data["visuals"]
     assert "issues" in manual_context["visuals"][0]["text"]
     assert not list(folder.rglob("*.png"))
@@ -140,10 +141,16 @@ def test_visual_content_invalidates_notes_cache_but_diagnostics_do_not(tmp_path)
 def test_empty_visuals_do_not_bypass_missing_content_guard(tmp_path, frames):
     prepare(tmp_path, evidence(speech=False, visuals=frames))
     write_json(tmp_path / "checkpoints/notes/ch001.json", {"preserve": True})
+    write_json(tmp_path / "notes.json", {"preserve": "previous notes"})
     with pytest.raises(ValueError, match="No speech or readable visual content"):
         notes.generate_notes(tmp_path, tmp_path / "auth", manual=True, rebuild=True)
     assert read_json(tmp_path / "checkpoints/notes/ch001.json") == {"preserve": True}
-    assert not (tmp_path / "handoff").exists()
+    assert read_json(tmp_path / "notes.json") == {"preserve": "previous notes"}
+    runs = list((tmp_path / "handoff/runs").iterdir())
+    assert len(runs) == 1
+    assert read_json(runs[0] / "run.json") == {"mode": "manual", "status": "failed", "rebuild": True}
+    assert {path.name for path in runs[0].iterdir()} == {"run.json"}
+    assert not (tmp_path / "handoff/inputs").exists()
 
 
 def test_model_context_does_not_forward_extra_top_level_fields():

@@ -13,7 +13,7 @@ def evidence():
 
 
 @pytest.mark.parametrize("mode", ["import", "automatic"])
-def test_success_does_not_export_handoff_or_open_network(tmp_path, monkeypatch, mode):
+def test_success_saves_handoff_and_run_archive_without_opening_network(tmp_path, monkeypatch, mode):
     data = evidence()
     data["media"]["duration"] = 900
     write_json(tmp_path / "evidence.json", data)
@@ -22,7 +22,7 @@ def test_success_does_not_export_handoff_or_open_network(tmp_path, monkeypatch, 
         {**outline["chapters"][0], "blocks": [
             {"id": "ch001_b1", "kind": "text", "content": "Определение",
              "evidence_ids": ["speech"]}]}], "glossary": [], "issues": []}
-    export = Mock(side_effect=AssertionError("Unexpected handoff export"))
+    export = Mock(wraps=notes.export_handoff)
     network = Mock(side_effect=AssertionError("Unexpected network connection"))
     monkeypatch.setattr(notes, "export_handoff", export)
     monkeypatch.setattr("shad_helper.network.httpx.Client", network)
@@ -36,8 +36,16 @@ def test_success_does_not_export_handoff_or_open_network(tmp_path, monkeypatch, 
         result = notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
         assert client.complete.call_count == 1
     assert result.exists() and read_json(tmp_path / "review.json")["ready"]
-    assert not (tmp_path / "handoff").exists()
-    export.assert_not_called()
+    folder = tmp_path / "handoff"
+    export.assert_called_once()
+    assert export.call_args.args[0] == tmp_path
+    assert export.call_args.args[1] == data
+    assert read_json(folder / "inputs/ch001/context.json")["segments"] == data["segments"]
+    runs = list((folder / "runs").iterdir())
+    assert len(runs) == 1
+    assert read_json(runs[0] / "run.json") == {"mode": mode, "status": "completed", "rebuild": False}
+    for relative in ("response-schema.json", "ch001/context.json", "ch001/prompt.txt"):
+        assert (runs[0] / "inputs" / relative).read_bytes() == (folder / "inputs" / relative).read_bytes()
     network.assert_not_called()
 
 
@@ -75,7 +83,7 @@ def test_handoff_exports_three_distinct_input_types(tmp_path):
     assert {path.name for path in folder.iterdir()} == {"inputs", "README.txt"}
     chapter = inputs / "ch001"
     context = read_json(chapter / "context.json")
-    assert set(context) == {"lecture_title", "glossary", "chapter", "segments"}
+    assert set(context) == {"lecture_title", "glossary", "writing_budget", "chapter", "segments"}
     assert context["lecture_title"] == outline["title"]
     assert context["glossary"] == outline["glossary"]
     assert context["segments"] == data["segments"]

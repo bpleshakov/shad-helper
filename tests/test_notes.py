@@ -160,7 +160,7 @@ class NotesValidationTests(unittest.TestCase):
 
     @unittest.skipUnless(importlib.util.find_spec("pydantic"), "requires installed pydantic")
     def test_manual_handoff_and_import_have_same_notes_contract(self):
-        from shad_helper.notes import generate_notes
+        from shad_helper.notes import export_handoff, generate_notes
         with tempfile.TemporaryDirectory() as temporary:
             job = Path(temporary).resolve()
             data = evidence()
@@ -177,9 +177,16 @@ class NotesValidationTests(unittest.TestCase):
                 self.assertTrue((folder / "inputs/ch001/prompt.txt").exists())
                 self.assertFalse(list(folder.rglob("*.pdf")))
                 write_json(folder / "status.json", {"status": "manual_required"})
-                with patch("shad_helper.notes.export_handoff") as export:
+                with patch("shad_helper.notes.export_handoff", wraps=export_handoff) as export:
                     path = generate_notes(job, job / "auth", imported=response_file)
-                export.assert_not_called()
+                export.assert_called_once_with(job, data, read_json(job / "outline.json"), contexts={})
+                context = read_json(folder / "inputs/ch001/context.json")
+                self.assertEqual(context["chapter"]["title"], "Матрицы")
+                self.assertEqual(context["segments"], [data["segments"][0]])
+                runs = list((folder / "runs").iterdir())
+                self.assertEqual(len(runs), 2)
+                self.assertEqual({read_json(run / "run.json")["mode"] for run in runs},
+                                 {"manual", "import"})
                 self.assertTrue(path.exists())
                 self.assertTrue((job / "notes.json").exists())
                 self.assertTrue(read_json(job / "review.json")["ready"])

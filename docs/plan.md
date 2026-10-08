@@ -62,13 +62,25 @@ reject them before any rebuild, review, or rendering writes.
   Stop before parts become shorter than thirty seconds. Preserve all evidence in
   manual handoffs when splitting cannot help.
 - Automatic and imported replies use the same schema. Mark added explanations
-  and uncertain details; do not invent missing formula, code, or diagram details.
+  and only the questionable fragments of useful study material; do not invent
+  missing formula, code, or diagram details. Combine source times into one short
+  footnote per affected paragraph; keep diagnostic explanations in local review.
   Cross-check fallible visual extraction against speech. Notebook visuals supply
   theory and explanatory comments, excluding executable code and service output.
+- Focus on definitions, facts, formulas, theorem conditions, proof steps, and
+  useful explanations, omitting narration, administration, and repetitions.
+  Aim for ten pages per three hours, up to twenty for dense lectures, with a soft
+  duration-scaled word allowance. Omit empty chapters from the PDF, preserve their
+  outline intervals, and avoid a standalone title/contents page.
 - Use three distinct manual inputs: shared instructions in `prompt.txt`, lecture
-  title/glossary/chapter/speech/visuals in `context.json`, and output constraints in
+  title/glossary/writing budget/chapter/speech/visuals in `context.json`, and output constraints in
   `response-schema.json`. Keep them under `handoff/inputs/`, with operator README
-  and fallback status outside it. Export no duplicate outline or transcript.
+  and fallback status outside it. Do not duplicate the outline or transcript in model inputs.
+- Save the handoff on every notes run, including cache hits and imports. Retain
+  separate `handoff/runs/<run ID>/` archives with the run's outline and actual
+  chapter contexts, including accumulated glossary. Save each attempt's exact
+  outbound API JSON before transmission; keep retries and split-parent requests.
+  Exclude credentials and OAuth exchanges; never send after an archive write fails.
 - Preserve note-generated issues and explicit resolutions. Review operates on
   notes only. Bind resolution records and the rendered project to the complete
   clean evidence fingerprint; diagnostic-only changes leave them valid.

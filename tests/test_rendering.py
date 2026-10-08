@@ -47,6 +47,18 @@ class RenderingTests(unittest.TestCase):
         root = path.parent
         return root, json.loads((root / "project.json").read_text())
 
+    def evidence(self, segments, visuals=()):
+        data = {"schema_version": 4 if visuals else 3, "title": "Лекция",
+                "media": {"duration": 10800},
+                "segments": [{"id": identifier, "start": start, "end": start + 1,
+                              "text": "Формулировка"} for identifier, start in segments]}
+        if visuals:
+            data["visuals"] = [{"id": identifier, "timestamp": timestamp, "status": "complete",
+                                "kind": "whiteboard", "text": "Формула", "formulas": [],
+                                "diagrams": [], "unreadable": []}
+                               for identifier, timestamp in visuals]
+        write_json(self.job / "evidence.json", data)
+
     def test_escape_all_tex_special_characters(self):
         self.assertEqual(rendering.escape_text(r"\{}$&#%_~^"), r"\textbackslash{}\{\}\$\&\#\%\_\textasciitilde{}\textasciicircum{}")
 
@@ -62,12 +74,15 @@ class RenderingTests(unittest.TestCase):
         self.assertIn(r"\(X \in \mathbb{R}\)", chapter)
         self.assertIn(r"p\_value \& 50\%", chapter)
         self.assertIn("00:01:01 - 00:02:05", chapter)
-        self.assertIn("Требует проверки", chapter)
-        self.assertIn("Пояснение", chapter)
+        self.assertNotIn("Требует проверки", chapter)
+        self.assertIn(r"\textbf{Пояснение.} Условие:", chapter)
+        self.assertNotIn(r"\begin{quote}", chapter)
+        self.assertIn(r"\textcolor{blue!60!black}{Проверьте индекс.}\footnote{00:01:01}", chapter)
         self.assertEqual((root / "code/code-1.txt").read_text(), self.notes["chapters"][0]["blocks"][2]["content"])
         self.assertEqual(len(manifest["review"]), 2)
 
     def test_evidence_and_review_metadata_do_not_add_pdf_footnotes_or_appendix(self):
+        self.notes["chapters"][0]["blocks"][5]["kind"] = "text"
         for block in self.notes["chapters"][0]["blocks"]:
             block["evidence_ids"] = ["ev-1"]
         root, manifest = self.project()
@@ -87,6 +102,86 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual([block["evidence_ids"] for block in self.notes["chapters"][0]["blocks"]],
                          [["ev-1"]] * 6)
 
+    def test_only_uncertain_fragments_are_colored_with_one_deduplicated_footnote(self):
+        self.notes["issues"] = []
+        self.notes["evidence_index"] = {"ev-1": "Аудио 99:99:99"}
+        content = r"Матрица симметрична, \(X_1 \in \mathbb{R}\), индекс \(j\)."
+        self.notes["chapters"][0]["blocks"] = [{
+            "id": "selected", "kind": "text", "content": content,
+            "evidence_ids": ["ev-1", "ev-2", "frame-1", "ordinary"],
+            "uncertain_fragments": [
+                {"text": r"индекс \(j\)", "evidence_ids": ["ev-2", "frame-1"]},
+                {"text": r"\(X_1 \in \mathbb{R}\)", "evidence_ids": ["frame-1", "ev-1"]},
+            ],
+        }]
+        self.evidence([("ev-1", 3661.2), ("ev-2", 3661.9), ("ordinary", 7200)],
+                      [("frame-1", 3723.7)])
+        root, manifest = self.project()
+        rendering._validate_project(root, manifest)
+        chapter = (root / "chapters/chapter-1.tex").read_text()
+        self.assertIn(r"Матрица симметрична, \textcolor{blue!60!black}{\(X_1 \in \mathbb{R}\)}, "
+                      r"\textcolor{blue!60!black}{индекс \(j\)}.\footnote{01:01:01, 01:02:03}", chapter)
+        self.assertEqual(chapter.count(r"\footnote"), 1)
+        self.assertNotIn("02:00:00", chapter)
+        self.assertNotIn("99:99:99", chapter)
+        self.assertEqual([flag["id"] for flag in manifest["review"]], ["selected"])
+        self.assertTrue(manifest["draft"])
+
+    def test_many_uncertain_references_use_a_short_range_per_paragraph(self):
+        self.notes["chapters"][0]["blocks"] = [{
+            "id": "selected", "kind": "clarification",
+            "content": "Первое утверждение.\n\nВторое утверждение.\n\nНадёжный вывод.",
+            "evidence_ids": [f"ev-{index}" for index in range(5)],
+            "uncertain_fragments": [
+                {"text": "Первое", "evidence_ids": ["ev-3", "ev-1", "ev-2", "ev-0", "ev-0"]},
+                {"text": "Второе", "evidence_ids": ["ev-4"]},
+            ],
+        }]
+        self.evidence([(f"ev-{index}", 60 * index) for index in range(5)])
+        root, manifest = self.project()
+        rendering._validate_project(root, manifest)
+        chapter = (root / "chapters/chapter-1.tex").read_text()
+        self.assertIn(r"\textcolor{blue!60!black}{Первое} утверждение.\footnote{00:00:00–00:03:00}", chapter)
+        self.assertIn(r"\textcolor{blue!60!black}{Второе} утверждение.\footnote{00:04:00}", chapter)
+        self.assertEqual(chapter.count(r"\footnote"), 2)
+        self.assertIn("\n\nНадёжный вывод.", chapter)
+
+    def test_uncertain_fragments_require_real_evidence_timestamps(self):
+        self.notes["chapters"][0]["blocks"] = [{
+            "id": "selected", "kind": "text", "content": "Индекс неясен.",
+            "evidence_ids": ["missing"],
+            "uncertain_fragments": [{"text": "Индекс", "evidence_ids": ["missing"]}],
+        }]
+        with self.assertRaisesRegex(rendering.RenderError, "without timestamps: missing"):
+            self.project()
+
+    def test_invalid_or_unsafe_math_in_highlighted_fragments_is_rejected(self):
+        for content, fragment in ((r"Индекс \(x_i\).", "x_i"),
+                                  (r"Индекс \(\input{secret}\).", r"\(\input{secret}\)"),
+                                  (r"Индекс \(x_i.", r"\(x_i")):
+            self.notes["chapters"][0]["blocks"] = [{
+                "id": "selected", "kind": "text", "content": content,
+                "evidence_ids": ["ev-1"],
+                "uncertain_fragments": [{"text": fragment, "evidence_ids": ["ev-1"]}],
+            }]
+            self.evidence([("ev-1", 61)])
+            with self.subTest(content=content), self.assertRaises(rendering.RenderError):
+                self.project()
+
+    def test_empty_chapters_and_standalone_front_matter_are_omitted(self):
+        self.notes["chapters"].insert(0, {
+            "id": "empty", "title": "Организационные вопросы", "start": 0, "end": 61, "blocks": [],
+        })
+        root, manifest = self.project()
+        rendering._validate_project(root, manifest)
+        main = (root / "main.tex").read_text()
+        self.assertNotIn("chapters/empty.tex", manifest["tex_files"])
+        self.assertNotIn("Организационные вопросы", main)
+        self.assertNotIn(r"\tableofcontents", main)
+        self.assertNotIn(r"\newpage", main)
+        self.assertNotIn(r"\maketitle", main)
+        self.assertIn(r"\input{chapters/chapter-1.tex}", main)
+
     def test_regeneration_removes_obsolete_review_appendix(self):
         root, _ = self.project()
         (root / "review.tex").write_text(r"\section{Вопросы и замечания}")
@@ -102,6 +197,12 @@ class RenderingTests(unittest.TestCase):
                 self.notes["chapters"][0]["blocks"][0]["content"] = content
                 with self.assertRaises(rendering.RenderError):
                     self.project()
+
+    def test_unmarked_multiline_inline_math_is_preserved(self):
+        expression = "\\(a\n\nb\\)"
+        self.notes["chapters"][0]["blocks"][0]["content"] = "Формула " + expression
+        root, _ = self.project()
+        self.assertIn(expression, (root / "chapters/chapter-1.tex").read_text())
 
     def test_function_colon_is_supported_in_inline_and_display_math(self):
         expression = r"f\colon \mathbb{R} \to \mathbb{R}"
@@ -340,6 +441,9 @@ class RenderingTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("latexmk") and shutil.which("lualatex") and importlib.util.find_spec("pymupdf"), "LuaLaTeX, latexmk, and PyMuPDF are required")
     def test_actual_cyrillic_math_diagram_code_pdf_and_qa(self):
+        self.notes["chapters"][0]["blocks"][0]["uncertain_fragments"] = [
+            {"text": r"\(X \in \mathbb{R}\)", "evidence_ids": ["ev-1"]}]
+        self.evidence([("ev-1", 3661)])
         self.notes["chapters"][0]["blocks"][1]["content"] = (
             r"f\colon \mathbb{R} \to \mathbb{R},\quad x \mapsto x^2,\quad "
             r"\|\tilde{x}\|,\quad P(Y=1\mid X=x)")
@@ -355,6 +459,8 @@ class RenderingTests(unittest.TestCase):
             text = "\n".join(page.get_text() for page in document)
         self.assertIn("Случайные величины", text)
         self.assertIn("Проверьте индекс.", text)
+        self.assertIn("01:01:01", text)
+        self.assertNotIn("Требует проверки", text)
         self.assertNotIn("Источники:", text)
         self.assertNotIn("Аудио 00:01:05", text)
         self.assertNotIn("Вопросы и замечания", text)
