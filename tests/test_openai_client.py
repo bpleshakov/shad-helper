@@ -62,7 +62,7 @@ def _client_module():
             calls.append(("GET", url, kwargs))
             if module.network_error is not None:
                 raise module.network_error
-            return _Response(catalog={"models": [{"slug": "gpt-6-astra", "visibility": "list"},
+            return _Response(catalog={"models": [{"slug": "gpt-6.1-sol", "visibility": "list"},
                 {"slug": "hidden", "visibility": "hide"}]})
 
         def stream(self, method, url, **kwargs):
@@ -154,7 +154,7 @@ class ClientStdlibTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(module.client_options), 1)
         self.assertEqual(module.client_options[0]["proxy"], proxy)
-        client._available_models = ["gpt-6-astra"]
+        client._available_models = ["gpt-6.1-sol"]
         with self.assertRaisesRegex(module.PlanAccessError, "connection was interrupted"):
             client.complete("Instructions", "Text")
         self.assertEqual([item[0] for item in calls], ["GET", "POST"])
@@ -211,11 +211,11 @@ class ClientStdlibTests(unittest.TestCase):
     def test_unavailable_model_and_invalid_json_never_return_notes(self):
         module, calls = _client_module()
         client = module.PlanClient(Path("."), token_provider=lambda: "offline-token")
-        client._available_models = ["gpt-6.1-sol"]
+        client._available_models = ["gpt-6-astra"]
         with self.assertRaisesRegex(module.PlanAccessError, "unavailable"):
             client.complete("Instructions", "Text")
         self.assertEqual(calls, [])
-        client._available_models = ["gpt-6-astra"]
+        client._available_models = ["gpt-6.1-sol"]
         for output, message in [("not JSON", "invalid notes JSON"), ("[]", "JSON object")]:
             module.response_events = [_completed(output)]
             with self.subTest(output=output), self.assertRaisesRegex(module.ResponseError, message):
@@ -256,7 +256,7 @@ if _FULL_DEPS:
             assert request.headers["Authorization"] == "Bearer test-plan-token"
             if request.url.path == "/v1/models":
                 return httpx.Response(200, json={"models": models if models is not None else [
-                    {"slug": "gpt-6-astra", "visibility": "list"}, {"slug": "hidden", "visibility": "hide"}]})
+                    {"slug": "gpt-6.1-sol", "visibility": "list"}, {"slug": "hidden", "visibility": "hide"}]})
             assert str(request.url) == "https://api.openai.com/v1/responses"
             return httpx.Response(status, text=stream, headers={"content-type": "text/event-stream"})
 
@@ -312,7 +312,7 @@ if _FULL_DEPS:
         client, requests = client_for(tmp_path, sse({"type": "response.output_text.delta", "delta": '{"notes":'}, completed('{"notes":"Привет"}')))
         assert client.complete("Return notes JSON.", "Lecture text.", schema) == {"notes": "Привет"}
         body = json.loads(requests[-1].content)
-        assert body["model"] == "gpt-6-astra"
+        assert body["model"] == "gpt-6.1-sol"
         assert body["reasoning"] == {"effort": "high"}
         assert body["store"] is False and body["stream"] is True
         assert body["instructions"] == "Return notes JSON."
@@ -321,7 +321,7 @@ if _FULL_DEPS:
         assert body["input"][0]["content"] == [{"type": "input_text", "text": "Lecture text."}]
         assert body["text"]["format"]["schema"] == schema
         assert not set(body) & {"tools", "max_output_tokens", "previous_response_id", "background", "temperature"}
-        assert client.models() == ["gpt-6-astra"]
+        assert client.models() == ["gpt-6.1-sol"]
 
 
     def test_recorder_runs_before_transport_with_exact_request_bytes(tmp_path):
@@ -342,7 +342,7 @@ if _FULL_DEPS:
             assert request.headers["Authorization"] == "Bearer private-plan-token"
             events.append(("transport", request.method))
             if request.method == "GET":
-                return httpx.Response(200, json={"models": [{"slug": "gpt-6-astra", "visibility": "list"}]})
+                return httpx.Response(200, json={"models": [{"slug": "gpt-6.1-sol", "visibility": "list"}]})
             return httpx.Response(200, text=sse(completed("{}")))
 
         client = PlanClient(tmp_path, proxy="http://private-proxy:8080", transport=httpx.MockTransport(handle),
@@ -351,7 +351,7 @@ if _FULL_DEPS:
         assert events == [("token", None), ("record", "GET"), ("transport", "GET"),
             ("token", None), ("record", "POST"), ("transport", "POST")]
         body = json.loads(records[-1][2])
-        assert body == {"model": "gpt-6-astra", "reasoning": {"effort": "high"},
+        assert body == {"model": "gpt-6.1-sol", "reasoning": {"effort": "high"},
             "instructions": "Return notes JSON.",
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "Лекция."}]}],
             "store": False, "stream": True, "text": {"format": {"type": "json_schema",
@@ -365,7 +365,7 @@ if _FULL_DEPS:
     def test_recorder_failure_blocks_unrecorded_network_request(tmp_path, method, error):
         client, requests = client_for(tmp_path, sse(completed("{}")))
         if method == "POST":
-            client._available_models = ["gpt-6-astra"]
+            client._available_models = ["gpt-6.1-sol"]
 
         def fail_record(recorded_method, url, payload):
             assert recorded_method == method
@@ -389,7 +389,7 @@ if _FULL_DEPS:
         client = PlanClient(tmp_path, transport=httpx.MockTransport(fail), token_provider=lambda: "token",
             request_recorder=lambda *args: records.append(args))
         if method == "POST":
-            client._available_models = ["gpt-6-astra"]
+            client._available_models = ["gpt-6.1-sol"]
         with pytest.raises(PlanAccessError):
             client.complete("Instructions", "Lecture text")
         assert len(records) == 1
@@ -419,7 +419,7 @@ if _FULL_DEPS:
 
 
     def test_unavailable_account_model_does_not_call_inference(tmp_path):
-        client, requests = client_for(tmp_path, "", models=[{"slug": "gpt-6.1-sol", "visibility": "list"}])
+        client, requests = client_for(tmp_path, "", models=[{"slug": "gpt-6-astra", "visibility": "list"}])
         with pytest.raises(PlanAccessError, match="unavailable"):
             client.complete("Instructions", "Lecture text")
         assert len(requests) == 1
@@ -477,7 +477,7 @@ if _FULL_DEPS:
     def test_http_eligibility_error_retains_code_and_request_id(tmp_path):
         def handle(request):
             if request.url.path.endswith("models"):
-                return httpx.Response(200, json={"models": [{"slug": "gpt-6-astra", "visibility": "list"}]})
+                return httpx.Response(200, json={"models": [{"slug": "gpt-6.1-sol", "visibility": "list"}]})
             return httpx.Response(403, json={"error": {"code": "subscription_sharing_user_not_eligible"}}, headers={"x-request-id": "request-1"})
 
         client = PlanClient(tmp_path, transport=httpx.MockTransport(handle), token_provider=lambda: "token")

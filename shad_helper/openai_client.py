@@ -8,7 +8,7 @@ import httpx
 from shad_helper.auth import RESOURCE, PlanAccessError, access_token, http_error
 from shad_helper.network import openai_http_client, resolve_openai_proxy
 
-DEFAULT_MODEL = "gpt-6-astra"
+DEFAULT_MODEL = "gpt-6.1-sol"
 DEFAULT_REASONING_EFFORT = "high"
 
 class ResponseError(RuntimeError):

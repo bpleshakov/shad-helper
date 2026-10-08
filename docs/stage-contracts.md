@@ -1061,7 +1061,7 @@ The instructions are identical to the manual `prompt.txt`. They contain no
 lecture data or embedded response schema. The output schema is supplied through
 the client's response-format field rather than duplicated in the user input.
 
-The current client default is model `gpt-6-astra` with reasoning effort
+The current client default is model `gpt-6.1-sol` with reasoning effort
 `high`. Its response format is named `lecture_notes`. For the API's strict
 JSON Schema format, the client recursively removes schema defaults, requires
 every declared object property, and sets `additionalProperties: false`.

@@ -59,7 +59,7 @@ def doctor(state_dir: Path = Path(".shad-helper/auth"), *, proxy: str | None = N
     packages.update({name: importlib.util.find_spec(name) is not None
                      for name in ("mlx", "mlx_whisper", "mlx_vlm", "numpy", "cv2", "PIL")})
     tools = {name: shutil.which(name) for name in ("ffmpeg", "ffprobe", "latexmk", "lualatex")}
-    openai = {"status": "not_checked", "models": [], "default_model": "gpt-6-astra",
+    openai = {"status": "not_checked", "models": [], "default_model": "gpt-6.1-sol",
               "default_model_available": None}
     configured_proxy = os.environ.get("SHAD_HELPER_OPENAI_PROXY") if proxy is None else proxy
     if not (Path(state_dir) / "credentials.json").is_file():

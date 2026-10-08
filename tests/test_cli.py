@@ -46,15 +46,15 @@ def doctor_catalog(monkeypatch, tmp_path):
     state_dir = tmp_path / "auth"
     state_dir.mkdir()
     (state_dir / "credentials.json").write_text("{}")
-    models = Mock(return_value=["gpt-6-astra", "another-model"])
-    client = SimpleNamespace(model="gpt-6-astra", models=models)
+    models = Mock(return_value=["gpt-6.1-sol", "another-model"])
+    client = SimpleNamespace(model="gpt-6.1-sol", models=models)
     factory = Mock(return_value=client)
     monkeypatch.setitem(sys.modules, "shad_helper.openai_client", SimpleNamespace(PlanClient=factory))
     return state_dir, factory, models
 
 
 @pytest.mark.parametrize("available", [
-    ["gpt-6-astra", "another-model"], ["gpt-6.1-sol"], [],
+    ["gpt-6.1-sol", "another-model"], ["gpt-6-astra"], [],
 ])
 def test_doctor_reports_account_models_and_default_availability(doctor_catalog, capsys, available):
     state_dir, factory, models = doctor_catalog
@@ -63,8 +63,8 @@ def test_doctor_reports_account_models_and_default_availability(doctor_catalog, 
     report = json.loads(capsys.readouterr().out)
     assert report["openai"]["status"] == "available"
     assert report["openai"]["models"] == available
-    assert report["openai"]["default_model"] == "gpt-6-astra"
-    assert report["openai"]["default_model_available"] is ("gpt-6-astra" in available)
+    assert report["openai"]["default_model"] == "gpt-6.1-sol"
+    assert report["openai"]["default_model_available"] is ("gpt-6.1-sol" in available)
     assert all(report["packages"].values())
     factory.assert_called_once_with(state_dir, proxy=None)
     models.assert_called_once_with()
@@ -89,7 +89,7 @@ def test_doctor_skips_catalog_without_required_setup(doctor_catalog, monkeypatch
     report = json.loads(capsys.readouterr().out)
     assert report["openai"]["status"] == "not_checked"
     assert report["openai"]["models"] == []
-    assert report["openai"]["default_model"] == "gpt-6-astra"
+    assert report["openai"]["default_model"] == "gpt-6.1-sol"
     assert report["openai"]["default_model_available"] is None
     expected = {"credentials": "login", "proxy": "--openai-proxy",
                 "explicit_blank": "--openai-proxy", "dependency": "uv sync"}

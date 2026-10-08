@@ -133,7 +133,7 @@ keep localhost direct for the OAuth callback. This app's protected credentials
 live in `.shad-helper/auth`. Change the location with `--state-dir PATH` before
 the command name.
 
-Automatic synthesis checks account availability of `gpt-6-astra` and requests
+Automatic synthesis checks account availability of `gpt-6.1-sol` and requests
 `high` reasoning effort through the authorized ChatGPT-plan integration.
 Each failed chapter request or invalid reply gets three retries after the initial
 attempt, waiting 5, 10, and 20 seconds. Completed chapters remain cached.
