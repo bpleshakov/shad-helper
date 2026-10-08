@@ -9,7 +9,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .jobs import check_audio_job, fingerprint, read_json
+from .jobs import check_job, fingerprint, read_json
 
 
 class RenderError(RuntimeError):
@@ -224,12 +224,12 @@ _PREAMBLE = r"""\documentclass[a4paper,11pt]{article}
 
 
 def write_project(job: Path, notes: dict) -> Path:
-    """Create editable sources from transcript-grounded notes.
+    """Create editable sources from evidence-grounded notes.
 
     Call this only when replacing the note project is intentional. ``render``
     preserves these sources, including subsequent manual corrections.
     """
-    check_audio_job(job)
+    check_job(job)
     root = job.resolve() / "notes"
     if root.is_symlink() or not root.resolve().is_relative_to(job.resolve()):
         raise RenderError("The notes directory escapes the job")
@@ -245,7 +245,7 @@ def write_project(job: Path, notes: dict) -> Path:
             raise RenderError("Chapter IDs must be unique")
         chapter_ids.add(chapter_id)
         lines = ["\\section{" + escape_text(chapter["title"]) + "}",
-                 "\\noindent\\textit{Аудио: " + _stamp(chapter["start"]) + " - " + _stamp(chapter["end"]) + "}\\par\n"]
+                 "\\noindent\\textit{Лекция: " + _stamp(chapter["start"]) + " - " + _stamp(chapter["end"]) + "}\\par\n"]
         for block in chapter.get("blocks", []):
             block_id = _identifier(block["id"])
             if block_id in block_ids:
@@ -305,7 +305,7 @@ def refresh_review(job: Path, notes: dict) -> Path:
     The caller verifies the project matches the current evidence before refresh.
     It updates only project.json and the marked footer in main.tex.
     """
-    check_audio_job(job)
+    check_job(job)
     root = job.resolve() / "notes"
     if root.is_symlink() or not root.resolve().is_relative_to(job.resolve()):
         raise RenderError("The notes directory escapes the job")
@@ -395,7 +395,7 @@ def _qa(pdf: Path) -> int:
 
 def render(job: Path) -> Path:
     """Compile existing sources without replacing manual TeX corrections."""
-    check_audio_job(job)
+    check_job(job)
     root = job.resolve() / "notes"
     if root.is_symlink() or not root.resolve().is_relative_to(job.resolve()):
         raise RenderError("The notes directory escapes the job")

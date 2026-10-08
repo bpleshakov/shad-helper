@@ -1,14 +1,17 @@
-# Audio to PDF stage contracts
+# Recording to PDF stage contracts
 
-The pipeline turns a recording into timestamped speech evidence, Russian notes,
-an editable LaTeX project, and a PDF. Each boundary below specifies the files
-produced, their structure, and the rules the next stage applies before using them.
+The pipeline turns a recording into timestamped speech and visual evidence,
+Russian notes, an editable LaTeX project, and a PDF. Each boundary below specifies
+the files produced, their structure, and the rules the next stage applies before
+using them.
 
-This contract describes the current implementation. It covers the audio-only
-version 3 job format, automatic synthesis, manual ChatGPT handoff and import,
-review, and rendering. Video inputs contribute only their first audio stream.
-There are no extracted frames, OCR results, source-file imports, or external
-image assets. Diagrams are generated from speech as inline TikZ or PGFPlots.
+This contract describes the current implementation. It covers audio-only version
+3 jobs, audio/video version 4 jobs, automatic synthesis, manual ChatGPT handoff
+and import, review, and rendering. Video extraction adds local frame selection
+and recognition of slides, physical or digital whiteboards, and notebook theory.
+Only clean textual evidence reaches synthesis; images and recognition diagnostics
+stay local. Diagrams are generated as editable inline TikZ or PGFPlots, without
+a raster fallback. Importing original slides or notebook files is unsupported.
 
 ## Contents
 
@@ -16,6 +19,7 @@ image assets. Diagrams are generated from speech as inline TikZ or PGFPlots.
 - [Shared conventions](#shared-conventions)
 - [Recording to audio chunks](#recording-to-audio-chunks)
 - [Audio chunks to raw transcription](#audio-chunks-to-raw-transcription)
+- [Video to visual evidence](#video-to-visual-evidence)
 - [Raw transcription to evidence](#raw-transcription-to-evidence)
 - [Evidence to chapter inputs](#evidence-to-chapter-inputs)
 - [Chapter inputs to validated notes](#chapter-inputs-to-validated-notes)
@@ -30,8 +34,9 @@ image assets. Diagrams are generated from speech as inline TikZ or PGFPlots.
 | Stage | Entry point | Reads | Produces | Completion result |
 | --- | --- | --- | --- | --- |
 | Prepare audio | Internal part of `extract` | Original recording | Job marker, WAV chunks, audio checkpoints | Every requested core interval has a WAV descriptor |
-| Transcribe audio | Local worker started by `extract` | Worker request, WAV chunks, ASR checkpoints | Worker response, ASR checkpoints | Worker exits successfully and returns all requested items |
-| Assemble evidence | Internal part of `extract` | Raw worker response | Clean evidence, separate diagnostics, transcript copies, extraction timings | `extract` returns the path to `evidence.json` |
+| Transcribe audio | Local worker started by `extract` when the clip overlaps audio | Worker request, WAV chunks, ASR checkpoints | Worker response, ASR checkpoints | Worker exits successfully and returns all requested items, or is skipped for an empty audio intersection |
+| Extract video | Local selection and vision worker started by `extract`, after ASR exits or is skipped | Original recording, selected frames, vision checkpoints | Frame images, recognized content, separate local diagnostics | Every selected frame has complete or incomplete extraction status |
+| Assemble evidence | Internal part of `extract` | Raw worker responses | Clean evidence, separate diagnostics, transcript copies, extraction timings | `extract` returns the path to `evidence.json` |
 | Prepare chapters | Internal part of `notes` | Evidence, optional saved outline | Saved outline and in-memory chapter contexts | A consecutive outline covers the extracted interval |
 | Synthesize or import | `notes`, optionally `--manual` or `--import` | Chapter contexts, schema, optional replies and resolutions | Notes, review summary, LaTeX project; or a manual handoff | A project path means notes were generated; a handoff path means replies are still required |
 | Review | `review`, optionally `--resolve` | Clean evidence, notes, review files and project | Resolution ledger, updated note issues and review metadata | A named note issue has an explicit correction recorded |
@@ -63,10 +68,16 @@ JOB/
 │   └── chunk_0000.wav                         # one file per audio core interval
 ├── workers/
 │   ├── asr.request.json
-│   └── asr.response.json
+│   ├── asr.response.json
+│   ├── vision.request.json                   # video extraction only
+│   └── vision.response.json                  # video extraction only
+├── frames/                                  # video extraction only; native PNGs
+├── diagnostics/vision/                      # local per-frame raw attempts
 ├── checkpoints/
 │   ├── audio/chunk_0000.json
 │   ├── asr/chunk_0000.json
+│   ├── video/selection.json                  # video selection checkpoint
+│   ├── vision/<frame ID>.json                # successful visual extraction only
 │   └── notes/ch001.json                       # automatic synthesis only
 ├── evidence.json
 ├── extraction-diagnostics.json
@@ -145,6 +156,7 @@ All durations and timestamps are seconds, represented as JSON numbers.
 | Media bounds, chunk `offset`, `core_start`, `core_end` | Absolute seconds from the beginning of the original recording |
 | Raw Whisper segment and word `start` and `end` | Seconds from the beginning of that chunk's WAV |
 | Clean evidence segment and diagnostic word `start` and `end` | Absolute seconds in the original recording |
+| Visual evidence `timestamp` | Selected frame's source time relative to the original container start |
 | Outline, notes and handoff chapter bounds | Absolute seconds in the original recording |
 | Subtitle cues | Absolute recording timestamps, rounded to milliseconds |
 | Human-readable timestamps and PDF source labels | Absolute recording timestamps, floored to whole seconds |
@@ -179,6 +191,10 @@ prompt but is not a separate validator requirement.
 Segment IDs identify the current normalized extraction. They are assigned by
 output order and can change after retranscription. They are not persistent
 identities for a spoken sentence across different extractions.
+
+Visual IDs have the form `frame_<stream index>_<12-digit timestamp in microseconds>`.
+The numeric width is a minimum, and timestamps are rounded to microseconds for
+the ID. Version 4 requires IDs to be unique across speech and visuals.
 
 Media and WAV paths stored in extraction artifacts are absolute local paths.
 Manifest paths are relative to `JOB/notes/`. Moving a job does not automatically
@@ -217,7 +233,7 @@ Every checkpoint file has this envelope:
 | --- | --- | --- |
 | `fingerprint` | string | Fingerprint of the inputs listed for that stage |
 | `seconds` | number | Elapsed time for the successful action that originally produced this result |
-| `result` | stage-specific JSON | Audio descriptor, transcribed chunk, or validated single-chapter note object |
+| `result` | stage-specific JSON | Audio descriptor, transcribed chunk, video selection, visual extraction, or validated single-chapter note object |
 
 Only successful actions create a new checkpoint. Reuse returns the saved result
 without rerunning the action or updating its recorded time. A matching
@@ -230,19 +246,38 @@ pipeline-owned cache files, rather than an interface for manual corrections.
 later extraction reruns.
 
 The input must be a readable media file with a first audio stream. `ffprobe`
-selects `a:0`; the duration of that stream takes precedence over the container
-duration. Container duration is used only when stream duration is missing or
-`N/A`. The resulting duration must be finite and positive.
+selects `a:0`. For formats other than Matroska/WebM, audio start is the stream
+start minus the container start, clamped to zero; missing container start
+defaults to zero, and missing stream start defaults to the container start.
+When stream duration exists, audio end is this relative start plus stream
+duration. If stream duration is missing or `N/A`, container duration is used
+directly as the audio end, without adding the start. The audio bounds must be
+finite and describe a positive interval.
+
+When `ffprobe` identifies Matroska or WebM, audio and video probes derive their
+bounds from a streaming packet scan instead of stream duration/start metadata.
+The scan uses the minimum valid packet presentation timestamp and the maximum
+timestamp plus packet duration, relative to container start; a missing packet
+duration contributes zero. Invalid or empty packet bounds fail probing. This
+targets containers whose reported stream bounds can match the container bounds
+despite delayed or shorter streams; other formats retain the metadata route.
+
+With an enabled vision model and a real video stream, the recording end is the
+later of audio end and video end. With `--vision-model off` or audio-only input,
+the recording end is audio end. These bounds preserve video that continues
+after audio finishes, including requested clips wholly within that visual tail.
 
 `--start` defaults to zero and must be finite, nonnegative, and less than the
 media duration. An optional `--duration` must be finite and positive. The saved
 end is `min(media duration, start + requested duration)`, or the media duration
-when no duration is requested.
+when no duration is requested. Here media duration is the recording end defined
+above; all bounds are relative to the original container start, not the clip.
 
 ### extraction-config.json
 
 This job marker is written after input probing and interval validation, before
-chunk extraction. Its complete structure is:
+chunk extraction. For audio-only inputs or `--vision-model off`, its complete
+structure is:
 
 ~~~json
 {
@@ -251,14 +286,30 @@ chunk extraction. Its complete structure is:
 }
 ~~~
 
-The marker must equal this object exactly; extra keys make it unsupported.
-It permits an interrupted extraction to resume before `evidence.json` exists.
+For an input with a real video stream and vision enabled, the marker is:
 
-The job guard accepts a new or empty directory, a directory with this marker,
-or a directory containing supported version 3 evidence. An incompatible marker,
+~~~json
+{
+  "schema_version": 4,
+  "pipeline": "audio_video",
+  "vision_model": "35b"
+}
+~~~
+
+`extract --vision-model` accepts `35b`, `9b`, `4b`, or `off`, defaulting to `35b`.
+Enabled aliases select pinned Qwen3.5 4-bit MLX checkpoints; `35b` selects
+Qwen3.5-35B-A3B. Attached cover art is not a real video stream. An audio-only
+recording remains version 3 even when an enabled vision model is selected.
+
+Each marker must have exactly its displayed keys; the version 4 model alias
+must be `35b`, `9b`, or `4b`. The marker permits an interrupted extraction to
+resume before `evidence.json` exists.
+
+The job guard accepts a new or empty directory, a directory with a supported marker,
+or a directory containing supported version 3 or 4 evidence. An incompatible marker,
 legacy evidence, or a nonempty directory with neither marker nor evidence is
-rejected before writing. This includes version 2 audio jobs as well as older
-visual-processing jobs. The commands do not migrate them; use a fresh directory.
+rejected before writing. This includes version 1 and 2 jobs. The commands do not
+migrate them; use a fresh directory.
 
 ### audio/chunk_0000.wav
 
@@ -266,19 +317,24 @@ Each WAV has one channel and a 16,000 Hz sample rate. FFmpeg chooses its WAV
 encoding; the command does not explicitly select a PCM subtype. Only audio
 stream `0:a:0` is mapped, and video output is disabled.
 
-Audio is divided into core intervals of at most 600 seconds. For a core
+The requested interval is intersected with the available audio interval. An
+empty intersection creates no audio chunks and skips the ASR worker, leaving
+empty speech evidence while video extraction can proceed. Otherwise this audio
+intersection is divided into core intervals of at most 600 seconds. For a core
 `[lower, upper)`:
 
 ~~~text
-offset    = max(0, lower - 5)
-audio_end = min(extracted clip end, upper + 5)
+offset    = max(0, audio stream start, lower - 5)
+audio_end = min(requested audio intersection end, upper + 5)
 WAV spans offset through audio_end
 ~~~
 
 Thus adjacent full chunks can share ten seconds of audio. The first chunk of
-a pilot clip may include five seconds before the requested start. Audio never
-extends past the extracted clip end. The final core may be shorter than 600
-seconds.
+a pilot clip may include five seconds before the requested start, bounded by
+the actual audio stream start. Audio never extends past the available audio
+or extracted clip end. Delayed audio therefore retains its recording timestamp
+without a leading overlap into a region containing no audio samples. The final
+core may be shorter than 600 seconds.
 
 The descriptor passed to ASR is:
 
@@ -445,6 +501,76 @@ earlier checkpoints remain reusable even though the full response was not
 written. Model, language, descriptor, or WAV-byte changes invalidate reuse.
 Moving the job and rewriting WAV paths also changes the descriptor fingerprint.
 
+## Video to visual evidence
+
+**Producers:** `shad_helper.video` and `shad_helper.vision_worker`.
+**Consumer:** the extraction process that assembles version 4 evidence.
+
+Video processing runs after the ASR subprocess exits and releases its model
+memory, or immediately when the clip's audio intersection is empty. The requested
+interval uses the combined recording bounds defined above; frame selection
+intersects it with the first non-cover-art video stream. Matroska/WebM uses the
+packet-derived bounds described above; other formats use stream metadata, with
+container duration as the fallback when stream duration is unavailable.
+An input must therefore contain an audio stream even when it contains no speech.
+An empty video intersection produces an empty `visuals` array. Rotated video
+streams are rejected and require orientation normalization before extraction.
+
+### Frame selection and images
+
+FFmpeg streams grayscale proxies at up to 720 pixels wide and two samples per
+second, retaining source timestamps. The selector tracks accumulated changes,
+settled frames, frames before erasure or transitions, and overlapping scroll
+positions. A 15-second change guard retains slowly developing content. Unchanged
+frames are omitted; lecturer motion can retain extra frames. Selection is a
+content-preservation heuristic, not a semantic guarantee or a fixed frame cap.
+
+`checkpoints/video/selection.json` stores selected timestamps, reasons, sharpness,
+proxy count, and original scan time. Its fingerprint includes media bytes, the
+intersected interval, video metadata, and selection settings. Reuse skips the
+proxy scan. Missing or empty selected PNGs are retrieved again from the source.
+
+Native frames are saved under `frames/<frame ID>_<first 12 media hash digits>.png`.
+Each local worker item has `id`, `image` (absolute path), `timestamp`, `reason`,
+and `sharpness`. Images and these selection details are local extraction artifacts.
+
+### Vision worker request, response, and checkpoints
+
+`workers/vision.request.json` contains `job`, pinned model repository `model`,
+`revision`, and the selected `items`. The worker loads one MLX-VLM model lazily
+and processes frames sequentially. It exits after writing
+`workers/vision.response.json`, releasing the model memory. If selection returns
+no frames, extraction does not start the worker.
+
+Recognition uses thinking disabled, temperature zero, a 2,200,000-pixel ceiling,
+and an initial output limit of 2,048 tokens. Invalid or truncated JSON receives
+one retry with a corrective prompt and a 4,096-token limit. Both attempts use
+the same source frame. A response that still fails becomes an `incomplete`
+frame with empty clean content; extraction continues with the other frames.
+Model-loading, inference, and worker-process failures propagate instead.
+
+For slides and physical or digital whiteboards, the prompt requests readable
+text, exact LaTeX formulas, and diagram descriptions with labels and relationships.
+Notebook frames contribute theory, concepts, formulas, and meaningful plots;
+program code, service output, and application interface are excluded. Hidden or
+unreadable fragments are described explicitly rather than reconstructed.
+
+The response contains `items` and aggregate `diagnostics`. Each response item
+preserves its local input fields and adds `content` and `diagnostics`. `content`
+contains `kind`, `text`, `formulas`, `diagrams`, and `unreadable`; these become the
+clean visual fields below. Per-item diagnostics contain `status` and `attempts`.
+Attempts include raw output, output limits, generation metrics, and validation
+errors when present. Aggregate diagnostics include model/revision, settings,
+package versions, elapsed and load times, and fresh/cached item counts.
+
+`diagnostics/vision/<frame ID>.json` preserves the latest attempts and their
+input fingerprint even when extraction is incomplete. Successful frame results
+are checkpointed at `checkpoints/vision/<frame ID>.json`; incomplete results
+are retried on a later extraction. The checkpoint fingerprint includes image
+bytes, model/revision, both prompts, generation settings, and package versions.
+Changing the vision preset invalidates visual inference without invalidating
+matching audio, ASR, or selection checkpoints.
+
 ## Raw transcription to evidence
 
 **Producer:** `shad_helper.extraction`. **Consumers:** chapter preparation and
@@ -484,8 +610,9 @@ and it may be empty for a silent recording.
 
 ### evidence.json
 
-This is the authoritative input to synthesis. It contains clean speech without
-word data, scores, warnings, or ASR model metadata. Its complete shape is:
+This is the authoritative input to synthesis. It contains clean speech and,
+for version 4, clean visual content, without word data, scores, extraction
+diagnostics, image paths, or model metadata. The complete audio-only shape is:
 
 ~~~json
 {
@@ -511,14 +638,16 @@ word data, scores, warnings, or ASR model metadata. Its complete shape is:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer | Must be `3` |
+| `schema_version` | integer | `3` for audio-only evidence; `4` when `visuals` is present |
 | `title` | string | Recording filename stem by default; can be corrected before synthesis |
 | `media` | object | Recording identity and extracted interval |
 | `media.path` | string | Absolute path to the original recording |
 | `media.sha256` | string | Original recording's byte hash |
-| `media.duration` | number | Probed full audio duration |
+| `media.duration` | number | Recording end relative to container start: audio end, or the later audio/video end when vision is enabled |
+| `media.audio_start` | number, optional | Audio stream start relative to container start; omitted when zero |
 | `media.clip_start`, `media.clip_end` | numbers | Requested interval after end clipping |
 | `segments` | array of clean segments | Speech and source IDs; may be empty |
+| `visuals` | array of clean visual objects, version 4 only | Timestamped recognized content; may be empty |
 
 Every clean segment has exactly these fields:
 
@@ -528,14 +657,39 @@ Every clean segment has exactly these fields:
 | `start`, `end` | numbers | Absolute recording bounds, clamped to the audio core |
 | `text` | string | Nonempty reconstructed speech |
 
-The version guard requires version 3 and exactly the four root keys shown above.
-It requires `media` to be an object and `segments` to be an array of objects
+Version 3 requires exactly the four root keys shown above; version 4 requires
+those four keys plus `visuals`. Both require `media` to be an object and
+`segments` to be an array of objects
 containing exactly `id`, `start`, `end`, and `text`. Missing or additional root or
 segment fields are rejected,
 including `issues`, `models`, `words`, and `diagnostics`. This enforces the
-boundary between speech and diagnostics; it is not full nested type or semantic
+boundary between content and diagnostics; it is not full nested type or semantic
 validation of media and timestamps. Downstream code expects the producer types
 above.
+
+Each version 4 visual has exactly these fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | nonempty string | Frame source identifier, unique across speech and visuals |
+| `timestamp` | finite nonnegative number | Absolute source frame time |
+| `status` | `"complete"` or `"incomplete"` | Whether recognition produced a valid, non-truncated content object |
+| `kind` | `"slides"`, `"whiteboard"`, `"notebook"`, or `"other"` | Recognized display category |
+| `text` | string | Readable instructional text, or `""` |
+| `formulas` | array of strings | Recognized LaTeX formulas |
+| `diagrams` | array of diagram descriptions | Visible objects, labels, and relationships |
+| `unreadable` | array of strings | Descriptions of obscured or unreadable source regions |
+
+Each diagram has exactly `description` (string), `labels` (array of strings),
+and `relationships` (array of strings). These are descriptions for later editable
+diagram generation, not images or executable drawing code. Missing or extra
+visual/diagram fields and invalid visual types are rejected.
+
+`complete` means the response passed structural validation; it does not establish
+recognition accuracy or imply an empty `unreadable` array. An `incomplete` item
+has `kind: "other"`, empty text and arrays; failure explanations remain in local
+diagnostics. The clean status lets synthesis see the gap without receiving raw
+model output or implementation errors.
 
 For lecture bounds, synthesis falls back to `clip_start = 0` and
 `clip_end = duration` if those keys are missing. It rejects an empty interval.
@@ -545,7 +699,8 @@ New extraction always writes both clip bounds.
 
 This report contains the data removed from stitched segments and the warnings
 computed from it. Extraction computes warnings before creating clean evidence,
-so separation does not change word ownership or warning thresholds.
+so separation does not change word ownership or warning thresholds. The following
+complete example is audio-only; video extraction adds the local fields below.
 
 ~~~json
 {
@@ -590,10 +745,18 @@ so separation does not change word ownership or warning thresholds.
 | Segment `id` | string | Foreign key to the corresponding clean evidence segment |
 | Segment `words` | array | Retained words with absolute timestamps and any extra Whisper word fields, or `[]` |
 | Segment `diagnostics` | object | Present subset of `avg_logprob`, `no_speech_prob`, and `compression_ratio`, or `{}` |
-| `warnings` | array of warning objects | Informational ASR warnings, or `[]` |
+| `warnings` | array of warning objects | Informational extraction warnings, or `[]` |
 | Warning `id` | string | Generated `issue_0000` identity within this extraction |
 | Warning `description` | string | Human-readable condition and suggested inspection |
-| Warning `evidence_ids` | array of strings | Affected clean speech segment IDs |
+| Warning `evidence_ids` | array of strings | Affected clean speech or visual IDs |
+
+For video jobs, `models.vision` adds the selected preset, model repository, and
+pinned revision. `selection` records sampling settings, interval, proxy/selected
+counts, selection/retrieval times, and cache reuse. `vision` contains aggregate
+worker diagnostics, or failure status and an error when the vision stage fails.
+`visuals` preserves each worker item's local image path, selection details, status,
+and raw attempts, excluding its clean `content`. Individual attempt files and
+frame images remain under `diagnostics/vision/` and `frames/`.
 
 A warning has no `status` or `resolution`. Its `issue_` ID prefix is a naming
 convention inherited from extraction and does not make it a note review issue.
@@ -609,12 +772,16 @@ Extraction creates a warning for each applicable condition:
 | `no_speech_prob > 0.6` with nonblank text | Possible text generated during silence |
 | Any word `probability < 0.3` | Low word confidence; description lists at most five weak words |
 | `compression_ratio > 2.4` or a four-word sequence repeats at least four times | Strong repetition |
+| A complete visual contains `unreadable` descriptions | One inspection warning per described source region |
+| Visual output is invalid or truncated after its retry | Incomplete frame extraction |
 
 Warnings preserve the transcribed text; they do not silently correct it.
 The report is an inspection artifact, not a synthesis or review input. Notes
 do not read it, including when missing or edited, and there is no required
-approval or ignore action. Correct source speech in `evidence.json` if a warning
-reveals a transcription error before generating notes.
+approval or ignore action. Correct recognized content in `evidence.json` if a
+warning reveals an extraction error before generating notes. Clean visual
+`status` and `unreadable` fields remain part of the source evidence available to
+synthesis; raw attempts, metrics, image paths, and model metadata do not.
 
 ### transcript.json
 
@@ -656,6 +823,8 @@ VTT containing just its header.
 
 ### extraction-timings.json
 
+Audio-only example:
+
 ~~~json
 {
   "scope": "current extraction invocation",
@@ -664,18 +833,35 @@ VTT containing just its header.
 ~~~
 
 `audio_asr_seconds` measures elapsed wall time from before chunk preparation
-through transcription, stitching, and transcript, evidence, and diagnostic
-writes. It includes checkpoint lookup and reused work, and is not a sum of
+through transcription, stitching, and initial transcript/evidence writes.
+It includes checkpoint lookup and reused work, and is not a sum of
 historic checkpoint times or a measurement of model execution alone. It excludes initial probing and
 original-media hashing. The file is written after evidence.
+
+Video jobs add `vision_seconds` for selection, frame retrieval, model loading,
+inference, retries, and evidence assembly, plus `total_seconds` from extraction
+entry through the vision attempt, including initial probing and media hashing.
+These fields are written even when the vision stage fails after audio extraction.
+They measure current-run
+wall time, so checkpoint reuse reduces them. The runtime target is assessed
+from measurements, not enforced by dropping frames or stopping at one hour.
+
+Matroska/WebM probing adds a sequential packet read for each selected stream:
+one for audio and, when vision is enabled, one for video. The scan retains only
+running timestamp bounds in memory. Extraction passes the probed video metadata
+into frame selection, avoiding another packet scan there. These initial scans
+are included in video-job `total_seconds`, but precede `audio_asr_seconds` and
+`vision_seconds`; they still run when later stage checkpoints are reused.
 
 ## Evidence to chapter inputs
 
 **Producer:** `shad_helper.notes`. **Consumers:** automatic synthesis, manual
 handoff, and chapter reply validation.
 
-At least one evidence segment must contain nonblank speech before `notes`
-can run. Silence remains a valid extraction result but cannot produce notes.
+`notes` requires nonblank speech or at least one complete visual with nonblank
+text, a formula, or diagram description/label/relationship. Silence can therefore
+produce notes from usable visual evidence. Empty, incomplete-only, or
+unreadable-only visuals without speech do not satisfy this requirement.
 
 ### outline.json
 
@@ -735,6 +921,7 @@ The local context is an in-memory object:
 | --- | --- | --- |
 | `chapter` | Outline chapter object | Exact chapter identity and interval |
 | `segments` | Array of `{id, start, end, text}` | Speech selected for this chapter and neighboring context |
+| `visuals` | Array of clean visual objects, version 4 only | Selected visual source content, with exactly the eight evidence fields |
 
 Default neighboring context is `min(60 seconds, chapter duration / 4)` on
 each side. A segment is selected when its end is at or after the expanded
@@ -742,12 +929,19 @@ start and its start is at or before the expanded end. Selected segments are
 included in full, not trimmed at chapter or context bounds. Adjacent chapters
 can therefore receive the same context segments.
 
-The context has no word probabilities, word timestamps, ASR diagnostics,
-extraction warnings, or existing note issues. Note generation does not open
+Visuals are sorted by `timestamp`, then `id`. The context includes every visual
+within the inclusive expanded interval and the latest visual before its start,
+when one exists. This carries a previously shown static slide or board into a
+later chapter. It does not claim that the retained frame's content first
+appeared at the current chapter boundary.
+
+The context has no images, image paths, raw model attempts, model metadata,
+word probabilities, word timestamps, extraction diagnostics, extraction warnings,
+or existing note issues. Note generation does not open
 `extraction-diagnostics.json` or copy its contents into checkpoints or review.
 
-The model-facing context adds lecture metadata to those two fields. Its complete
-shape, also saved as a manual `context.json`, is:
+The model-facing context adds lecture metadata to these fields. Its complete
+audio-only shape, also saved as a manual `context.json`, is:
 
 ~~~json
 {
@@ -776,15 +970,17 @@ shape, also saved as a manual `context.json`, is:
 | `glossary` | array of `{term, definition}` | Seed terms for manual export; seed plus accumulated prior chapter terms during automatic synthesis |
 | `chapter` | Outline chapter object | Required single chapter and its bounds |
 | `segments` | Array of clean speech segments | Chapter and neighboring speech, included once |
+| `visuals` | Array of clean visual objects, version 4 only | Timestamped text, formulas, diagram descriptions, status, and unreadable regions |
 
 There is no nested `context` wrapper. Automatic API input is a compact JSON
 serialization of this object. Manual JSON is the same structure written with
 readable indentation. Neither contains a response schema or instructions.
 
-A block can cite any segment selected for its chapter, including neighboring
-context. The prompt asks the model to use neighboring speech for understanding
-without duplicating it in the chapter; that editorial rule is not enforced by
-timestamp filtering of the reply's prose.
+A block can cite any speech or visual ID selected for its chapter, including
+neighboring context and the carried preceding frame. The prompt asks the model
+to use neighboring content for understanding without duplicating it in the
+chapter; that editorial rule is not enforced by timestamp filtering of the
+reply's prose.
 
 ### Request size and chapter splitting
 
@@ -810,9 +1006,9 @@ chapter, context, glossary, instructions, and response schema. Only a validated
 successful reply is checkpointed. Completed chapters are reused; exhausting all
 four attempts exports the manual handoff with the final failure in `status.json`.
 
-If time splitting cannot reduce an oversized input, all speech is retained in
-the manual handoff and `status.json` explains the failure. Import mode skips
-automatic request-size splitting because no model request is made.
+If time splitting cannot reduce an oversized input, all selected evidence is
+retained in the manual handoff and `status.json` explains the failure. Import
+mode skips automatic request-size splitting because no model request is made.
 
 ## Chapter inputs to validated notes
 
@@ -823,9 +1019,10 @@ generation.
 ### Automatic request and reply
 
 Automatic synthesis submits text only. The user input is the compact JSON
-model context: lecture title, current glossary, chapter, and speech. Russian
+model context: lecture title, current glossary, chapter, speech, and optional
+clean visuals. Images and local recognition artifacts are never attached. Russian
 instructions request one chapter with the provided ID and timestamps,
-speech-grounded content, source citations, and explicit uncertainty.
+evidence-grounded content, source citations, and explicit uncertainty.
 The instructions are identical to the manual `prompt.txt`. They contain no
 lecture data or embedded response schema. The output schema is supplied through
 the client's response-format field rather than duplicated in the user input.
@@ -994,7 +1191,7 @@ the source-label mapping is computed locally for project generation.
 | `id` | identifier string | Required | Unique block identity and possible asset filename |
 | `kind` | one of six values below | Required | Rendering and provenance behavior |
 | `content` | nonempty string | Required | Text, LaTeX, or literal code |
-| `evidence_ids` | array of strings | Default `[]` | Existing source segment IDs |
+| `evidence_ids` | array of strings | Default `[]` | Existing speech or visual source IDs |
 | `caption` | string | Default `""` | Diagram caption; other block renderers do not use it |
 | `language` | string | Default `""` | Code-language metadata; current renderer uses plain verbatim output |
 
@@ -1007,16 +1204,21 @@ the source-label mapping is computed locally for project generation.
 | `clarification` | Added explanatory prose, with supported inline math | May have no evidence IDs; rendered with a “Пояснение” label |
 | `uncertain` | Missing or ambiguous details, with supported inline math | At least one permitted evidence ID; rendered with a review label and generates an open issue |
 
-For every evidence ID cited by a block, the source segment must exist in that chapter's
-selected context. An empty citation list is accepted only for clarification.
+For every evidence ID cited by a block, the speech or visual source must exist
+in that chapter's selected context. An empty citation list is accepted only for
+clarification.
 An issue's citations must exist in the available evidence. Citations validate
 the reference relationship; they do not prove that the model's prose or code
-accurately represents the speech.
+accurately represents the evidence.
 
-The instructions prohibit inventing unspoken formulas, code, execution results,
-graph values, or unseen slide details. Diagram captions should identify a
-schematic plot when actual data were not spoken. Those content rules require
-review; they are not semantic facts that the JSON validator can establish.
+The instructions prohibit inventing formulas, labels, code, execution results,
+or graph values absent from the sources. Notebook concepts and theory remain
+ordinary text; notebook code, arrays, service output, and UI are excluded, and
+theory must not be inferred from code alone. Diagram blocks use editable TikZ
+or PGFPlots based on the described labels and relationships, without raster
+fallback. Captions should identify a schematic plot when actual data are missing.
+Unreadable or missing source details require uncertainty. Those content rules
+require review; they are not semantic facts that the JSON validator can establish.
 
 The renderer accepts math beginning with `\[` or supported
 `equation`, `align`, `gather`, and `multline` display environments without
@@ -1050,7 +1252,7 @@ handling. The fingerprint input object contains:
 
 | Input key | Value |
 | --- | --- |
-| `context` | Internal chapter context containing only chapter metadata and clean speech |
+| `context` | Internal chapter context containing chapter metadata, clean speech, and optional clean visuals |
 | `prompt` | Exact compact model-context JSON with lecture title and current accumulated glossary |
 | `instructions` | Russian synthesis instructions |
 | `model` | Client's model identifier |
@@ -1060,13 +1262,13 @@ handling. The fingerprint input object contains:
 
 These inputs are hashed but are not individually saved alongside the
 checkpoint. A cached chapter result can be reused while later chapters run.
-Speech, prompt, model, outline context, glossary, or schema changes can
-invalidate affected chapter reuse. Diagnostic-report changes cannot. Final
+Speech, visual content, prompt, model, outline context, glossary, or schema
+changes can invalidate affected chapter reuse. Diagnostic-report changes cannot. Final
 resolution checks use the complete clean evidence fingerprint even when a
 single chapter checkpoint is reused.
 
 `--rebuild` removes the entire notes checkpoint directory after the job and
-nonempty-speech checks, then generates again. Since the flag is also hashed,
+usable-evidence checks, then generates again. Since the flag is also hashed,
 a later run without `--rebuild` does not match checkpoints created with it.
 Neither import mode nor manual export creates synthesized chapter checkpoints.
 
@@ -1081,7 +1283,7 @@ their separate, status-free format in `extraction-diagnostics.json`.
 | --- | --- | --- | --- |
 | `id` | identifier string | Required | Issue identity |
 | `description` | string | Required | Problem requiring review |
-| `evidence_ids` | array of strings | Default `[]` | Related speech segments |
+| `evidence_ids` | array of strings | Default `[]` | Related speech or visual sources |
 | `status` | `"open"` or `"resolved"` | Default `"open"` | Review state |
 | `resolution` | string | Default `""` | User's correction or explanation |
 
@@ -1153,8 +1355,8 @@ issue. Unknown issue IDs and blank explanations are rejected.
 
 Recording a resolution does not transcribe audio again or correct note content
 automatically. Correct the affected note content explicitly, or correct evidence
-and regenerate notes when speech is wrong. When the LaTeX project is bound to the
-current clean evidence fingerprint, resolving an issue refreshes the marked
+and regenerate notes when recognized content is wrong. When the LaTeX project is
+bound to the current clean evidence fingerprint, resolving an issue refreshes the marked
 footer in `main.tex` and `project.json`, preserving chapter, diagram, and code
 edits. If the project was already stale, resolution is saved but project refresh
 is deferred until notes
@@ -1464,21 +1666,25 @@ and they should not be edited to change lecture content.
 | Desired change | Edit or command | Consequence |
 | --- | --- | --- |
 | Correct recognized speech | Edit `evidence.json`, then regenerate or import corrected notes | Evidence fingerprint changes; old project cannot render |
+| Correct recognized visual content | Edit the matching `visuals` entry in `evidence.json`, then regenerate or import corrected notes | Clean evidence changes invalidate affected notes and old project freshness |
 | Change chapter plan | Edit `outline.json`, then run notes | Current outline and reply IDs determine synthesis/import |
 | Correct generated content through JSON | Edit a note response and use `--import` | Revalidates provenance and rewrites generated project files |
 | Correct layout or content directly in TeX | Edit declared project sources, then render | Rendering preserves edits within supported TeX rules |
 | Record a verified issue correction | Use `review --resolve ... --resolution ...` | Updates issue state, resolution ledger, and eligible review metadata |
-| Inspect or change ASR diagnostic data | Read or edit `extraction-diagnostics.json` | No effect on synthesis, note review, resolution matching, or rendering |
+| Inspect or change extraction diagnostic data | Read or edit `extraction-diagnostics.json` or local vision attempt files | No effect on synthesis, note review, resolution matching, or rendering |
 | Change transcript export | Edit `transcript.json`, SRT, or VTT | Inspection copy changes; synthesis evidence does not |
 | Change cached stage output | Do not edit checkpoints | Use source corrections, re-extraction, import, or `--rebuild` instead |
 
 ### Partial failures
 
-Successful extraction writes transcript JSON, SRT/VTT, evidence, diagnostics,
-then timings.
-An interruption can leave only some of those files updated. Chunk and ASR
-checkpoints remain useful for rerun. The version marker is not a “complete”
-status flag.
+Extraction first writes transcript JSON, SRT/VTT, version 3 speech evidence,
+diagnostics, and audio timings. Video extraction then selects frames, runs
+recognition, replaces evidence with version 4, and refreshes diagnostics and
+timings. An interruption can leave only some files updated. Audio, ASR, selection,
+and successful vision checkpoints remain useful for rerun. A fatal vision error
+raises after preserving the audio artifacts and recording the failure; version
+3 speech evidence can remain under a version 4 marker. The marker is therefore
+not a completion flag or proof that video processing succeeded.
 
 Notes preparation writes its outline before generation or import completes.
 Automatic synthesis checkpoints chapters individually. Only after all chapter
@@ -1489,8 +1695,9 @@ leave updated notes with an incomplete or older project.
 Automatic fallback returns a handoff path normally, so the CLI can exit
 successfully while manual replies are still needed. Check the returned path
 and handoff status rather than treating exit code zero or an older
-`notes.json` as proof of a new synthesis result. Invalid evidence, silent
-input, and outline errors before the synthesis loop fail directly instead.
+`notes.json` as proof of a new synthesis result. Invalid evidence, lack of both
+speech and usable visual content, and outline errors before the synthesis loop
+fail directly instead.
 
 Neither re-extraction nor handoff export removes an old note project or PDF.
 Project generation does not purge obsolete TeX/code assets. Rendering compares
@@ -1502,9 +1709,11 @@ bytes.
 
 | Repeated action | What can be reused | What is refreshed or invalidated |
 | --- | --- | --- |
-| Extract same recording and interval | Matching audio and ASR checkpoints | Worker request/response, clean transcript/evidence, and diagnostic report are rewritten |
+| Extract same recording and interval | Matching audio, ASR, selection, and successful vision checkpoints | Worker request/response, clean transcript/evidence, and diagnostic report are rewritten |
 | Change recording bytes or core bounds | Unaffected matching checkpoints only | Changed audio inputs and dependent ASR results |
 | Change ASR language/model or WAV bytes | Existing WAV if its audio inputs still match | ASR checkpoint fingerprint |
+| Change vision preset, revision, prompt, settings, package versions, or selected image bytes | Matching audio, ASR, and selection results | Affected visual inference checkpoints and clean visual evidence |
+| Delete a selected frame image | Matching selection metadata | Missing PNG is retrieved from the original recording |
 | Run automatic notes again | Matching validated chapter checkpoints | Final merged notes, review summary and generated project |
 | Edit only the diagnostic report | Matching note checkpoints, resolutions, and project | No synthesis or render invalidation; report remains informational |
 | Use notes `--rebuild` | Extraction checkpoints | All automatic note checkpoints are removed |
@@ -1524,6 +1733,11 @@ restores a resolution only if its complete clean evidence and note issue match.
   stitching, transcript exports, warnings, and evidence.
 - [local_worker.py](../shad_helper/local_worker.py): worker request/response and ASR
   checkpoint results.
+- [video.py](../shad_helper/video.py): source timestamps, frame selection, image
+  retrieval, and selection checkpoints.
+- [vision_worker.py](../shad_helper/vision_worker.py) and
+  [vision_config.py](../shad_helper/vision_config.py): pinned presets, local model
+  inference, strict content parsing, raw attempts, and visual checkpoints.
 - [schemas.py](../shad_helper/schemas.py): outline, note, block, glossary, and issue
   fields and model validators.
 - [notes.py](../shad_helper/notes.py): chapter contexts, budgets, handoff/import,

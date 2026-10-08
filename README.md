@@ -1,8 +1,14 @@
 # shad-helper
 
-A CLI that turns Russian lecture audio into detailed, transcript-grounded LaTeX
-notes and PDF. Audio files and video soundtracks share local transcription.
+A CLI that turns Russian lecture recordings into detailed, evidence-grounded LaTeX
+notes and PDF. Audio files and video soundtracks share local transcription;
+video frames also supply text, formulas, and diagram descriptions.
 Notes include equations, code, TikZ/PGFPlots diagrams, timestamps, and review items.
+
+Video extraction uses a configurable local Qwen model. Handwritten formulas
+and diagram relationships can still be wrong and need review. See
+[the baseline pilot](docs/vision-pilot.md) and the
+[OCR-first and 35B experiments](docs/vision-specialist-pilot.md).
 
 ## Install
 
@@ -19,16 +25,18 @@ LuaLaTeX. The template uses `fontspec`, `unicode-math`, `polyglossia`,
 standard geometry, color, and hyperlink packages. Put `/Library/TeX/texbin` on
 `PATH`.
 
-The first transcription downloads Whisper large-v3 through MLX Whisper.
+The first transcription downloads Whisper large-v3 through MLX Whisper; the first
+video extraction downloads the selected Qwen vision model.
 Caches live under `.cache/huggingface`. The ASR worker exits after transcription
-to release model memory. Once tools and weights are installed, extraction works
+before the vision worker loads, so their model memory is not held together.
+Once tools and weights are installed, extraction works
 offline; use `HF_HUB_OFFLINE=1` to disable Hugging Face network access.
 
 With app-owned credentials and a configured OpenAI proxy, `doctor` also lists
 account-available models and reports default-model availability. It does not
 start login or generate notes. Local checks determine its exit status.
 
-## Extract audio evidence
+## Extract lecture evidence
 
 Start with a representative ten-minute interval:
 
@@ -36,11 +44,32 @@ Start with a representative ten-minute interval:
 UV_CACHE_DIR=.cache/uv uv run shad-helper extract lecture.m4a --start 1800 --duration 600 --out jobs/audio-pilot
 ```
 
-For a full recording, omit the interval options. Video files work the same way:
+For a full recording, omit the interval options. Video defaults to Qwen 35B:
 
 ```sh
-UV_CACHE_DIR=.cache/uv uv run shad-helper extract lecture.mp4 --out jobs/audio-lecture
+UV_CACHE_DIR=.cache/uv uv run shad-helper extract lecture.mp4 --out jobs/video-lecture
+UV_CACHE_DIR=.cache/uv uv run shad-helper extract lecture.mp4 --out jobs/video-lecture --vision-model 9b
+UV_CACHE_DIR=.cache/uv uv run shad-helper extract lecture.mp4 --out jobs/video-lecture --vision-model 4b
+UV_CACHE_DIR=.cache/uv uv run shad-helper extract lecture.mp4 --out jobs/audio-lecture --vision-model off
 ```
+
+`--vision-model` accepts `35b`, `9b`, `4b`, or `off`. The default is `35b` on
+every invocation; repeat the flag when continuing a job with another preset.
+Audio-only files and album-cover images do not load a vision model.
+
+| Preset | Local model (4-bit) | Peak MLX memory in the 16-frame pilot |
+| --- | --- | ---: |
+| `35b` (default) | `mlx-community/Qwen3.5-35B-A3B-4bit` | 22.4 GB |
+| `9b` | `mlx-community/Qwen3.5-9B-4bit` | 7.7 GB |
+| `4b` | `mlx-community/Qwen3.5-4B-4bit` | 4.9 GB |
+
+Presets pin the tested model revisions in `shad_helper/vision_config.py`.
+35B matched 4B's speed and was faster than 9B on this small pilot; model size
+alone does not predict runtime. The under-one-hour target for a one-hour video
+has not been established. Frames are selected from content changes, settled
+states, pre-erasure states and scrolling, then processed at native resolution
+up to the vision processor's 2.2-megapixel budget. Rotated streams must first be
+normalized. The recording still needs an audio stream.
 
 FFmpeg selects the first audio stream and produces 16 kHz mono WAV chunks.
 Ten-minute core intervals have five-second overlaps; each word belongs to one
@@ -48,22 +77,33 @@ core interval. JSON, SRT, and VTT timestamps refer to the original recording.
 Russian is the default; override transcription language with `--language`.
 Notes remain in Russian.
 
-Jobs contain `extraction-config.json`, schema-version-3 `evidence.json`,
+Jobs contain `extraction-config.json`, `evidence.json`,
 `transcript.json`, `transcript.srt`, `transcript.vtt`, audio chunks, worker
 requests/responses, successful checkpoints, and current-run extraction timings.
-Evidence stores only the title, media identity and interval, and speech segments
-with `id`, `start`, `end`, and `text`. `extraction-diagnostics.json` separately
-stores ASR model metadata, word timestamps and confidence, segment diagnostics,
-and extraction warnings. Notes do not read that report, and warnings do not block
-generation.
+Audio evidence remains schema version 3, with title, media identity and interval,
+and speech segments containing `id`, `start`, `end`, and `text`. Video evidence
+uses version 4 and adds timestamped `visuals`: source IDs, completion status,
+content kind, text, formulas, diagram descriptions and unreadable regions.
+Frames are saved under `frames/` for local inspection. Model metadata, raw
+responses, timing/token/memory measurements, selection details, ASR confidence
+and extraction warnings stay in worker files and `extraction-diagnostics.json`.
+Notes do not read that report, and warnings do not block generation.
 
-Reruns reuse matching audio and ASR checkpoints. Changes to media, intervals,
-language, or model invalidate affected results. Deleted audio artifacts are
-rebuilt, and interrupted ASR resumes at the last completed chunk.
+Reruns reuse matching audio, ASR, frame selection and vision checkpoints. Changing
+`--vision-model` reuses transcription and selected frames while recomputing visual
+content. Changes to media, intervals, language, model, or vision prompt/settings
+invalidate affected results. Deleted audio/frame artifacts are rebuilt. Interrupted
+work resumes from completed chunks/frames. Invalid vision JSON gets one retry;
+an unsuccessful frame remains explicitly `incomplete` and is retried on rerun.
 
-Use a **new output directory**. Legacy jobs are rejected before modifying their
-files. Existing jobs, PDFs, and downloaded model caches are preserved.
-Silent extraction keeps inspectable artifacts; note generation requires speech.
+Version 3 audio and version 4 video jobs can be reused, including enabling or
+disabling vision in an existing supported job. Older formats require a **new
+output directory** and are rejected before changing their files. Re-extraction
+preserves existing notes/PDFs, but changed evidence requires regenerating notes
+before rendering. A fatal vision error preserves the completed transcript and
+audio evidence and returns an error; rerun the extraction to complete video.
+Silent extraction keeps inspectable artifacts; notes require speech or useful
+visual content.
 
 A transcription smoke check processes thirty seconds and may download Whisper:
 
@@ -100,21 +140,25 @@ attempt, waiting 5, 10, and 20 seconds. Completed chapters remain cached.
 Unavailable access or failure after all four attempts exports a manual handoff.
 
 The app uses `outline.json`, or creates consecutive fifteen-minute chapters.
-Each request contains one chapter, neighboring speech context, and a shared
-glossary. Speech inputs contain only `id`, `start`, `end`, and `text`.
-Confidence and extraction diagnostics stay in their separate report. Only
+Each request contains one chapter, neighboring speech and visual context, and a
+shared glossary. Speech inputs contain only `id`, `start`, `end`, and `text`.
+Video inputs contain the extracted content and timestamps, including the last
+preceding frame when a static slide spans a chapter boundary. Raw frame images,
+local frame paths, confidence and extraction diagnostics are not sent. Only
 uncertainties discovered during note generation become note review issues.
 
 Chapters split above 120,000 UTF-8 bytes of instructions, context, and response
 schema. A typed `context_length_exceeded` response also triggers a split and
 retry. Splitting stops before creating parts shorter than thirty seconds.
-Irreducible context is exported manually without dropping speech.
+Irreducible context is exported manually without dropping speech or visuals.
 Editable outlines must cover the entire interval consecutively in chapters
 of at most twenty minutes.
 
-Lecture blocks cite transcript IDs. Added explanations are **Пояснение**;
-uncertain claims are **Требует проверки**. Unspoken details of a referenced
-formula, diagram, or code display must be flagged rather than invented.
+Lecture blocks cite speech or visual evidence IDs. Added explanations are
+**Пояснение**; uncertain claims are **Требует проверки**. Missing or conflicting
+formula/diagram details must be flagged rather than invented. Notebook visuals
+contribute theory, formulas and explanatory comments, not executable code.
+Diagrams remain editable TikZ/PGFPlots; source screenshots are not placed in PDFs.
 The PDF omits audio source footnotes and the list of review issues. Chapter
 audio intervals and inline uncertainty labels remain; review issues are stored
 in the JSON files and available through `review`.
@@ -138,7 +182,8 @@ For each chapter listed in the job's `outline.json`, attach
 `handoff/inputs/response-schema.json` in ChatGPT, then paste that chapter's
 `prompt.txt`. These are the three model inputs: instructions, lecture data, and
 response structure. The context contains the lecture title, glossary, chapter
-metadata, and speech once. `handoff/README.txt` and any `status.json` are operator
+metadata, speech and (for video jobs) extracted visuals once. `handoff/README.txt`
+and any `status.json` are operator
 instructions and should not be sent to the model.
 Save JSON replies without Markdown fences as `CHAPTER_ID.json`:
 
@@ -185,8 +230,11 @@ UV_CACHE_DIR=.cache/uv uv run pytest
 UV_CACHE_DIR=.cache/uv uv run ruff check shad_helper tests main.py
 ```
 
-Tests mock ASR and HTTP responses. FFmpeg integration verifies matching audio-only
-and multistream-video soundtracks. PDF integration uses real LuaLaTeX and PyMuPDF
+Tests mock model and HTTP responses. FFmpeg integration verifies matching audio-only
+and multistream-video soundtracks, delayed audio, and video extending beyond audio.
+All three vision presets were also exercised through the main CLI on a real
+15-second lecture clip, including model switching, cached resume, and manual
+notes handoff. PDF integration uses real LuaLaTeX and PyMuPDF
 when installed. These checks do not establish real-lecture ASR accuracy or speed;
 assess a representative Russian recording before a full run.
 

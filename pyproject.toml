@@ -12,7 +12,11 @@ dependencies = [
 
 [project.optional-dependencies]
 local = [
+    "mlx-vlm>=0.7.6",
     "mlx-whisper>=0.4.3",
+    "numpy>=2.4",
+    "opencv-python>=4.13",
+    "pillow>=12",
 ]
 
 [project.scripts]
@@ -30,6 +34,7 @@ dev = ["pytest>=8.4", "ruff>=0.13"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py314"

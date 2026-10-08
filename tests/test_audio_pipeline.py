@@ -54,7 +54,8 @@ def test_invalid_intervals_create_no_job(tmp_path, monkeypatch, start, duration)
     monkeypatch.setattr(extraction, "probe", lambda media: {"duration": 120})
     out = tmp_path / "job"
     with pytest.raises(ValueError):
-        extraction.extract(tmp_path / "lecture.wav", out, start=start, duration=duration)
+        extraction.extract(tmp_path / "lecture.wav", out, start=start, duration=duration,
+                           vision_model="off")
     assert not out.exists()
 
 
@@ -185,7 +186,7 @@ def test_real_audio_and_multistream_video_use_the_same_soundtrack(tmp_path, monk
     pcm = []
     for media in (audio, video):
         job = tmp_path / media.suffix[1:]
-        path = extraction.extract(media, job, start=0.5, duration=1)
+        path = extraction.extract(media, job, start=0.5, duration=1, vision_model="off")
         evidence = read_json(path)
         assert set(evidence) == {"schema_version", "title", "media", "segments"}
         assert evidence["schema_version"] == 3
@@ -213,7 +214,7 @@ def test_real_audio_and_multistream_video_use_the_same_soundtrack(tmp_path, monk
         with wave.open(str(job / "audio/chunk_0000.wav")) as chunk:
             assert (chunk.getnchannels(), chunk.getframerate()) == (1, 16000)
             pcm.append(chunk.readframes(chunk.getnframes()))
-        extraction.extract(media, job, start=0.5, duration=1)
+        extraction.extract(media, job, start=0.5, duration=1, vision_model="off")
         assert not (job / "frames").exists()
     assert pcm[0] == pcm[1]
     assert transcribe.call_count == 2
@@ -227,7 +228,7 @@ def test_silent_audio_retains_extraction_artifacts(tmp_path, monkeypatch):
     monkeypatch.setattr(extraction, "probe", lambda path: {"duration": 120})
     monkeypatch.setattr(extraction, "_audio_chunks", lambda *args: [])
     monkeypatch.setattr(extraction, "_worker", lambda *args: {"items": []})
-    evidence = read_json(extraction.extract(media, out))
+    evidence = read_json(extraction.extract(media, out, vision_model="off"))
     assert evidence["segments"] == []
     diagnostics = read_json(out / "extraction-diagnostics.json")
     assert diagnostics["segments"] == diagnostics["warnings"] == []

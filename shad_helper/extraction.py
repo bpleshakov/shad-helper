@@ -1,4 +1,4 @@
-"""Resumable local speech extraction from audio files or video soundtracks."""
+"""Resumable local speech and video extraction in sequential model processes."""
 
 import math
 import re
@@ -12,13 +12,16 @@ from pathlib import Path
 from .jobs import (
     AUDIO_CONFIG,
     EVIDENCE_VERSION,
-    check_audio_job,
+    VIDEO_EVIDENCE_VERSION,
+    check_job,
     checkpoint,
     fingerprint,
     read_json,
     sha256_file,
     write_json,
 )
+from .video import packet_bounds, probe_video, select_frames
+from .vision_config import DEFAULT_VISION_MODEL, VISION_MODELS
 
 ASR_MODEL = "mlx-community/whisper-large-v3-mlx"
 
@@ -28,22 +31,42 @@ def probe(media: Path) -> dict:
 
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
-         "stream=duration:format=duration", "-of", "json", str(media)],
+         "stream=duration,start_time:format=duration,start_time,format_name", "-of", "json",
+         str(media)],
         check=True, capture_output=True, text=True,
     )
     data = json.loads(result.stdout)
     if not data.get("streams"):
         raise ValueError("Input has no audio stream.")
-    duration = data["streams"][0].get("duration")
+    stream, container = data["streams"][0], data.get("format", {})
+    origin = container.get("start_time")
+    origin = 0 if origin in (None, "N/A") else origin
+    start = stream.get("start_time")
+    start = origin if start in (None, "N/A") else start
+    try:
+        audio_start = float(start) - float(origin)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Input has no valid audio start time.") from error
+    if not math.isfinite(audio_start):
+        raise ValueError("Input has no valid audio start time.")
+    audio_start = max(0.0, audio_start)
+    if set(container.get("format_name", "").split(",")) & {"matroska", "webm"}:
+        audio_start, audio_end = packet_bounds(media, "a:0", float(origin))
+        return {"duration": audio_end, **({"audio_start": audio_start} if audio_start else {})}
+    duration = stream.get("duration")
+    stream_duration = duration not in (None, "N/A")
     if duration in (None, "N/A"):
-        duration = data.get("format", {}).get("duration")
+        duration = container.get("duration")
     try:
         duration = float(duration)
     except (TypeError, ValueError) as error:
         raise ValueError("Input has no valid audio duration.") from error
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("Input has no valid audio duration.")
-    return {"duration": duration}
+    duration = duration + audio_start if stream_duration else duration
+    if duration <= audio_start:
+        raise ValueError("Input has no valid audio duration.")
+    return {"duration": duration, **({"audio_start": audio_start} if audio_start else {})}
 
 
 def stitch_segments(chunks: list[dict]) -> list[dict]:
@@ -128,11 +151,22 @@ def _worker(out: Path, request: dict) -> dict:
     return read_json(response_path)
 
 
-def _audio_chunks(media: Path, out: Path, start: float, end: float, media_hash: str) -> list[dict]:
+def _vision_worker(out: Path, request: dict) -> dict:
+    request = {"job": str(out.resolve()), **request}
+    request_path = out / "workers" / "vision.request.json"
+    response_path = out / "workers" / "vision.response.json"
+    write_json(request_path, request)
+    subprocess.run([sys.executable, "-m", "shad_helper.vision_worker",
+                    "--request", str(request_path), "--output", str(response_path)], check=True)
+    return read_json(response_path)
+
+
+def _audio_chunks(media: Path, out: Path, start: float, end: float, media_hash: str,
+                  audio_start: float = 0) -> list[dict]:
     chunks = []
     for position in range(math.ceil((end - start) / 600)):
         lower, upper = start + position * 600, min(end, start + (position + 1) * 600)
-        offset, audio_end = max(0, lower - 5), min(end, upper + 5)
+        offset, audio_end = max(0, audio_start, lower - 5), min(end, upper + 5)
         path = out / "audio" / f"chunk_{position:04d}.wav"
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -150,24 +184,40 @@ def _audio_chunks(media: Path, out: Path, start: float, end: float, media_hash: 
 
 
 def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
-            duration: float | None = None, asr_model: str = ASR_MODEL) -> Path:
+            duration: float | None = None, asr_model: str = ASR_MODEL,
+            vision_model: str = DEFAULT_VISION_MODEL) -> Path:
+    total_started = time.monotonic()
     media, out = Path(media).resolve(), Path(out).resolve()
-    check_audio_job(out)
+    if vision_model != "off" and vision_model not in VISION_MODELS:
+        raise ValueError("vision_model must be off, 4b, 9b, or 35b.")
+    check_job(out)
     for binary in ("ffmpeg", "ffprobe"):
         if not shutil.which(binary):
             raise RuntimeError(f"{binary} is required. Install FFmpeg with: brew install ffmpeg")
     metadata = probe(media)
-    if not math.isfinite(start) or start < 0 or start >= metadata["duration"]:
-        raise ValueError("start must be within the audio duration.")
+    if not math.isfinite(start) or start < 0:
+        raise ValueError("start must be within the recording duration.")
     if duration is not None and (not math.isfinite(duration) or duration <= 0):
         raise ValueError("duration must be positive.")
+    audio_end = metadata["duration"]
+    audio_start = metadata.get("audio_start", 0)
+    video_metadata = probe_video(media) if vision_model != "off" else None
+    if video_metadata is not None:
+        metadata = {**metadata, "duration": max(audio_end, video_metadata["end"])}
+    if start >= metadata["duration"]:
+        raise ValueError("start must be within the recording duration.")
     end = metadata["duration"] if duration is None else min(metadata["duration"], start + duration)
+    config = ({"schema_version": VIDEO_EVIDENCE_VERSION, "pipeline": "audio_video",
+               "vision_model": vision_model} if video_metadata is not None else AUDIO_CONFIG)
     media_hash = sha256_file(media)
     out.mkdir(parents=True, exist_ok=True)
-    write_json(out / "extraction-config.json", AUDIO_CONFIG)
+    write_json(out / "extraction-config.json", config)
     started = time.monotonic()
-    chunks = _audio_chunks(media, out, start, end, media_hash)
-    asr = _worker(out, {"model": asr_model, "language": language, "items": chunks})
+    asr_start, asr_end = max(start, audio_start), min(end, audio_end)
+    chunks = (_audio_chunks(media, out, asr_start, asr_end, media_hash, audio_start)
+              if asr_start < asr_end else [])
+    asr = (_worker(out, {"model": asr_model, "language": language, "items": chunks})
+           if chunks else {"items": []})
     transcribed = stitch_segments(asr["items"])
     warnings = [(segment["id"], description) for segment in transcribed
                 for description in transcription_warnings(segment)]
@@ -180,7 +230,7 @@ def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
                           "clip_start": start, "clip_end": end},
                 "segments": segments}
     write_json(out / "evidence.json", evidence)
-    write_json(out / "extraction-diagnostics.json", {
+    diagnostics = {
         "schema_version": 1, "evidence_fingerprint": fingerprint(evidence),
         "models": {"asr": asr_model},
         "segments": [{key: segment[key] for key in ("id", "words", "diagnostics")}
@@ -188,8 +238,50 @@ def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
         "warnings": [{"id": f"issue_{position:04d}", "description": description,
                       "evidence_ids": [identifier]}
                      for position, (identifier, description) in enumerate(warnings)],
-    })
-    write_json(out / "extraction-timings.json",
-               {"scope": "current extraction invocation",
-                "audio_asr_seconds": time.monotonic() - started})
+    }
+    timings = {"scope": "current extraction invocation",
+               "audio_asr_seconds": time.monotonic() - started}
+    write_json(out / "extraction-diagnostics.json", diagnostics)
+    write_json(out / "extraction-timings.json", timings)
+    if video_metadata is not None:
+        vision_started = time.monotonic()
+        model = VISION_MODELS[vision_model]
+        diagnostics["models"]["vision"] = {"preset": vision_model, **model}
+        try:
+            selection = select_frames(media, out, start, end, media_hash, metadata=video_metadata)
+            diagnostics["selection"] = selection["diagnostics"]
+            visual_result = (_vision_worker(out, {**model, "items": selection["items"]})
+                             if selection["items"] else {"items": [], "diagnostics": {
+                                 "status": "no_frames", "fresh_items": 0, "cached_items": 0}})
+            visuals = []
+            for item in visual_result["items"]:
+                status = item["diagnostics"]["status"]
+                content = {**item["content"]}
+                if status == "incomplete":
+                    # Failure explanations stay local; the clean status is sufficient evidence.
+                    content["unreadable"] = []
+                    descriptions = ["Не удалось получить корректное описание кадра."]
+                else:
+                    descriptions = content["unreadable"]
+                visuals.append({"id": item["id"], "timestamp": item["timestamp"],
+                                "status": status, **content})
+                for description in descriptions:
+                    diagnostics["warnings"].append({
+                        "id": f"issue_{len(diagnostics['warnings']):04d}",
+                        "description": description, "evidence_ids": [item["id"]],
+                    })
+            evidence.update(schema_version=VIDEO_EVIDENCE_VERSION, visuals=visuals)
+            diagnostics["vision"] = visual_result["diagnostics"]
+            diagnostics["visuals"] = [{key: value for key, value in item.items() if key != "content"}
+                                      for item in visual_result["items"]]
+            diagnostics["evidence_fingerprint"] = fingerprint(evidence)
+            write_json(out / "evidence.json", evidence)
+        except Exception as error:
+            diagnostics["vision"] = {"status": "failed", "error": str(error)}
+            raise
+        finally:
+            timings.update(vision_seconds=time.monotonic() - vision_started,
+                           total_seconds=time.monotonic() - total_started)
+            write_json(out / "extraction-diagnostics.json", diagnostics)
+            write_json(out / "extraction-timings.json", timings)
     return out / "evidence.json"

@@ -177,7 +177,7 @@ def test_extract_forwards_audio_options_without_writing(monkeypatch, tmp_path, m
     assert main(["extract", media, "--out", str(out), "--start", "30",
                  "--duration", "60", "--language", "ru"]) == 0
     extract.assert_called_once_with(
-        cli.Path(media), out, language="ru", start=30, duration=60)
+        cli.Path(media), out, language="ru", start=30, duration=60, vision_model="35b")
     assert not out.exists()
 
 
@@ -195,8 +195,9 @@ def test_removed_options_are_rejected_before_work(tmp_path, command, flag):
     assert not (tmp_path / "job").exists()
 
 
-def test_doctor_checks_only_audio_notes_and_render_dependencies(monkeypatch, capsys):
-    expected = {"httpx", "jwt", "pydantic", "pymupdf", "mlx", "mlx_whisper"}
+def test_doctor_checks_audio_vision_notes_and_render_dependencies(monkeypatch, capsys):
+    expected = {"httpx", "jwt", "pydantic", "pymupdf", "mlx", "mlx_whisper",
+                "mlx_vlm", "numpy", "cv2", "PIL"}
     monkeypatch.setattr(cli.importlib.util, "find_spec",
                         lambda name: SimpleNamespace() if name in expected else None)
     monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -212,4 +213,24 @@ def test_doctor_smoke_runs_only_transcription(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "shad_helper.extraction", SimpleNamespace(extract=extract))
     assert main(["doctor", "--smoke", "lecture.wav"]) == 0
     extract.assert_called_once_with(cli.Path("lecture.wav"), cli.Path(".shad-helper/smoke"),
-                                    duration=30)
+                                    duration=30, vision_model="off")
+
+
+@pytest.mark.parametrize("model", ["4b", "9b", "35b", "off"])
+def test_extract_forwards_vision_model(monkeypatch, tmp_path, model):
+    extract = Mock(return_value=tmp_path / "evidence.json")
+    monkeypatch.setitem(sys.modules, "shad_helper.extraction", SimpleNamespace(extract=extract))
+    assert main(["extract", "lecture.mp4", "--out", str(tmp_path),
+                 "--vision-model", model]) == 0
+    assert extract.call_args.kwargs["vision_model"] == model
+
+
+def test_unknown_vision_model_is_rejected_before_work(monkeypatch, tmp_path):
+    extract = Mock()
+    monkeypatch.setitem(sys.modules, "shad_helper.extraction", SimpleNamespace(extract=extract))
+    with pytest.raises(SystemExit) as caught:
+        main(["extract", "lecture.mp4", "--out", str(tmp_path / "job"),
+              "--vision-model", "unknown"])
+    assert caught.value.code == 2
+    extract.assert_not_called()
+    assert not (tmp_path / "job").exists()

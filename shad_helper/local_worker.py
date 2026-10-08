@@ -3,12 +3,12 @@
 import argparse
 from pathlib import Path
 
-from .jobs import check_audio_job, checkpoint, read_json, sha256_file, write_json
+from .jobs import check_job, checkpoint, read_json, sha256_file, write_json
 
 
 def run(request: dict) -> dict:
     job = Path(request["job"])
-    check_audio_job(job)
+    check_job(job)
     model_id = request["model"]
 
     def process(item):

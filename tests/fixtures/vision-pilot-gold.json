@@ -1,0 +1,582 @@
+{
+  "version": 1,
+  "purpose": "Small independent source-frame pilot reference; not a lecture-wide quality certification.",
+  "annotation_method": "Assistant directly inspected native FFmpeg screenshots at fixed timestamps before receiving any target model output or frame-selector output. No target model output used to define references. Not independently human-adjudicated.",
+  "coverage_limit": "Three fixed samples in each contiguous 20-second interval. Content between sampled instants has not been exhaustively annotated; interval-level 95 percent coverage cannot be certified from this reference alone.",
+  "scoring": "Review semantic coverage and mathematical equivalence manually; group by category and report critical omissions. Excluded unreadable items are not reference truths. Do not infer exact first-appearance timestamps from sampled observations.",
+  "cases": [
+    {
+      "id": "stress-test",
+      "source_filename": "16-09-2026 Лекция - Леша Толстиков - Введение в алгоритмы и структуры данных.mp4",
+      "interval_start_seconds": 2005,
+      "interval_end_seconds": 2025,
+      "inspected_timestamps_seconds": [
+        2005,
+        2015,
+        2025
+      ],
+      "medium": "physical_whiteboard",
+      "units": [
+        {
+          "id": "stress-test-01",
+          "category": "diagram",
+          "truth": "Diagram title is Stresstest. Labels include yours, slow! and correct, generator, checker, and testset.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            2005,
+            2015,
+            2025
+          ]
+        },
+        {
+          "id": "stress-test-02",
+          "category": "diagram",
+          "truth": "Two arrows from the left, from yours and slow! and correct, point into the central rectangular loop block.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            2005,
+            2015,
+            2025
+          ]
+        },
+        {
+          "id": "stress-test-03",
+          "category": "diagram",
+          "truth": "The generator label is above-right of the central block and points into it; the pale green checker label is to its right and has a leftward arrow into it.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            2005,
+            2015,
+            2025
+          ]
+        },
+        {
+          "id": "stress-test-04",
+          "category": "diagram",
+          "truth": "testset is written beneath the central block; a downward arrow points from that area to the pale green source + testset submission line.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            2005,
+            2015,
+            2025
+          ]
+        },
+        {
+          "id": "stress-test-05",
+          "category": "diagram",
+          "truth": "A separate red box at upper right contains verdict labels OK, WA, and TL separated by vertical bars.",
+          "critical": false,
+          "observed_timestamps_seconds": [
+            2005,
+            2015,
+            2025
+          ]
+        },
+        {
+          "id": "stress-test-06",
+          "category": "definition",
+          "truth": "The board lists 6 contests with 4–6 problems in each.",
+          "critical": false,
+          "observed_timestamps_seconds": [
+            2005,
+            2015,
+            2025
+          ]
+        }
+      ],
+      "uncertainty_and_exclusions": [
+        "The pale green submission line is low contrast; exact punctuation and any leading sign are excluded.",
+        "Administrative details outside the listed references are visible but not exhaustively annotated.",
+        "There are no content changes among the three inspected samples."
+      ]
+    },
+    {
+      "id": "linear-regression",
+      "source_filename": "22-09-2026 Лекция - Никита Волков - Линейная регрессия.mp4",
+      "interval_start_seconds": 1661,
+      "interval_end_seconds": 1681,
+      "inspected_timestamps_seconds": [
+        1661,
+        1671,
+        1681
+      ],
+      "medium": "two_physical_whiteboards",
+      "units": [
+        {
+          "id": "linear-regression-01",
+          "category": "formula",
+          "truth": "\\mathcal M=\\{y:\\mathbb R^d\\to\\mathbb R\\mid y(x)=x^T\\theta,\\ \\theta\\in\\mathbb R^d\\}.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            1661,
+            1671,
+            1681
+          ]
+        },
+        {
+          "id": "linear-regression-02",
+          "category": "definition",
+          "truth": "The task is to estimate theta; theta denotes the model parameters.",
+          "critical": false,
+          "observed_timestamps_seconds": [
+            1661,
+            1671,
+            1681
+          ]
+        },
+        {
+          "id": "linear-regression-03",
+          "category": "formula",
+          "truth": "To include an intercept set x_1=1 for every object; then \\theta_1 is the shift.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            1661,
+            1671,
+            1681
+          ]
+        },
+        {
+          "id": "linear-regression-04",
+          "category": "formula",
+          "truth": "For a new object x, the prediction is \\hat y(x)=x^T\\hat\\theta.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            1661,
+            1671,
+            1681
+          ]
+        },
+        {
+          "id": "linear-regression-05",
+          "category": "formula",
+          "truth": "The squared loss is L(y,z)=(y-z)^2.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            1661,
+            1671,
+            1681
+          ]
+        },
+        {
+          "id": "linear-regression-06",
+          "category": "formula",
+          "truth": "Least squares minimizes \\sum_{i=1}^n L(y_i,\\hat y(X_i))=\\sum_{i=1}^n(y_i-\\hat y(X_i))^2=\\|y-X\\theta\\|^2 over \\theta\\in\\mathbb R^d.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            1661,
+            1671,
+            1681
+          ]
+        },
+        {
+          "id": "linear-regression-07",
+          "category": "formula",
+          "truth": "y=(y_1,\\ldots,y_n)^T, X=(x_{ij})_{n\\times d}, and \\theta=(\\theta_1,\\ldots,\\theta_d)^T.",
+          "critical": false,
+          "observed_timestamps_seconds": [
+            1661,
+            1681
+          ]
+        },
+        {
+          "id": "linear-regression-08",
+          "category": "formula",
+          "truth": "For f:\\mathbb R^d\\to\\mathbb R, \\partial f/\\partial x=(\\partial f/\\partial x_1,\\ldots,\\partial f/\\partial x_d) is written as a row.",
+          "critical": false,
+          "observed_timestamps_seconds": [
+            1661,
+            1681
+          ]
+        },
+        {
+          "id": "linear-regression-09",
+          "category": "formula",
+          "truth": "\\nabla f is written as a column with entries \\partial f/\\partial x_1 through \\partial f/\\partial x_d.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            1681
+          ]
+        }
+      ],
+      "uncertainty_and_exclusions": [
+        "At 1661 the board reads only nabla f = with a blank right-hand side. Do not backdate the completed gradient column from 1681.",
+        "At 1671 the lecturer occludes much of the right-board vector-derivative content.",
+        "Some training-sample symbols are ambiguous in capitalization; evaluate the referenced regression equations semantically."
+      ]
+    },
+    {
+      "id": "gaussian-mle",
+      "source_filename": "29-09-2026 Лекция - Никита Волков - Логистическая регрессия.mp4",
+      "interval_start_seconds": 5029,
+      "interval_end_seconds": 5049,
+      "inspected_timestamps_seconds": [
+        5029,
+        5039,
+        5049
+      ],
+      "medium": "two_physical_whiteboards",
+      "units": [
+        {
+          "id": "gaussian-mle-01",
+          "category": "definition",
+          "truth": "Maximum likelihood is introduced for iid X_1,\\ldots,X_n with distribution P_\\theta in a parameterized family indexed by \\theta\\in\\mathbb R^d.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5029,
+            5039,
+            5049
+          ]
+        },
+        {
+          "id": "gaussian-mle-02",
+          "category": "definition",
+          "truth": "The family is assumed either continuous or discrete; p_\\theta(x) denotes a density in the continuous case and P_\\theta(X=x) in the discrete case.",
+          "critical": false,
+          "observed_timestamps_seconds": [
+            5029,
+            5039,
+            5049
+          ]
+        },
+        {
+          "id": "gaussian-mle-03",
+          "category": "formula",
+          "truth": "L_X(\\theta)=\\prod_{i=1}^n p_\\theta(X_i), treated as a function of \\theta.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5029,
+            5039,
+            5049
+          ]
+        },
+        {
+          "id": "gaussian-mle-04",
+          "category": "formula",
+          "truth": "\\hat\\theta=\\operatorname*{argmax}_{\\theta} L_X(\\theta).",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5029,
+            5039,
+            5049
+          ]
+        },
+        {
+          "id": "gaussian-mle-05",
+          "category": "formula",
+          "truth": "For X_1,\\ldots,X_n\\sim N(a,\\sigma^2), \\theta=(a,\\sigma) and p_\\theta(x)=\\frac{1}{\\sqrt{2\\pi\\sigma^2}}\\exp[-(x-a)^2/(2\\sigma^2)].",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5029,
+            5039,
+            5049
+          ]
+        },
+        {
+          "id": "gaussian-mle-06",
+          "category": "formula",
+          "truth": "L_X(\\theta)=(2\\pi\\sigma^2)^{-n/2}\\exp[-\\frac{1}{2\\sigma^2}\\sum_{i=1}^n(X_i-a)^2].",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5029,
+            5039,
+            5049
+          ]
+        },
+        {
+          "id": "gaussian-mle-07",
+          "category": "formula",
+          "truth": "\\ell_X(\\theta)=\\log L_X(\\theta)=-\\frac n2\\log(2\\pi)-n\\log\\sigma-\\frac{1}{2\\sigma^2}\\sum_{i=1}^n(X_i-a)^2.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5029,
+            5039,
+            5049
+          ]
+        },
+        {
+          "id": "gaussian-mle-08",
+          "category": "formula",
+          "truth": "\\frac{\\partial\\ell_X(\\theta)}{\\partial a}=\\frac{1}{\\sigma^2}\\sum_{i=1}^n(X_i-a)=0.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5029,
+            5039,
+            5049
+          ]
+        },
+        {
+          "id": "gaussian-mle-09",
+          "category": "formula",
+          "truth": "\\hat a=\\bar X=\\frac1n\\sum_{i=1}^n X_i.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5029,
+            5039,
+            5049
+          ]
+        },
+        {
+          "id": "gaussian-mle-10",
+          "category": "formula",
+          "truth": "\\frac{\\partial\\ell_X(\\theta)}{\\partial\\sigma}=-\\frac n\\sigma+\\frac{1}{\\sigma^3}\\sum_{i=1}^n(X_i-a)^2=0.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5029,
+            5039,
+            5049
+          ]
+        },
+        {
+          "id": "gaussian-mle-11",
+          "category": "formula",
+          "truth": "\\hat\\sigma^2=\\frac1n\\sum_{i=1}^n(X_i-\\bar X)^2=S^2.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5029,
+            5039,
+            5049
+          ]
+        },
+        {
+          "id": "gaussian-mle-12",
+          "category": "diagram",
+          "truth": "The lower-left diagram contains three overlapping bell-shaped density curves, with peaks ordered left to right and a marked common x on the horizontal axis.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5029,
+            5039,
+            5049
+          ]
+        },
+        {
+          "id": "gaussian-mle-13",
+          "category": "diagram",
+          "truth": "At the marked x, the diagram compares the heights of the different density curves; the curves have p_theta-index labels and the marked heights have L_x(theta-index) labels.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5029,
+            5039,
+            5049
+          ]
+        },
+        {
+          "id": "gaussian-mle-14",
+          "category": "formula",
+          "truth": "Consistency is expressed as \\hat\\theta\\xrightarrow{P}\\theta, equivalently P_\\theta(\\|\\hat\\theta-\\theta\\|>\\varepsilon)\\to0 as n\\to\\infty.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5039
+          ]
+        }
+      ],
+      "uncertainty_and_exclusions": [
+        "The exact subscripts next to all three density and likelihood labels in the small diagram are not reliable enough for exact transcription and are excluded.",
+        "The third property at upper-right is blank at 5029 and 5039; at 5049 it is still being written. Its completion is excluded and must not be invented.",
+        "The rightmost text is partially occluded at 5029 and 5049."
+      ]
+    },
+    {
+      "id": "notebook-theory",
+      "source_filename": "15-09-2026 Семинар - Никита Волков - Задачи машинного обучения.mp4",
+      "interval_start_seconds": 4969,
+      "interval_end_seconds": 4989,
+      "inspected_timestamps_seconds": [
+        4969,
+        4979,
+        4989
+      ],
+      "medium": "notebook_theory_with_camera_sidebar",
+      "units": [
+        {
+          "id": "notebook-theory-01",
+          "category": "definition",
+          "truth": "The section title is Обучение и применение моделей.",
+          "critical": false,
+          "observed_timestamps_seconds": [
+            4969,
+            4979
+          ]
+        },
+        {
+          "id": "notebook-theory-02",
+          "category": "formula",
+          "truth": "\\mathcal M=\\{y:\\mathbb R^d\\to\\mathcal Y\\} is the family of candidate models.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            4969,
+            4979
+          ]
+        },
+        {
+          "id": "notebook-theory-03",
+          "category": "definition",
+          "truth": "Обучение (оценка, вывод) is selecting a specific model \\hat y\\in\\mathcal M from the training sample.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            4969,
+            4979,
+            4989
+          ]
+        },
+        {
+          "id": "notebook-theory-04",
+          "category": "definition",
+          "truth": "Метод обучения is the particular way of selecting \\hat y\\in\\mathcal M.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            4969,
+            4979,
+            4989
+          ]
+        },
+        {
+          "id": "notebook-theory-05",
+          "category": "definition",
+          "truth": "The loss L(y,z) penalizes predicting z\\in\\mathcal Y instead of the correct answer y\\in\\mathcal Y.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            4969,
+            4979,
+            4989
+          ]
+        },
+        {
+          "id": "notebook-theory-06",
+          "category": "formula",
+          "truth": "\\sum_{i=1}^n L(Y_i,y(X_i))\\longrightarrow\\min_{y\\in\\mathcal M}.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            4969,
+            4979,
+            4989
+          ]
+        },
+        {
+          "id": "notebook-theory-07",
+          "category": "formula",
+          "truth": "The apartment-price example has true price 10 million, predicted price 12 million, and squared penalty (10-12)^2=4.",
+          "critical": false,
+          "observed_timestamps_seconds": [
+            4969,
+            4979,
+            4989
+          ]
+        },
+        {
+          "id": "notebook-theory-08",
+          "category": "definition",
+          "truth": "A new subsection 3.1 Виды методов обучения and the heading 1. Параметрический подход appear at the bottom; model families are specified through parameters.",
+          "critical": false,
+          "observed_timestamps_seconds": [
+            4989
+          ]
+        }
+      ],
+      "uncertainty_and_exclusions": [
+        "A small downward scroll occurs between inspected frames. The model-family definition has left the viewport by 4989.",
+        "Only the introductory heading and sentence of the parametric approach are visible by 4989; no later parameterization formula is visible.",
+        "There is no visible code in these samples; this case cannot validate code exclusion."
+      ]
+    },
+    {
+      "id": "classification-slide",
+      "source_filename": "15-09-2026 Семинар - Никита Волков - Задачи машинного обучения.mp4",
+      "interval_start_seconds": 1649,
+      "interval_end_seconds": 1669,
+      "inspected_timestamps_seconds": [
+        1649,
+        1659,
+        1669
+      ],
+      "medium": "slide_with_camera_sidebar",
+      "units": [
+        {
+          "id": "classification-slide-01",
+          "category": "definition",
+          "truth": "The slide title is А ты кто?",
+          "critical": false,
+          "observed_timestamps_seconds": [
+            1649,
+            1659,
+            1669
+          ]
+        },
+        {
+          "id": "classification-slide-02",
+          "category": "definition",
+          "truth": "The slide asks: Перед нами домашнее животное. Кто это — собака или кот?",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            1649,
+            1659,
+            1669
+          ]
+        },
+        {
+          "id": "classification-slide-03",
+          "category": "diagram",
+          "truth": "An illustration places a cat on the left and a dog on the right, with a green VS circle between them.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            1649,
+            1659,
+            1669
+          ]
+        }
+      ],
+      "uncertainty_and_exclusions": [
+        "The small upper-left camera feed repeats the slide and should not create duplicate evidence.",
+        "No formulas or algorithm definitions are displayed in this sample."
+      ]
+    },
+    {
+      "id": "notebook-code-exclusion",
+      "source_filename": "22-09-2026 Лекция - Никита Волков - Линейная регрессия.mp4",
+      "interval_start_seconds": 5015,
+      "interval_end_seconds": 5016,
+      "inspected_timestamps_seconds": [
+        5015
+      ],
+      "medium": "notebook_code_and_theory_with_camera_sidebar",
+      "units": [
+        {
+          "id": "notebook-code-exclusion-01",
+          "category": "definition",
+          "truth": "When encoding categorical data, one category is excluded. Do not add an unstated justification.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5015
+          ]
+        },
+        {
+          "id": "notebook-code-exclusion-02",
+          "category": "definition",
+          "truth": "The encoding transformation is fitted on training data, and must not be fitted on test data. The warning appears in a code comment; retain its theoretical meaning without copying the code.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5015
+          ]
+        },
+        {
+          "id": "notebook-code-exclusion-03",
+          "category": "definition",
+          "truth": "The next section combines real-valued features with encoded categorical features.",
+          "critical": true,
+          "observed_timestamps_seconds": [
+            5015
+          ]
+        }
+      ],
+      "forbidden_code_snippets": [
+        "encoder = OneHotEncoder",
+        "train_cat =",
+        "array([[",
+        "encoder.categories_"
+      ],
+      "uncertainty_and_exclusions": [
+        "Only the single specified frame has been inspected; this is a negative code-transcription check, not a temporal coverage check.",
+        "Do not copy the displayed binary arrays, category arrays, or Python statements."
+      ]
+    }
+  ]
+}

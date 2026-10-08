@@ -12,6 +12,8 @@ from pathlib import Path
 
 
 def parser() -> argparse.ArgumentParser:
+    from .vision_config import DEFAULT_VISION_MODEL, VISION_MODELS
+
     result = argparse.ArgumentParser(description="Local Russian lecture extraction and LaTeX notes")
     result.add_argument("--state-dir", type=Path, default=Path(".shad-helper/auth"),
                         help="App-owned ChatGPT credentials (default: .shad-helper/auth)")
@@ -22,11 +24,14 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--smoke", type=Path, help="Transcribe a thirty-second audio or video excerpt")
     login = commands.add_parser("login", help="Authorize this local app to use your ChatGPT plan")
     extract = commands.add_parser("extract", help="Extract resumable local lecture evidence")
-    extract.add_argument("media", type=Path, help="Audio file or video soundtrack")
+    extract.add_argument("media", type=Path, help="Audio file or lecture video")
     extract.add_argument("--out", type=Path, required=True)
     extract.add_argument("--start", type=float, default=0)
     extract.add_argument("--duration", type=float, help="Process a pilot interval, in seconds")
     extract.add_argument("--language", default="ru")
+    extract.add_argument("--vision-model", choices=(*VISION_MODELS, "off"),
+                         default=DEFAULT_VISION_MODEL,
+                         help="Local video model: 35b (default), 9b, 4b, or off for audio only")
     notes = commands.add_parser("notes", help="Generate notes or export/import a ChatGPT handoff")
     notes.add_argument("job", type=Path)
     mode = notes.add_mutually_exclusive_group()
@@ -52,7 +57,7 @@ def doctor(state_dir: Path = Path(".shad-helper/auth"), *, proxy: str | None = N
         "httpx", "jwt", "pydantic", "pymupdf")}
     # find_spec on a dotted name imports its parent, so check MLX top-level only.
     packages.update({name: importlib.util.find_spec(name) is not None
-                     for name in ("mlx", "mlx_whisper")})
+                     for name in ("mlx", "mlx_whisper", "mlx_vlm", "numpy", "cv2", "PIL")})
     tools = {name: shutil.which(name) for name in ("ffmpeg", "ffprobe", "latexmk", "lualatex")}
     openai = {"status": "not_checked", "models": [], "default_model": "gpt-6-astra",
               "default_model_available": None}
@@ -100,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
             healthy = doctor(args.state_dir, proxy=args.openai_proxy)
             if args.smoke:
                 from .extraction import extract
-                extract(args.smoke, Path(".shad-helper/smoke"), duration=30)
+                extract(args.smoke, Path(".shad-helper/smoke"), duration=30, vision_model="off")
             return 0 if healthy else 1
         if args.command == "login":
             from .auth import login
@@ -109,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "extract":
             from .extraction import extract
             print(extract(args.media, args.out, language=args.language,
-                          start=args.start, duration=args.duration))
+                          start=args.start, duration=args.duration, vision_model=args.vision_model))
         elif args.command == "notes":
             from .notes import generate_notes
             print(generate_notes(args.job, args.state_dir, imported=args.imported,
@@ -118,9 +123,9 @@ def main(argv: list[str] | None = None) -> int:
             from .rendering import render
             print(render(args.job))
         elif args.command == "review":
-            from .jobs import check_audio_job, read_json, validate_audio_evidence
-            check_audio_job(args.job)
-            validate_audio_evidence(read_json(args.job / "evidence.json"))
+            from .jobs import check_job, read_json, validate_evidence
+            check_job(args.job)
+            validate_evidence(read_json(args.job / "evidence.json"))
             if args.resolve:
                 if not args.resolution:
                     raise ValueError("--resolve requires --resolution describing your correction")

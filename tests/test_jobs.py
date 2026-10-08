@@ -1,14 +1,27 @@
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 from shad_helper.jobs import (
+    AUDIO_CONFIG,
+    check_job,
     checkpoint,
     evidence_index,
     read_json,
     validate_audio_evidence,
+    validate_evidence,
     write_json,
 )
+
+
+def video_evidence():
+    return {"schema_version": 4, "title": "Лекция", "media": {"duration": 120},
+            "segments": [{"id": "s1", "start": 0, "end": 10, "text": "Теорема"}],
+            "visuals": [{"id": "frame_1", "timestamp": 65, "status": "complete",
+                         "kind": "whiteboard", "text": "Определение", "formulas": ["y=x"],
+                         "diagrams": [{"description": "Стрелка", "labels": ["A", "B"],
+                                       "relationships": ["A → B"]}], "unreadable": []}]}
 
 
 class CheckpointTests(unittest.TestCase):
@@ -63,6 +76,59 @@ class CheckpointTests(unittest.TestCase):
                       {"schema_version": 3, "title": "Лекция", "media": {}, "segments": {}}):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 validate_audio_evidence(value)
+
+    def test_visual_evidence_and_timestamps_are_indexed(self):
+        evidence = video_evidence()
+        self.assertEqual(validate_evidence(evidence), evidence)
+        self.assertEqual(evidence_index(evidence),
+                         {"s1": "Аудио 00:00:00", "frame_1": "Видео 00:01:05"})
+        evidence["visuals"][0]["status"] = "incomplete"
+        self.assertEqual(validate_evidence(evidence), evidence)
+
+    def test_visual_evidence_rejects_private_fields_and_bad_content(self):
+        for key, value in (("image", "/local/frame.png"), ("diagnostics", {}),
+                           ("timestamp", float("nan")), ("timestamp", -1),
+                           ("status", "unknown"), ("kind", "unknown"),
+                           ("formulas", "y=x"), ("unreadable", [None]),
+                           ("diagrams", [{"description": "diagram"}])):
+            evidence = video_evidence()
+            evidence["visuals"][0][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                validate_evidence(evidence)
+        for key in ("diagnostics", "models", "issues"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_evidence({**video_evidence(), key: {}})
+
+    def test_visual_and_speech_ids_cannot_collide(self):
+        evidence = video_evidence()
+        for identifier in ("s1", "frame_1"):
+            changed = deepcopy(evidence)
+            changed["visuals"].append({**changed["visuals"][0], "id": identifier})
+            with self.subTest(identifier=identifier), self.assertRaisesRegex(ValueError, "unique"):
+                validate_evidence(changed)
+
+    def test_supported_job_versions_allow_resume_and_model_switching(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            job = Path(temporary)
+            video = video_evidence()
+            audio = {key: value for key, value in video.items() if key != "visuals"}
+            audio["schema_version"] = 3
+            for config in (AUDIO_CONFIG, *({"schema_version": 4, "pipeline": "audio_video",
+                                           "vision_model": model}
+                                          for model in ("4b", "9b", "35b"))):
+                for evidence in (audio, video):
+                    with self.subTest(config=config, version=evidence["schema_version"]):
+                        write_json(job / "extraction-config.json", config)
+                        write_json(job / "evidence.json", evidence)
+                        check_job(job)
+
+    def test_unsupported_video_preset_in_job_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            job = Path(temporary)
+            write_json(job / "extraction-config.json",
+                       {"schema_version": 4, "pipeline": "audio_video", "vision_model": "unknown"})
+            with self.assertRaisesRegex(ValueError, "Unsupported job format"):
+                check_job(job)
 
 
 if __name__ == "__main__":

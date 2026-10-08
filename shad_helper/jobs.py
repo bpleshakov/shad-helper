@@ -2,29 +2,42 @@
 
 import hashlib
 import json
+import math
 import os
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 EVIDENCE_VERSION = 3
+VIDEO_EVIDENCE_VERSION = 4
 AUDIO_CONFIG = {"schema_version": EVIDENCE_VERSION, "pipeline": "audio"}
 
 
-def check_audio_job(job: Path) -> None:
-    """Allow empty/new jobs or resumable audio jobs, without migrating old files."""
+def check_job(job: Path) -> None:
+    """Allow new jobs and supported audio/video jobs, without adopting older formats."""
     job = Path(job)
     config = job / "extraction-config.json"
     if config.exists():
-        if read_json(config) != AUDIO_CONFIG:
-            raise ValueError("Unsupported job format; use a new output directory for audio extraction.")
+        saved = read_json(config)
+        video_config = (isinstance(saved, dict)
+                        and set(saved) == {"schema_version", "pipeline", "vision_model"}
+                        and saved["schema_version"] == VIDEO_EVIDENCE_VERSION
+                        and saved["pipeline"] == "audio_video"
+                        and saved["vision_model"] in ("4b", "9b", "35b"))
+        if saved != AUDIO_CONFIG and not video_config:
+            raise ValueError("Unsupported job format; use a new output directory for extraction.")
     elif job.exists() and any(job.iterdir()):
         evidence = job / "evidence.json"
         if not evidence.is_file():
-            raise ValueError("Existing job requires a new output directory for audio extraction.")
+            raise ValueError("Existing job requires a new output directory for extraction.")
     evidence = job / "evidence.json"
     if evidence.exists():
-        validate_audio_evidence(read_json(evidence))
+        validate_evidence(read_json(evidence))
+
+
+def check_audio_job(job: Path) -> None:
+    """Compatibility entry point for callers checking an existing audio job."""
+    check_job(job)
 
 
 def validate_audio_evidence(evidence: dict) -> dict:
@@ -36,6 +49,50 @@ def validate_audio_evidence(evidence: dict) -> dict:
                    or set(segment) != {"id", "start", "end", "text"}
                    for segment in evidence["segments"])):
         raise ValueError("Unsupported evidence format; use a new output directory for audio extraction.")
+    return evidence
+
+
+def validate_evidence(evidence: dict) -> dict:
+    if isinstance(evidence, dict) and evidence.get("schema_version") == EVIDENCE_VERSION:
+        return validate_audio_evidence(evidence)
+    message = "Unsupported evidence format; use a new output directory for extraction."
+    if (not isinstance(evidence, dict)
+            or evidence.get("schema_version") != VIDEO_EVIDENCE_VERSION
+            or set(evidence) != {"schema_version", "title", "media", "segments", "visuals"}
+            or not isinstance(evidence["visuals"], list)):
+        raise ValueError(message)
+    validate_audio_evidence({**{key: value for key, value in evidence.items() if key != "visuals"},
+                             "schema_version": EVIDENCE_VERSION})
+    identifiers = [segment["id"] for segment in evidence["segments"]]
+    for visual in evidence["visuals"]:
+        if (not isinstance(visual, dict)
+                or set(visual) != {"id", "timestamp", "status", "kind", "text", "formulas",
+                                   "diagrams", "unreadable"}
+                or not isinstance(visual["id"], str) or not visual["id"]
+                or type(visual["timestamp"]) not in (int, float)
+                or not math.isfinite(visual["timestamp"]) or visual["timestamp"] < 0
+                or visual["status"] not in ("complete", "incomplete")
+                or visual["kind"] not in ("slides", "whiteboard", "notebook", "other")
+                or not isinstance(visual["text"], str)
+                or not isinstance(visual["diagrams"], list)):
+            raise ValueError(message)
+        for key in ("formulas", "unreadable"):
+            if (not isinstance(visual[key], list)
+                    or not all(isinstance(value, str) for value in visual[key])):
+                raise ValueError(message)
+        for diagram in visual["diagrams"]:
+            if (not isinstance(diagram, dict)
+                    or set(diagram) != {"description", "labels", "relationships"}
+                    or not isinstance(diagram["description"], str)
+                    or any(not isinstance(diagram[key], list)
+                           or not all(isinstance(value, str) for value in diagram[key])
+                           for key in ("labels", "relationships"))):
+                raise ValueError(message)
+        identifiers.append(visual["id"])
+    if not all(isinstance(identifier, str) and identifier for identifier in identifiers):
+        raise ValueError(message)
+    if len(set(identifiers)) != len(identifiers):
+        raise ValueError("Evidence IDs must be unique across speech and video.")
     return evidence
 
 
@@ -90,8 +147,10 @@ def checkpoint(job: Path, key: str, inputs: Any, action: Callable[[], Any]) -> A
 
 
 def evidence_index(evidence: dict) -> dict[str, str]:
-    return {segment["id"]: f"Аудио {timestamp(segment['start'])}"
-            for segment in evidence.get("segments", [])}
+    return {**{segment["id"]: f"Аудио {timestamp(segment['start'])}"
+               for segment in evidence.get("segments", [])},
+            **{visual["id"]: f"Видео {timestamp(visual['timestamp'])}"
+               for visual in evidence.get("visuals", [])}}
 
 
 def timestamp(seconds: float) -> str:
