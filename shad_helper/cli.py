@@ -50,7 +50,19 @@ def parser() -> argparse.ArgumentParser:
     anki.add_argument("--rebuild", action="store_true", help="Regenerate Anki notes from the PDF")
     anki.add_argument("--anki-collection", type=Path,
                       help="Anki collection.anki2 to read positions from (default: unique local profile)")
-    for command in (check, login, notes, anki):
+    run = commands.add_parser("run", help="Run extract, notes, render, and Anki for each recording")
+    run.add_argument("media", nargs="+", type=Path, help="Audio files or lecture videos, in order")
+    run.add_argument("--out", type=Path, required=True, help="Parent directory for separate jobs")
+    run.add_argument("--start", type=float, default=0)
+    run.add_argument("--duration", type=float, help="Process this interval length in each file")
+    run.add_argument("--language", default="ru")
+    run.add_argument("--vision-model", choices=(*VISION_MODELS, "off"),
+                     default=DEFAULT_VISION_MODEL,
+                     help="Local video model: 35b (default), 9b, 4b, or off for audio only")
+    run.add_argument("--rebuild", action="store_true", help="Regenerate notes and Anki responses")
+    run.add_argument("--anki-collection", type=Path,
+                     help="Anki collection.anki2 to read positions from (default: unique local profile)")
+    for command in (check, login, notes, anki, run):
         command.add_argument("--openai-proxy", default=argparse.SUPPRESS,
                              help="HTTP/HTTPS proxy URL for OpenAI requests")
     return result
@@ -150,6 +162,14 @@ def main(argv: list[str] | None = None) -> int:
             print(generate_anki(args.job, args.state_dir, pdf=args.pdf,
                                 rebuild=args.rebuild, proxy=args.openai_proxy,
                                 anki_collection=args.anki_collection))
+        elif args.command == "run":
+            from .pipeline import run_pipeline
+            completed = run_pipeline(args.media, args.out, args.state_dir,
+                                     language=args.language, start=args.start,
+                                     duration=args.duration, vision_model=args.vision_model,
+                                     rebuild=args.rebuild, proxy=args.openai_proxy,
+                                     anki_collection=args.anki_collection)
+            return 0 if completed else 1
         return 0
     except ModuleNotFoundError as exc:
         print(f"Missing dependency {exc.name}. Run: UV_CACHE_DIR=.cache/uv uv sync --extra local", file=sys.stderr)

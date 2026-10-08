@@ -143,7 +143,10 @@ def _prepare_notes(response, document, media_dir, identity, pdf_hash, *, start_p
 
 def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
                   rebuild: bool = False, proxy: str | None = None,
-                  anki_collection: Path | None = None, client=None) -> Path:
+                  anki_collection: Path | None = None, minimum_position: int = 1,
+                  client=None) -> Path:
+    if type(minimum_position) is not int or minimum_position < 1:
+        raise ValueError("minimum_position must be a positive integer")
     job = Path(job)
     source = Path(pdf) if pdf is not None else job / "notes" / "main.pdf"
     if not source.is_file():
@@ -191,7 +194,8 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
             # Generation and TeX compilation can take minutes. Read the allocation
             # cursor again immediately before packaging, including current WAL data.
             position_source = collection_position(Path(position_source["collection_path"]))
-            start_position = position_source["next_position"]
+            # Earlier packages in the same batch may not have been imported yet.
+            start_position = max(position_source["next_position"], minimum_position)
             for index, (note, source_note) in enumerate(zip(notes, provenance, strict=True)):
                 positions = {ordinal: start_position + index for ordinal in note["positions"]}
                 note["positions"] = positions

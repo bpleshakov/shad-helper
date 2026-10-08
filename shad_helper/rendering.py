@@ -37,7 +37,7 @@ _MATH_COMMANDS = set(
     "Leftrightarrow longrightarrow longleftarrow Longrightarrow Longleftrightarrow "
     "uparrow downarrow updownarrow iff implies forall exists nexists neg land lor "
     "wedge vee top bot perp parallel mid angle triangle square checkmark "
-    "ldots cdots vdots ddots dots dot ddot hat widehat tilde bar overline underline "
+    "ldots cdots vdots ddots dots dot ddot hat widehat tilde widetilde bar overline underline "
     "vec overrightarrow overbrace underbrace overset underset stackrel "
     "mathrm mathbf mathit mathsf mathtt mathcal mathbb mathscr boldsymbol "
     "operatorname text textrm textsf texttt textbf textit mathop limits nolimits "

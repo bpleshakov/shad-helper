@@ -29,6 +29,21 @@ def test_normalize_full_latex_with_internal_math_delimiters():
     assert normalize_latex(text) == text.replace("LATEX", "latex")
 
 
+@pytest.mark.parametrize(("source", "expected"), [
+    (r"\(\widetilde{x}\)", r"[$]\widetilde{x}[/$]"),
+    (r"\[\widetilde{AB}\]", r"[$$]\widetilde{AB}[/$$]"),
+    (r"[$]\widetilde{x}[/$]", r"[$]\widetilde{x}[/$]"),
+    (r"[$$]\widetilde{AB}[/$$]", r"[$$]\widetilde{AB}[/$$]"),
+])
+def test_normalize_preserves_widetilde(source, expected):
+    assert normalize_latex(source) == expected
+
+
+def test_normalize_rejects_unknown_command_with_supported_prefix():
+    with pytest.raises(ValueError, match="widetildeunknown"):
+        normalize_latex(r"[$]\widetildeunknown{x}[/$]")
+
+
 @pytest.mark.parametrize("source", [
     r"\(x", r"x\)", r"\[x\)", r"\(a\(b\)\)", r"\)x\(",
     "[$]x[/$$]", "[/latex]x[latex]", "[$]a[$$]b[/$$][/$]", "[$$] [/$$]",
@@ -149,8 +164,8 @@ def test_renderer_reports_failures_without_publishing_broken_media(tmp_path, mon
 )
 def test_real_russian_latex_and_matrix_render_with_snapshot_preamble(tmp_path):
     fields = [
-        r"[$]x\in\mathds{R},\quad x<2[/$]",
-        r"[$$]\text{Матрица } A=\begin{pmatrix}1&2\\[2pt]3&4\end{pmatrix}[/$$]",
+        r"[$]\widetilde{x}\in\mathds{R},\quad \widetilde{x}<2[/$]",
+        r"[$$]\text{Матрица } \widetilde{A}=\begin{pmatrix}1&2\\[2pt]3&4\end{pmatrix}[/$$]",
         r"[latex]Если \(x\in\mathbb{R}\), то \[x^2\geq 0.\][/latex]",
     ]
     escaped = [html.escape(field, quote=False) for field in fields]

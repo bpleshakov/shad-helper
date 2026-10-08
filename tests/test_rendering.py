@@ -320,7 +320,8 @@ class RenderingTests(unittest.TestCase):
 
     def test_norm_conditional_and_tilde_commands_are_supported(self):
         expressions = (r"w_j = \|x-x_{(j)}\|^{-1}",
-                       r"P(Y=1\mid X=x)", r"\tilde{x}=x-\bar{x}")
+                       r"P(Y=1\mid X=x)", r"\tilde{x}=x-\bar{x}",
+                       r"\widetilde{XY}=\widetilde{X}\widetilde{Y}")
         for expression in expressions:
             with self.subTest(expression=expression):
                 self.notes["chapters"][0]["blocks"][0]["content"] = r"Формула \(" + expression + r"\)."

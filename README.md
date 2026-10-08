@@ -36,6 +36,43 @@ With app-owned credentials and a configured OpenAI proxy, `doctor` also lists
 account-available models and reports default-model availability. It does not
 start login or generate notes. Local checks determine its exit status.
 
+## Run the complete pipeline
+
+After installing dependencies, signing in, and configuring the OpenAI proxy, run:
+
+```sh
+UV_CACHE_DIR=.cache/uv uv run shad-helper run lecture.mp4 --out jobs
+UV_CACHE_DIR=.cache/uv uv run shad-helper run 'Lecture 1.mp4' 'Lecture 2.mkv' --out jobs --vision-model 9b
+```
+
+Each file gets its own job under `--out`, named `<filename-stem>-<path-hash>`.
+The hash uses the resolved absolute input path, so recordings with identical names
+in different directories remain separate. Repeating the command with the same
+files and output directory reuses the same jobs, regardless of input order.
+Repeated paths or symlink aliases in one invocation are rejected before work starts.
+Audio files are also supported.
+
+Files run in the supplied order. For each file, `run` completes **extract → notes
+→ render → anki** before starting the next file. It prints the job directory and
+current stage; outputs include `JOB/notes/main.pdf` and `JOB/anki/deck.apkg`.
+An error stops that file's remaining stages and processing continues with the next
+file. A manual notes handoff also counts as an incomplete job, so an older PDF is
+never used in its place. The final summary reports completed/failed jobs, and the
+command exits with status 1 if any job failed.
+
+The extraction options `--start`, `--duration`, `--language`, and `--vision-model`
+apply to every input. `--rebuild` regenerates notes and Anki model responses;
+otherwise existing stage checkpoints are reused. Rerunning the full pipeline
+regenerates the editable TeX sources, so use the individual commands to retain
+manual TeX corrections. `--anki-collection` selects the local Anki profile, and
+`--openai-proxy` and the global `--state-dir` work as for individual commands.
+
+Each job produces its own Anki deck. Within one invocation, successive decks use
+non-overlapping position ranges even before import; all cards from one note still
+share a position. Each export also checks the live Anki allocation. Import the
+completed decks before starting a separate batch, since separate invocations do
+not reserve positions for each other.
+
 ## Extract lecture evidence
 
 Start with a representative ten-minute interval:
@@ -122,7 +159,7 @@ UV_CACHE_DIR=.cache/uv uv run shad-helper notes jobs/audio-lecture
 ```
 
 Alternatively, pass `--openai-proxy URL` before the command or after
-`doctor`/`login`/`notes`/`anki`. The flag overrides the environment variable.
+`doctor`/`login`/`notes`/`anki`/`run`. The flag overrides the environment variable.
 URL-encoded proxy credentials are supported; URLs are not saved or printed.
 Requests fail if the proxy is missing, invalid, or unavailable, without direct
 retries. Other proxy environment variables cannot bypass this setting.
@@ -349,8 +386,10 @@ Anki's allocation counter and the highest existing new-card position plus one.
 Later notes increment this position by one. Anki need not be running, but its
 collection must be readable; missing or ambiguous profiles require
 `--anki-collection`, and export never silently falls back to position 1.
-Positions reflect the collection at export time: import each deck before exporting
-the next one, and regenerate the package if new cards were added in between.
+Positions reflect the collection at export time: with separate `anki` commands,
+import each deck before exporting the next one. `run` keeps position ranges
+separate across decks in the same batch. Regenerate packages if new cards were
+added in between export and import.
 In Anki's deck options, choose **New card gather order: Ascending position** and **New card sort
 order: Order gathered**. Sibling burying and daily limits may postpone cards;
 reviews continue to use Anki's scheduling. See the

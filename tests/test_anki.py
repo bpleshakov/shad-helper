@@ -195,6 +195,47 @@ def test_positions_refresh_after_generation_and_latex_rendering(job, client, col
     assert (report["start_position"], report["end_position"]) == (4201, 4204)
 
 
+@pytest.mark.parametrize(("minimum_position", "expected_start"), [
+    (4000, 4201), (5000, 5000),
+])
+def test_position_floor_respects_refreshed_collection_without_changing_source(
+        job, client, collection_reader, minimum_position, expected_start):
+    initial = {**collection_reader.return_value, "max_position": 3882, "next_position": 3883}
+    latest = {**initial, "max_position": 4200, "next_position": 4201}
+    collection_reader.side_effect = [initial, latest]
+
+    package = anki.generate_anki(job, job / "auth", client=client,
+                                 minimum_position=minimum_position)
+
+    rows, _ = inspect_package(package)
+    by_note = {}
+    for guid, _, _, due, *_ in rows:
+        by_note.setdefault(guid, set()).add(due)
+    assert sorted(by_note.values(), key=min) == [
+        {position} for position in range(expected_start, expected_start + 4)]
+    report = read_json(job / "anki" / "report.json")
+    assert report["position_source"] == latest
+    assert report["position_source"]["next_position"] == 4201
+    assert (report["start_position"], report["end_position"]) == (
+        expected_start, expected_start + 3)
+    assert [set(note["positions"].values()) for note in report["notes"]] == [
+        {position} for position in range(expected_start, expected_start + 4)]
+    assert collection_reader.call_count == 2
+
+
+@pytest.mark.parametrize("minimum_position", [True, False, 0, -1, 1.5, "3", None])
+def test_invalid_position_floor_aborts_before_model_without_export(
+        job, client, collection_reader, minimum_position):
+    with pytest.raises(ValueError, match="minimum_position"):
+        anki.generate_anki(job, job / "auth", client=client,
+                           minimum_position=minimum_position)
+
+    client.complete.assert_not_called()
+    collection_reader.assert_not_called()
+    assert not (job / "anki").exists()
+    assert not (job / "checkpoints" / "anki.json").exists()
+
+
 def test_source_pdf_bytes_are_authoritative_and_frozen_for_model(job, client, tmp_path):
     original = write_pdf(tmp_path / "manual.pdf", "Manually corrected PDF")
     source_bytes = original.read_bytes()

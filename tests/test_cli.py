@@ -20,6 +20,54 @@ def isolated_environment(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("position", ["global", "local"])
+def test_run_forwards_multiple_files_and_stage_options(monkeypatch, tmp_path, position):
+    run = Mock(return_value=True)
+    monkeypatch.setitem(sys.modules, "shad_helper.pipeline", SimpleNamespace(run_pipeline=run))
+    state, out = tmp_path / "auth", tmp_path / "jobs"
+    files = [tmp_path / "Лекция 1.mp4", tmp_path / "Лекция 2.mkv"]
+    collection = tmp_path / "profile" / "collection.anki2"
+    proxy = "http://configured-proxy:8080"
+    arguments = ["--state-dir", str(state)]
+    if position == "global":
+        arguments.extend(["--openai-proxy", proxy])
+    arguments.extend(["run", *(str(file) for file in files), "--out", str(out),
+                      "--start", "30", "--duration", "60", "--language", "en",
+                      "--vision-model", "4b", "--rebuild", "--anki-collection", str(collection)])
+    if position == "local":
+        arguments.extend(["--openai-proxy", proxy])
+
+    assert main(arguments) == 0
+    run.assert_called_once_with(files, out, state, language="en", start=30, duration=60,
+                                vision_model="4b", rebuild=True, proxy=proxy,
+                                anki_collection=collection)
+
+
+@pytest.mark.parametrize("completed", [True, False])
+def test_run_defaults_and_batch_exit_status(monkeypatch, tmp_path, completed):
+    run = Mock(return_value=completed)
+    monkeypatch.setitem(sys.modules, "shad_helper.pipeline", SimpleNamespace(run_pipeline=run))
+    assert main(["run", "lecture.mp4", "--out", "jobs"]) == (0 if completed else 1)
+    run.assert_called_once_with([cli.Path("lecture.mp4")], cli.Path("jobs"),
+                                cli.Path(".shad-helper/auth"), language="ru", start=0,
+                                duration=None, vision_model="35b", rebuild=False,
+                                proxy=None, anki_collection=None)
+
+
+@pytest.mark.parametrize("arguments", [
+    ["run", "--out", "jobs"],
+    ["run", "lecture.mp4"],
+    ["run", "lecture.mp4", "--out", "jobs", "--vision-model", "unknown"],
+])
+def test_run_rejects_missing_inputs_output_or_unknown_model(monkeypatch, arguments):
+    run = Mock()
+    monkeypatch.setitem(sys.modules, "shad_helper.pipeline", SimpleNamespace(run_pipeline=run))
+    with pytest.raises(SystemExit) as caught:
+        main(arguments)
+    assert caught.value.code == 2
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize("position", ["global", "local"])
 def test_anki_forwards_pdf_rebuild_state_and_proxy(monkeypatch, tmp_path, position):
     generate = Mock(return_value=tmp_path / "deck.apkg")
     monkeypatch.setitem(sys.modules, "shad_helper.anki", SimpleNamespace(generate_anki=generate))
