@@ -328,6 +328,7 @@ def _generate_chapter(client, text: str, evidence: dict, chapter: dict,
                       resolutions: dict, requests: Path) -> dict:
     from .auth import PlanAccessError
     from .openai_client import PlanClient, ResponseError
+    from .rendering import RenderError, validate_chapter_latex
     from .schemas import LectureNotes
 
     schema = LectureNotes.model_json_schema()
@@ -340,10 +341,16 @@ def _generate_chapter(client, text: str, evidence: dict, chapter: dict,
             client.request_recorder = lambda method, url, payload, folder=folder: _record_request(
                 folder, method, url, payload)
         try:
-            result = _validate_chapter_reply(
-                client.complete(INSTRUCTIONS, text, schema=schema), evidence, chapter, resolutions)
+            reply = client.complete(INSTRUCTIONS, text, schema=schema)
+            write_json(folder / "response.json", reply)
+            result = _validate_chapter_reply(reply, evidence, chapter, resolutions)
+            validate_chapter_latex(result, evidence, folder / "latex-check")
             write_json(folder / "status.json", {"status": "success"})
             return result
+        except RenderError as exc:
+            write_json(folder / "status.json", {"status": "failed", "error_type": type(exc).__name__,
+                                              "error": str(exc)})
+            raise
         except (PlanAccessError, ResponseError, ValueError) as exc:
             write_json(folder / "status.json", {"status": "failed", "error_type": type(exc).__name__,
                                               "error_code": getattr(exc, "code", None)})
@@ -450,7 +457,7 @@ def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
 
 def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                manual: bool, client, rebuild: bool, proxy: str | None, run: Path) -> Path:
-    from .rendering import write_project
+    from .rendering import RenderError, write_project
     from .schemas import LectureNotes
 
     evidence = validate_evidence(read_json(job / "evidence.json"))
@@ -551,6 +558,7 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                         {"context": context, "prompt": text, "instructions": INSTRUCTIONS,
                          "model": client.model, "rebuild": rebuild,
                          "reasoning_effort": DEFAULT_REASONING_EFFORT,
+                         "latex_validation": 1,
                          "schema": LectureNotes.model_json_schema()},
                         lambda requests=requests: _generate_chapter(
                             client, text, evidence, chapter, resolutions, requests))
@@ -579,7 +587,7 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                             topics.setdefault(topic.casefold(), topic)
                 position += 1
             notes = _merge_chapters(parts, outline, evidence, resolutions)
-        except (PlanAccessError, ResponseError, ValueError) as exc:
+        except (PlanAccessError, ResponseError, ValueError, RenderError) as exc:
             handoff = _archive_handoff(job, evidence, outline, run, contexts)
             write_json(handoff / "status.json", {"status": "manual_required", "reason": str(exc)})
             print(f"Automatic synthesis unavailable: {exc}\nManual handoff: {handoff}")

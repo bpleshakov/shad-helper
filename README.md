@@ -234,6 +234,14 @@ Outputs are `notes.json`, `review.json`, and editable `notes/` LaTeX sources.
 `notes` regenerates the project; `--rebuild` invalidates synthesis checkpoints.
 Keep manual TeX edits for the subsequent `render` step.
 
+Automatic generation compiles each chapter locally with the final notes preamble
+before saving its synthesis checkpoint. This requires `latexmk` and LuaLaTeX.
+A compilation failure stops that chapter without another model request; the handoff
+reports the chapter and compiler error, with a block ID when available. `response.json` and
+`latex-check/notes/` retain the response, editable sources, and compiler logs locally.
+Compiler diagnostics are not sent to OpenAI. Checkpoints created before this check
+are regenerated once; successfully checked chapters are reused on later runs.
+
 Every `notes` run saves a handoff, including successful automatic generation,
 cache reuse, and imports. `handoff/inputs/` contains the current chapter prompts,
 contexts, and response schema. Each run also gets a separate archive under

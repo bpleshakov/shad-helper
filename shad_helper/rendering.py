@@ -9,7 +9,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .jobs import check_job, fingerprint, read_json
+from .jobs import check_job, fingerprint, read_json, write_json
 from .schemas import NoteBlock
 
 
@@ -322,6 +322,7 @@ def write_project(job: Path, notes: dict) -> Path:
             block_id = block["id"]
             content = block["content"]
             kind = block["kind"]
+            lines.append(f"% shad-helper: block {block_id}")
             if kind == "math":
                 _validate_commands(content)
                 display_environment = re.match(r"\s*\\begin\s*\{(?:equation|align|gather|multline)\*?\}", content)
@@ -454,6 +455,51 @@ def _validate_project(root: Path, manifest: dict) -> None:
             raise RenderError("Missing or invalid verbatim code asset")
 
 
+def _run_latex(root: Path) -> subprocess.CompletedProcess:
+    if not shutil.which("latexmk") or not shutil.which("lualatex"):
+        raise RenderError("Rendering requires latexmk and LuaLaTeX (for example, MacTeX)")
+    environment = os.environ.copy()
+    environment.update({"openin_any": "p", "openout_any": "p"})
+    with (root / "compiler-output.log").open("w", encoding="utf-8") as output:
+        return subprocess.run(
+            ["latexmk", "-norc", "-lualatex", "-latexoption=-no-shell-escape",
+             "-interaction=nonstopmode", "-halt-on-error", "-file-line-error", "main.tex"],
+            cwd=root, env=environment, stdout=output, stderr=subprocess.STDOUT,
+            timeout=600, check=False,
+        )
+
+
+def validate_chapter_latex(notes: dict, evidence: dict, folder: Path) -> None:
+    """Compile a chapter locally; retain sources and logs without PDF previews."""
+    chapter = notes["chapters"][0]
+    context = dict(evidence, segments=[segment for segment in evidence["segments"]
+                                      if any(segment["id"] in block["evidence_ids"]
+                                             for block in chapter["blocks"])])
+    write_json(folder / "evidence.json", context)
+    try:
+        root = write_project(folder, notes).parent
+        _validate_project(root, read_json(root / "project.json"))
+        completed = _run_latex(root)
+        if completed.returncode or not (root / "main.pdf").is_file():
+            log_path = root / "compiler-output.log"
+            log = log_path.read_text(encoding="utf-8", errors="replace")
+            error = re.search(r"(?:\./)?((?:chapters|figures)/[\w-]+\.tex|main\.tex):(\d+): ([^\n]+)", log)
+            detail = "LuaLaTeX compilation failed"
+            if error:
+                source, line, message = error.groups()
+                detail = f"{source}:{line}: {message}"
+                markers = re.findall(r"^% shad-helper: block ([\w-]+)$",
+                                     "\n".join((root / source).read_text().splitlines()[:int(line)]),
+                                     re.MULTILINE)
+                if markers:
+                    detail = f"block {markers[-1]}: {detail}"
+                elif source.startswith("figures/diagram-"):
+                    detail = f"block {Path(source).stem.removeprefix('diagram-')}: {detail}"
+            raise RenderError(f"{detail}; inspect {log_path}")
+    except (OSError, subprocess.TimeoutExpired, RenderError) as error:
+        raise RenderError(f"Chapter {chapter['id']} LaTeX validation failed: {error}") from error
+
+
 def _qa(pdf: Path) -> int:
     try:
         import pymupdf
@@ -487,19 +533,9 @@ def render(job: Path) -> Path:
         if manifest.get("evidence_fingerprint") != _evidence_fingerprint(job):
             raise RenderError("Evidence changed after these notes were generated; regenerate notes or import corrected notes before rendering")
         _validate_project(root, manifest)
-        if not shutil.which("latexmk") or not shutil.which("lualatex"):
-            raise RenderError("Rendering requires latexmk and LuaLaTeX (for example, MacTeX)")
         for extension in ("pdf", "log", "aux", "out", "toc", "fls", "fdb_latexmk", "synctex.gz"):
             _confined(root, f"main.{extension}")
-        environment = os.environ.copy()
-        environment.update({"openin_any": "p", "openout_any": "p"})
-        with log_path.open("w", encoding="utf-8") as compiler_output:
-            completed = subprocess.run(
-                ["latexmk", "-norc", "-lualatex", "-latexoption=-no-shell-escape",
-                 "-interaction=nonstopmode", "-halt-on-error", "-file-line-error", "main.tex"],
-                cwd=root, env=environment, stdout=compiler_output, stderr=subprocess.STDOUT,
-                timeout=600, check=False,
-            )
+        completed = _run_latex(root)
         log = log_path.read_text(encoding="utf-8", errors="replace")
         if (root / "main.log").is_file():
             log += "\n" + (root / "main.log").read_text(encoding="utf-8", errors="replace")
