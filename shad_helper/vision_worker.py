@@ -7,6 +7,8 @@ import time
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+from tqdm import tqdm
+
 from .jobs import checkpoint, fingerprint, read_json, sha256_file, write_json
 
 MAX_PIXELS = 2_200_000  # Preserve 1080p, including the processor's patch alignment.
@@ -148,7 +150,7 @@ def run(request: dict) -> dict:
     model_load_seconds = 0.0
     fresh_items = 0
 
-    def process(item, position):
+    def process(item):
         nonlocal runtime, model_load_seconds, fresh_items
         item_id = item["id"]
         if (not isinstance(item_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", item_id)
@@ -193,8 +195,7 @@ def run(request: dict) -> dict:
             raise _InvalidOutput(attempts)
 
         try:
-            result = checkpoint(job, f"vision/{item_id}", signature, action,
-                                progress=(position, len(request["items"])))
+            result = checkpoint(job, f"vision/{item_id}", signature, action, quiet=True)
         except _InvalidOutput as error:
             # Failed responses are reviewable, but must not poison successful-stage caches.
             result = {
@@ -204,7 +205,8 @@ def run(request: dict) -> dict:
             }
         return {**item, **result}
 
-    items = [process(item, position) for position, item in enumerate(request["items"], 1)]
+    with tqdm(request["items"], desc="Vision", unit="frame", dynamic_ncols=True) as frames:
+        items = [process(item) for item in frames]
     return {"items": items, "diagnostics": {
         "model": model_id, "revision": revision, "settings": settings, "packages": packages,
         "seconds": time.monotonic() - started, "model_load_seconds": model_load_seconds,

@@ -9,6 +9,7 @@ dependencies = [
     "PyJWT[crypto]>=2.10",
     "pymupdf>=1.26",
     "genanki==0.13.1",
+    "tqdm>=4.67",
 ]
 
 [project.optional-dependencies]

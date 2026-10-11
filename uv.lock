@@ -1660,6 +1660,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "pymupdf" },
+    { name = "tqdm" },
 ]
 
 [package.optional-dependencies]
@@ -1690,6 +1691,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.12" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10" },
     { name = "pymupdf", specifier = ">=1.26" },
+    { name = "tqdm", specifier = ">=4.67" },
 ]
 provides-extras = ["local"]
 
