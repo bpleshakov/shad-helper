@@ -195,9 +195,12 @@ def test_batch_exports_real_independent_packages_with_disjoint_positions(
     original_collection = collection.read_bytes()
     response = {"title": "Одинаковое название лекции", "notes": [
         {"note_type": "Basic", "front": "Определение", "back": "Ответ",
-         "source": {"page": 1, "order": 1}},
+         "source": {"page": 1, "order": 1},
+         "card_sources": [{"field": "Back", "page": 1, "location": "Определение"}]},
         {"note_type": "Theorem Full proof", "name": "Теорема", "statement": "Утверждение",
-         "proof": "Доказательство", "source": {"page": 1, "order": 2}},
+         "proof": "Доказательство", "source": {"page": 1, "order": 2},
+         "card_sources": [{"field": field, "page": 1, "location": "Теорема"}
+                          for field in ("Statement", "Full proof")]},
     ]}
     client = SimpleNamespace(model=anki.DEFAULT_MODEL, complete=Mock(return_value=response))
     monkeypatch.setattr(anki, "PlanClient", lambda state, **kwargs: client)

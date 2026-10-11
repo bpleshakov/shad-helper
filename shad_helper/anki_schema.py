@@ -15,6 +15,18 @@ class Source(BaseModel):
     order: int = Field(ge=1, description="Unique note order on its first source page")
 
 
+class CardSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    field: Text = Field(description="Exact answer field: Back, Statement, Full proof, "
+                       "Definition steps, Steps to prove, or Step 1..15")
+    page: int = Field(ge=1, description="Physical PDF page containing this card's source")
+    location: Text = Field(description="Heading, theorem/formula number or short exact "
+                          "excerpt locating this card's source on the page")
+    block_ids: list[Text] = Field(default_factory=list,
+        description="Supporting block IDs from the supplied source catalog; empty only "
+                    "when no catalog was provided")
+
+
 class Figure(BaseModel):
     field: Text = Field(description="Exact destination Anki field name")
     page: int = Field(ge=1)
@@ -32,6 +44,7 @@ class Figure(BaseModel):
 class NoteBase(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     source: Source
+    card_sources: list[CardSource] = Field(default_factory=list)
     figures: list[Figure] = Field(default_factory=list)
     supplemented_fields: list[str] = Field(default_factory=list,
         description="Exact Anki fields containing reasoning added beyond the PDF")

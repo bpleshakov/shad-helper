@@ -60,7 +60,7 @@ _PROJECT_COMMANDS = set(
     "textbackslash textasciitilde textasciicircum textcolor "
     "input VerbatimInput pagestyle fancyhf fancyfoot renewcommand "
     "headrulewidth thepage linewidth textwidth medskip bigskip item "
-    "hypersetup emergencystretch newtheorem theoremstyle".split()
+    "hypersetup hypertarget emergencystretch newtheorem theoremstyle".split()
 )
 _SYMBOL_COMMANDS = set("\\{}%&#$_~^ ,;:![]()|") | {"\n", "\r"}
 _MATH_ENVIRONMENTS = set(
@@ -301,6 +301,7 @@ def write_project(job: Path, notes: dict) -> Path:
     block_ids = set()
     chapter_ids = set()
     sections = []
+    source_blocks = []
     review = _review_flags(notes)
     evidence_times = _evidence_times(job)
     for chapter in sorted(notes.get("chapters", []), key=lambda chapter: chapter["start"]):
@@ -354,6 +355,27 @@ def write_project(job: Path, notes: dict) -> Path:
                              + "\n\\end{" + kind + "}\n")
             else:
                 raise RenderError(f"Unsupported note block kind: {kind}")
+            start = f"\\hypertarget{{shad-block-{block_id}}}{{}}"
+            end = f"\\hypertarget{{shad-end-{block_id}}}{{}}"
+            if kind == "diagram":
+                lines[-1] = lines[-1].replace("\\centering\n", "\\centering\n" + start, 1)
+                lines[-1] = lines[-1].replace("\\end{figure}", end + "\\end{figure}", 1)
+            elif kind in {"definition", "theorem", "proof"}:
+                lines[-1] = lines[-1].replace("\n", "\n" + start, 1)
+                lines[-1] = lines[-1].replace("\n\\end{", end + "\n\\end{", 1)
+            elif kind == "math":
+                environment = r"\{(?:equation|align|gather|multline)\*?\}"
+                lines[-1] = re.sub(r"\\(?:\[|begin" + environment + ")",
+                                   lambda match, start=start: match[0] + start, lines[-1], count=1)
+                lines[-1] = re.sub(r"\\(?:\]|end" + environment + r")\s*$",
+                                   lambda match, end=end: end + match[0], lines[-1])
+            elif kind == "code":
+                lines[-1] = lines[-1].replace("[breaklines,", "[formatcom={" + start
+                                             + "},breaklines,", 1).rstrip() + end + "\n"
+            else:
+                lines[-1] = start + lines[-1].rstrip() + end + "\n"
+            source_blocks.append({"id": block_id, "topic": title, "content": content,
+                                  "evidence_ids": block.get("evidence_ids", [])})
         relative = f"chapters/section-{number:03}.tex"
         _write(root, relative, "\n\n".join(lines) + "\n")
         tex_files.append(relative)
@@ -368,6 +390,7 @@ def write_project(job: Path, notes: dict) -> Path:
     _write(root, "main.tex", main)
     manifest = {"version": 2, "draft": bool(review), "tex_files": tex_files,
                 "code_files": code_files, "review": review,
+                "source_blocks": source_blocks,
                 "issues": notes.get("issues", []), "evidence_fingerprint": _evidence_fingerprint(job)}
     _write(root, "project.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     return root / "main.tex"
@@ -535,6 +558,7 @@ def render(job: Path) -> Path:
         if manifest.get("evidence_fingerprint") != _evidence_fingerprint(job):
             raise RenderError("Evidence changed after these notes were generated; regenerate notes or import corrected notes before rendering")
         _validate_project(root, manifest)
+        _confined(root, "source-map.json").unlink(missing_ok=True)
         for extension in ("pdf", "log", "aux", "out", "toc", "fls", "fdb_latexmk", "synctex.gz"):
             _confined(root, f"main.{extension}")
         completed = _run_latex(root)
@@ -550,6 +574,13 @@ def render(job: Path) -> Path:
         if completed.returncode or not pdf.is_file():
             raise RenderError(f"LuaLaTeX compilation failed; inspect {log_path}")
         report["pages"] = _qa(pdf)
+        if "source_blocks" in manifest:
+            from .pdf_sources import write_source_map
+
+            try:
+                write_source_map(pdf, manifest)
+            except ValueError as error:
+                raise RenderError(str(error)) from error
         report["status"] = "rendered"
         return pdf
     except (OSError, subprocess.TimeoutExpired) as error:

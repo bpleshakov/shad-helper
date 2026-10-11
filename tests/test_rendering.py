@@ -1,5 +1,7 @@
+import hashlib
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -9,6 +11,10 @@ from unittest.mock import patch
 
 from shad_helper import rendering
 from shad_helper.jobs import AUDIO_CONFIG, fingerprint, write_json
+
+
+def without_source_anchors(text):
+    return re.sub(r"\\hypertarget\{shad-(?:block|end)-[^}]+\}\{\}", "", text)
 
 
 def sample_notes():
@@ -256,7 +262,7 @@ class RenderingTests(unittest.TestCase):
             heading = "[Доказательство]" if kind == "proof" else ""
             self.assertIn("\\begin{" + kind + "}" + heading + "\n"
                           + r"Матрица \(A\) \textcolor{blue!60!black}{симметрична}.\footnote{01:01:01}"
-                          + "\n\\end{" + kind + "}", chapter)
+                          + "\n\\end{" + kind + "}", without_source_anchors(chapter))
         self.assertEqual(chapter.count(r"\footnote"), 3)
         self.assertTrue(manifest["draft"])
 
@@ -324,7 +330,7 @@ class RenderingTests(unittest.TestCase):
         rendering._validate_project(root, manifest)
         chapter = (root / "chapters/section-001.tex").read_text()
         self.assertIn(r"\(" + expression + r"\)", chapter)
-        self.assertIn("\\[\n" + expression + "\n\\]", chapter)
+        self.assertIn("\\[\n" + expression + "\n\\]", without_source_anchors(chapter))
 
     def test_norm_conditional_and_tilde_commands_are_supported(self):
         expressions = (r"w_j = \|x-x_{(j)}\|^{-1}",
@@ -338,7 +344,7 @@ class RenderingTests(unittest.TestCase):
                 rendering._validate_project(root, manifest)
                 chapter = (root / "chapters/section-001.tex").read_text()
                 self.assertIn(r"\(" + expression + r"\)", chapter)
-                self.assertIn("\\[\n" + expression + "\n\\]", chapter)
+                self.assertIn("\\[\n" + expression + "\n\\]", without_source_anchors(chapter))
 
     def test_safe_math_commands_do_not_allow_unsafe_commands(self):
         for name, command in (("input", r"\input{secret}"), ("write", r"\write18{ls}"),
@@ -365,6 +371,7 @@ class RenderingTests(unittest.TestCase):
                 root, manifest = self.project()
                 rendering._validate_project(root, manifest)
                 chapter = (root / "chapters/section-001.tex").read_text()
+                chapter = without_source_anchors(chapter)
                 display = "\\[\n" + content + "\n\\]"
                 if wrapped:
                     self.assertIn(display, chapter)
@@ -394,7 +401,7 @@ class RenderingTests(unittest.TestCase):
             stdout.write("Overfull \\hbox (2pt too wide)\nMissing character: U+1234\n")
             return subprocess.CompletedProcess(arguments, 0)
 
-        with patch.object(rendering.shutil, "which", return_value="/bin/test"), patch.object(rendering.subprocess, "run", side_effect=compiler), patch.object(rendering, "_qa", return_value=3):
+        with patch.object(rendering.shutil, "which", return_value="/bin/test"), patch.object(rendering.subprocess, "run", side_effect=compiler), patch.object(rendering, "_qa", return_value=3), patch("shad_helper.pdf_sources.write_source_map"):
             self.assertEqual(rendering.render(self.job), root / "main.pdf")
         self.assertEqual(source.read_text(), corrected)
         report = json.loads((root / "render-report.json").read_text())
@@ -547,10 +554,50 @@ class RenderingTests(unittest.TestCase):
 
         with patch.object(rendering.shutil, "which", return_value="/bin/test"), \
                 patch.object(rendering.subprocess, "run", side_effect=compiler), \
-                patch.object(rendering, "_qa", return_value=1):
+                patch.object(rendering, "_qa", return_value=1), \
+                patch("shad_helper.pdf_sources.write_source_map"):
             rendering.render(self.job)
         report = json.loads((root / "render-report.json").read_text())
         self.assertEqual(report["missing_fonts"], [error])
+
+    @unittest.skipUnless(shutil.which("latexmk") and shutil.which("lualatex") and importlib.util.find_spec("pymupdf"), "LuaLaTeX, latexmk, and PyMuPDF are required")
+    def test_source_anchors_follow_content_across_natural_page_breaks(self):
+        import pymupdf
+        blocks, targets = [], {}
+        environments = ["equation", "equation*", "align", "align*", "gather", "gather*",
+                        "multline", "multline*"]
+        for number in range(28):
+            start, end = f"BEGIN{number:03}", f"END{number:03}"
+            formula = str(20000 + number)
+            environment = environments[number % len(environments)]
+            blocks.extend([
+                {"id": f"text-{number}", "kind": "text",
+                 "content": start + " " + "Текст для проверки разрыва страницы. " * 8 + end},
+                {"id": f"math-{number}", "kind": "math",
+                 "content": r"\begin{" + environment + "}" + formula + r"\end{" + environment + "}"},
+                {"id": f"code-{number}", "kind": "code",
+                 "content": f"CODE{number:03}\nsecond_line = 1\nLAST{number:03}"},
+                {"id": f"theorem-{number}", "kind": "theorem",
+                 "content": f"THEOREM{number:03}. Утверждение для проверки переноса."},
+                {"id": f"proof-{number}", "kind": "proof",
+                 "content": f"PROOF{number:03}. Доказательство для проверки переноса."},
+            ])
+            targets.update({f"text-{number}": (start, end), f"math-{number}": (formula, formula),
+                            f"code-{number}": (f"CODE{number:03}", f"LAST{number:03}"),
+                            f"theorem-{number}": (f"THEOREM{number:03}",) * 2,
+                            f"proof-{number}": (f"PROOF{number:03}",) * 2})
+        self.notes["chapters"][0]["blocks"] = blocks
+        self.project()
+        pdf = rendering.render(self.job)
+        mapping = json.loads((pdf.parent / "source-map.json").read_text())
+        with pymupdf.open(pdf) as document:
+            self.assertGreater(len(document), 3)
+            for identifier, (start, end) in targets.items():
+                with self.subTest(block=identifier):
+                    first = next(i for i, page in enumerate(document, 1) if page.search_for(start))
+                    last = next(i for i, page in enumerate(document, 1) if page.search_for(end))
+                    self.assertEqual(mapping["blocks"][identifier]["page_start"], first)
+                    self.assertEqual(mapping["blocks"][identifier]["page_end"], last)
 
     @unittest.skipUnless(shutil.which("latexmk") and shutil.which("lualatex") and importlib.util.find_spec("pymupdf"), "LuaLaTeX, latexmk, and PyMuPDF are required")
     def test_actual_cyrillic_math_diagram_code_pdf_and_qa(self):
@@ -582,6 +629,17 @@ class RenderingTests(unittest.TestCase):
         import pymupdf
         with pymupdf.open(pdf) as document:
             text = "\n".join(page.get_text() for page in document)
+            mapping = json.loads((pdf.parent / "source-map.json").read_text())
+            blocks = self.notes["chapters"][0]["blocks"]
+            self.assertEqual(set(mapping["blocks"]), {block["id"] for block in blocks})
+            self.assertEqual(mapping["pdf_sha256"], hashlib.sha256(pdf.read_bytes()).hexdigest())
+            for block in blocks:
+                mapped = mapping["blocks"][block["id"]]
+                self.assertEqual(mapped["evidence_ids"], block.get("evidence_ids", []))
+                self.assertGreaterEqual(mapped["page_start"], 1)
+                self.assertLessEqual(mapped["page_start"], mapped["page_end"])
+                self.assertLessEqual(mapped["page_end"], len(document))
+            self.assertNotIn("shad-block-", text)
         self.assertIn("Случайные величины", text)
         self.assertRegex(text, r"Определение\s+1\.1")
         self.assertRegex(text, r"Теорема\s+1\.2")

@@ -1508,6 +1508,14 @@ The complete manifest shape is:
     "chapters/section-001.tex"
   ],
   "code_files": [],
+  "source_blocks": [
+    {
+      "id": "ch001_missing_detail",
+      "topic": "Основные понятия",
+      "content": "Формулировка из конспекта.",
+      "evidence_ids": ["segment_00000"]
+    }
+  ],
   "review": [
     {
       "id": "ch001_missing_detail",
@@ -1533,12 +1541,29 @@ The complete manifest shape is:
 | `draft` | boolean | Whether generation found review flags |
 | `tex_files` | array of relative paths | Declared TeX sources, including `main.tex`, topic sections under `chapters/`, and any diagrams |
 | `code_files` | array of relative paths | Declared verbatim code assets under `code/` |
+| `source_blocks` | array of `{id, topic, content, evidence_ids}` | Original note blocks for per-card PDF and recording provenance |
 | `review` | array of `{id, description}` | Blocks with uncertain fragments or legacy uncertain kind, followed by unresolved issues |
 | `issues` | array of full review issues | Review metadata, including resolved issues; not printed in the PDF |
 | `evidence_fingerprint` | string or null | Fingerprint of complete evidence when the project was written |
 
 Normal synthesis has evidence and writes a fingerprint string. The low-level
 project writer can produce null if no evidence file exists.
+
+Each block has invisible PDF destinations `shad-block-ID` and `shad-end-ID`.
+After compilation, `notes/source-map.json` stores schema version `1`, the PDF's
+SHA-256, `evidence_fingerprint`, and blocks keyed by ID with one-based
+`page_start`, `page_end`, and the start `anchor`. Diagram anchors stay inside
+the floating figure. A missing destination fails rendering. Old projects without
+`source_blocks` can still render, but must be regenerated before lecture Anki
+export can produce recording references.
+
+Anki responses carry `card_sources` on every note: exactly one
+`{field, page, location, block_ids}` record per populated answer field, including
+individual steps. PDF page/order still defines note identity and chronology.
+The model selects existing block IDs; recording times are resolved locally from
+their speech/frame evidence. The card report uses the actual exported GUID and
+template ordinal, not an assumed card count. `anki/report.json` schema version `2`
+includes these records in `cards`; `anki/sources.md` presents them as Markdown.
 
 `review` entries for marked blocks use the block ID. Entries for unresolved
 issues use the issue ID. An uncertain block and its generated issue can both

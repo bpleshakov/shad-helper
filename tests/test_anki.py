@@ -49,7 +49,7 @@ def job(tmp_path):
 
 @pytest.fixture
 def response():
-    return {"title": "Математическая лекция", "notes": [
+    result = {"title": "Математическая лекция", "notes": [
         {"note_type": "Basic", "front": "Положительные числа",
          "back": "Строка & смысл\n" + r"\(0 < x < y \Rightarrow x^2 < y^2\)",
          "source": {"page": 1, "order": 1}},
@@ -68,6 +68,13 @@ def response():
                    "Сравнить две наименьшие верхние грани."],
          "source": {"page": 2, "order": 1}},
     ], "warnings": []}
+    fields = [("Back",), ("Definition steps", "Step 1", "Step 2"),
+              ("Statement", "Full proof"), ("Statement", "Steps to prove", "Step 1", "Step 2")]
+    for note, answers in zip(result["notes"], fields, strict=True):
+        note["card_sources"] = [{"field": field, "page": note["source"]["page"],
+                                 "location": f"Фрагмент: {field}", "block_ids": []}
+                                for field in answers]
+    return result
 
 
 @pytest.fixture
@@ -133,6 +140,133 @@ def test_stage_exports_all_types_in_pdf_order_with_shared_note_positions(job, re
     assert [(note["source"]["page"], note["source"]["order"]) for note in report["notes"]] == [
         (1, 1), (1, 2), (1, 3), (2, 1),
     ]
+    assert {(card["guid"], card["ordinal"], card["position"]) for card in report["cards"]} == {
+        (row[0], row[2], row[3]) for row in rows}
+    markdown = (job / "anki/sources.md").read_text()
+    assert markdown.count("\n## ") == len(rows) == len(report["cards"])
+    assert markdown.count("Тайм-код недоступен") == 10
+    assert "#page=2" in markdown
+
+
+def mapped_lecture(job, response):
+    evidence = read_json(job / "evidence.json")
+    evidence["media"]["path"] = str(job / "PRIVATE_RECORDING.mp4")
+    evidence["segments"] = [
+        {"id": "s1", "start": 61.25, "end": 67.5, "text": "PRIVATE_SPEECH"},
+        {"id": "s2", "start": 112.125, "end": 119.75, "text": "PRIVATE_SPEECH"},
+    ]
+    evidence["visuals"] = [{"id": "v1", "timestamp": 113.5, "text": "PRIVATE_FRAME"}]
+    evidence["issues"] = ["PRIVATE_DIAGNOSTICS"]
+    write_json(job / "evidence.json", evidence)
+    mapping = {"schema_version": 1, "evidence_fingerprint": fingerprint(evidence),
+               "pdf_sha256": hashlib.sha256((job / "notes/main.pdf").read_bytes()).hexdigest(),
+               "blocks": {}}
+    for page, identifiers in [(1, ["s1"]), (2, ["v1", "s2", "s2"])]:
+        mapping["blocks"][f"b{page}"] = {
+            "id": f"b{page}", "topic": f"Тема {page}", "content": f"Текст блока {page}",
+            "anchor": f"shad-block-b{page}", "evidence_ids": identifiers,
+            "page_start": page, "page_end": page, "issues": ["PRIVATE_BLOCK_ISSUES"],
+        }
+    write_json(job / "notes/source-map.json", mapping)
+    for note in response["notes"]:
+        for reference in note["card_sources"]:
+            reference["block_ids"] = [f"b{reference['page']}"]
+    return mapping
+
+
+def test_report_resolves_each_proof_step_locally_and_matches_exported_cards(job, client, response):
+    mapped_lecture(job, response)
+    response["notes"] = [response["notes"][3]]
+    note = response["notes"][0]
+    note["card_sources"][2].update(page=1, block_ids=["b1"])
+    note["card_sources"][1]["block_ids"] = ["b1", "b2"]
+    note["supplemented_fields"] = ["Step 2"]
+    note["review_flags"] = ["Проверить дополнение"]
+    package = anki.generate_anki(job, job / "auth", client=client)
+    rows, _ = inspect_package(package)
+    cards = read_json(job / "anki/report.json")["cards"]
+    assert {(card["guid"], card["ordinal"]) for card in cards} == {
+        (row[0], row[2]) for row in rows}
+    by_field = {card["field"]: card for card in cards}
+    assert by_field["Step 1"]["timestamps"] == [
+        {"evidence_id": "s1", "start": 61.25, "end": 67.5}]
+    assert by_field["Step 2"]["timestamps"] == [
+        {"evidence_id": "s2", "start": 112.125, "end": 119.75},
+        {"evidence_id": "v1", "start": 113.5, "end": 113.5}]
+    assert len(by_field["Steps to prove"]["timestamps"]) == 3
+    assert {card["field"] for card in cards if card["supplemented"]} == {"Step 2"}
+    assert (by_field["Step 1"]["pdf_page"], by_field["Step 2"]["pdf_page"]) == (1, 2)
+    markdown = (job / "anki/sources.md").read_text()
+    assert markdown.count("\n## ") == 4
+    assert "00:01:01.250–00:01:07.500" in markdown
+    assert "#t=112.125,119.75" in markdown
+    assert "#t=113.5)" in markdown
+    assert "#nameddest=shad-block-b2" in markdown
+    assert markdown.count("**Дополнено моделью.**") == 1
+    assert "Проверить дополнение" in markdown
+    outbound = json.dumps(client.complete.call_args.args, ensure_ascii=False)
+    assert "Текст блока 1" in outbound
+    assert "PRIVATE_" not in outbound
+    assert "61.25" not in outbound
+    assert str(job) not in outbound
+
+
+@pytest.mark.parametrize("error", ["missing", "duplicate", "unknown", "page", "no_evidence"])
+def test_invalid_card_sources_do_not_publish(job, client, response, error):
+    mapping = mapped_lecture(job, response)
+    reference = response["notes"][0]["card_sources"][0]
+    if error == "missing":
+        response["notes"][0]["card_sources"] = []
+    elif error == "duplicate":
+        response["notes"][0]["card_sources"].append(copy.deepcopy(reference))
+    elif error == "unknown":
+        reference["block_ids"] = ["invented"]
+    elif error == "page":
+        reference["page"] = 2
+    else:
+        mapping["blocks"]["b1"]["evidence_ids"] = ["invented"]
+        write_json(job / "notes/source-map.json", mapping)
+    with pytest.raises(ValueError):
+        anki.generate_anki(job, job / "auth", client=client)
+    assert not (job / "anki/deck.apkg").exists()
+    assert not (job / "anki/sources.md").exists()
+    assert not (job / "checkpoints/anki.json").exists()
+
+
+@pytest.mark.parametrize("change", ["pdf", "evidence", "missing"])
+def test_stale_lecture_map_fails_before_model(job, client, response, change):
+    mapped_lecture(job, response)
+    if change == "pdf":
+        write_pdf(job / "notes/main.pdf", "Changed source")
+    elif change == "evidence":
+        evidence = read_json(job / "evidence.json")
+        evidence["segments"][0]["start"] = 62
+        write_json(job / "evidence.json", evidence)
+    else:
+        (job / "notes/source-map.json").unlink()
+        write_json(job / "notes/project.json", {})
+    with pytest.raises(ValueError, match="source map|evidence changed"):
+        anki.generate_anki(job, job / "auth", client=client)
+    client.complete.assert_not_called()
+
+
+def test_cached_card_sources_are_validated_and_catalog_changes_invalidate_cache(
+        job, client, response):
+    mapping = mapped_lecture(job, response)
+    anki.generate_anki(job, job / "auth", client=client)
+    previous = (job / "anki/sources.md").read_bytes()
+    cache_path = job / "checkpoints/anki.json"
+    cache = read_json(cache_path)
+    cache["result"]["notes"][0]["card_sources"] = []
+    write_json(cache_path, cache)
+    with pytest.raises(ValueError, match="Every generated answer"):
+        anki.generate_anki(job, job / "auth", client=client)
+    assert (job / "anki/sources.md").read_bytes() == previous
+    assert client.complete.call_count == 1
+    mapping["blocks"]["b1"]["content"] = "Уточнённая формулировка"
+    write_json(job / "notes/source-map.json", mapping)
+    anki.generate_anki(job, job / "auth", client=client)
+    assert client.complete.call_count == 2
 
 
 def test_row_intervals_are_repaired_in_fields_and_cache_before_compilation(
@@ -386,6 +520,7 @@ def test_bad_source_fails_before_model_and_does_not_publish(job, client, monkeyp
 
 @pytest.mark.parametrize("failure", [
     "invalid_json", "response_error", "package_error", "latex_error", "collection_refresh_error",
+    "sources_error",
 ])
 def test_failed_regeneration_keeps_previous_published_artifacts(
         job, client, monkeypatch, no_retry_wait, collection_reader, failure):
@@ -401,6 +536,9 @@ def test_failed_regeneration_keeps_previous_published_artifacts(
         expected_calls = 4
     elif failure == "latex_error":
         monkeypatch.setattr(anki, "render_latex_media", Mock(side_effect=RuntimeError("TeX failed")))
+        expected_calls = 1
+    elif failure == "sources_error":
+        monkeypatch.setattr(anki, "write_sources_report", Mock(side_effect=OSError("Disk full")))
         expected_calls = 1
     elif failure == "collection_refresh_error":
         collection_reader.side_effect = [collection_reader.return_value,
@@ -426,7 +564,7 @@ def test_failed_final_package_publication_rolls_back_sidecars(tmp_path, monkeypa
     folder, staging = tmp_path / "anki", tmp_path / "staging"
     folder.mkdir()
     staging.mkdir()
-    names = ("notes.json", "report.json", "deck.apkg")
+    names = ("notes.json", "report.json", "sources.md", "deck.apkg")
     for name in names:
         (staging / name).write_bytes(f"new {name}".encode())
         if existing:
@@ -562,6 +700,7 @@ def test_missing_proof_with_review_flag_exports_statement_without_empty_proof_ca
         job, response, client):
     response["notes"] = [response["notes"][2]]
     response["notes"][0].update(proof=None, review_flags=["Доказательство не восстановлено."])
+    response["notes"][0]["card_sources"] = [response["notes"][0]["card_sources"][0]]
     rows, _ = inspect_package(anki.generate_anki(job, job / "auth", client=client))
     assert len(rows) == 1
     assert rows[0][2:4] == (0, 1)

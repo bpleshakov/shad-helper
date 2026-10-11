@@ -2,6 +2,7 @@
 
 import hashlib
 import html
+import json
 import os
 import re
 import shutil
@@ -19,6 +20,13 @@ from .anki_models import get_models
 from .anki_positions import collection_position
 from .anki_prompt import INSTRUCTIONS, PROMPT_VERSION
 from .anki_schema import AnkiResponse, note_fields, validate_response
+from .anki_sources import (
+    card_records,
+    load_lecture_sources,
+    source_catalog,
+    validate_card_sources,
+    write_sources_report,
+)
 from .auth import PlanAccessError
 from .jobs import fingerprint, read_json, write_json
 from .openai_client import (
@@ -30,13 +38,17 @@ from .openai_client import (
 )
 
 
-def _generate(client, pdf, page_count):
+def _generate(client, pdf, page_count, sources):
     text = (f"Создай Anki-колоду по всему приложенному PDF ({page_count} страниц). "
             "Сохраняй порядок первого появления объектов и отмечай дополнения модели.")
+    text += "\nКаталог блоков конспекта для привязки источников:\n" + json.dumps(
+        source_catalog(sources), ensure_ascii=False)
     for attempt in range(4):
         try:
-            return validate_response(client.complete(
+            response = validate_response(client.complete(
                 INSTRUCTIONS, text, schema=AnkiResponse.model_json_schema(), pdf=pdf), page_count)
+            validate_card_sources(response, page_count, sources)
+            return response
         except (PlanAccessError, ResponseError, ValueError) as exc:
             if getattr(exc, "code", None) == "context_length_exceeded":
                 raise RuntimeError("The complete PDF exceeds the model context limit; "
@@ -72,7 +84,7 @@ def _field_html(value: str) -> str:
 
 
 def _publish(staging: Path, folder: Path) -> None:
-    names = ("notes.json", "report.json", "deck.apkg")
+    names = ("notes.json", "report.json", "sources.md", "deck.apkg")
     backup = staging / "previous"
     backup.mkdir()
     for name in names:
@@ -160,12 +172,14 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
     # Fail before model generation if the live collection cannot be read safely.
     position_source = collection_position(anki_collection)
     pdf_hash = hashlib.sha256(data).hexdigest()
+    lecture_sources = load_lecture_sources(job, source, pdf_hash)
     folder = job / "anki"
     folder.mkdir(parents=True, exist_ok=True)
     model = client.model if client is not None else DEFAULT_MODEL
     signature = fingerprint({"pdf_sha256": pdf_hash, "model": model,
         "reasoning_effort": DEFAULT_REASONING_EFFORT, "prompt_version": PROMPT_VERSION,
-        "instructions": INSTRUCTIONS, "schema": AnkiResponse.model_json_schema()})
+        "instructions": INSTRUCTIONS, "schema": AnkiResponse.model_json_schema(),
+        "source_catalog": source_catalog(lecture_sources)})
     cache_path = job / "checkpoints" / "anki.json"
     with pymupdf.open(stream=data, filetype="pdf") as document:
         if document.needs_pass or len(document) == 0:
@@ -179,10 +193,11 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
             if cached.get("fingerprint") == signature:
                 print("Reusing anki generation", flush=True)
                 response = validate_response(cached["result"], len(document))
+                validate_card_sources(response, len(document), lecture_sources)
             else:
                 print(f"Generating Anki cards from {len(document)} PDF pages", flush=True)
                 selected_client = client or PlanClient(state_dir, proxy=proxy)
-                response = _generate(selected_client, frozen_pdf, len(document))
+                response = _generate(selected_client, frozen_pdf, len(document), lecture_sources)
                 write_json(cache_path, {"fingerprint": signature,
                                        "result": response.model_dump()})
             identity = _identity(folder, response.title)
@@ -202,7 +217,7 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
                 source_note["positions"] = positions
             write_package(staging / "deck.apkg", deck_id=identity["deck_id"],
                           deck_name=identity["deck_name"], notes=notes, media_files=media)
-            report = {"schema_version": 1, **identity, "source_pdf": str(source.resolve()),
+            report = {"schema_version": 2, **identity, "source_pdf": str(source.resolve()),
                 "pdf_sha256": pdf_hash, "page_count": len(document), "model": model,
                 "reasoning_effort": DEFAULT_REASONING_EFFORT, "prompt_version": PROMPT_VERSION,
                 "math_format": "anki_latex",
@@ -210,6 +225,7 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
                 "end_position": start_position + len(notes) - 1,
                 "note_count": len(notes), "card_count": sum(len(n["positions"]) for n in notes),
                 "warnings": response.warnings, "notes": provenance,
+                "cards": card_records(response, provenance, lecture_sources),
                 "import_instructions": "Import deck.apkg. New card gather order: Ascending "
                     "position; New card sort order: Order gathered. Sibling cards share one "
                     "position. Positions start after the live collection allocation cursor "
@@ -217,6 +233,7 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
                     "and does not remove obsolete notes after PDF changes."}
             write_json(staging / "notes.json", response.model_dump())
             write_json(staging / "report.json", report)
+            write_sources_report(staging / "sources.md", report)
             (folder / "media").mkdir(exist_ok=True)
             for path in media:
                 os.replace(path, folder / "media" / path.name)

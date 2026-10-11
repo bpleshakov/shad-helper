@@ -363,8 +363,10 @@ UV_CACHE_DIR=.cache/uv uv run shad-helper anki jobs/audio-lecture --anki-collect
 
 The default input is `JOB/notes/main.pdf`. The command sends the complete PDF to
 `gpt-6.1-sol` with high reasoning through the existing ChatGPT sign-in and explicit
-OpenAI proxy. It includes text and page images; it does not use the earlier
-transcript, notes JSON, or pipeline diagnostics as model inputs. The PDF must be
+OpenAI proxy. It includes text and page images. For generated lecture PDFs it also
+sends a catalog of the saved note blocks and their PDF page ranges to identify
+sources. Raw transcripts, recording paths, timestamps, and pipeline diagnostics
+are not model inputs. The PDF must be
 unencrypted and smaller than 50,000,000 bytes. If the model cannot process the
 whole document or return a complete valid response, the command fails without
 publishing a partial deck. Temporary failures get three retries, after 5, 10 and
@@ -412,9 +414,27 @@ reviews continue to use Anki's scheduling. See the
 [Anki display-order documentation](https://docs.ankiweb.net/manual/deck-options#display-order).
 
 `JOB/anki/notes.json` preserves the structured generated content;
-`JOB/anki/report.json` records source pages, positions, model additions, warnings,
-and image coordinates. `JOB/anki/media/` contains figures and compiled formulas.
-Successful generation is cached against the PDF bytes, model, prompt and schema;
+`JOB/anki/sources.md` links **every exported card**, including individual definition
+and proof steps, to a PDF page and a heading, formula, or excerpt. Generated lecture
+PDFs also have clickable block anchors and recording timestamps resolved locally
+from the block's original speech/frame references. Multiple supporting intervals
+are listed separately; these are source-block intervals, not inferred phrase
+boundaries. Model additions are marked and their references identify the premises.
+A separately supplied PDF has no assumed connection to the job's recording; its
+report explicitly marks timestamps as unavailable.
+
+`render` writes `JOB/notes/source-map.json`, binding block IDs and page ranges to
+the exact PDF hash and lecture evidence. Missing, stale, or invalid references
+stop lecture export. For projects generated before source maps were introduced,
+back up any manual TeX corrections, run `notes JOB --import JOB/notes.json` to
+recreate the project, reapply the corrections while retaining the block anchors,
+then run `render JOB` and `anki JOB`.
+
+`JOB/anki/report.json` records the same per-card sources, note positions, model
+additions, warnings, and image coordinates. `JOB/anki/media/` contains figures and
+compiled formulas. The deck, JSON sidecars, and `sources.md` are published together;
+a failed export keeps the previous versions.
+Successful generation is cached against the PDF bytes, block catalog, model, prompt and schema;
 a cached export needs no model request. Use `anki JOB --rebuild` to regenerate only this
 stage. Reimporting the same output creates no duplicates and preserves existing
 positions, review progress and local template edits. It does not reposition cards
