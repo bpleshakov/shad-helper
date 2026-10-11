@@ -202,12 +202,13 @@ the input byte cap; no proof or evidence is truncated to hit a page count. Actua
 pagination depends on formulas and diagrams. Administrative-only chapters may
 have `blocks: []`; their intervals stay in the outline but get no PDF heading.
 
-PDF sections follow broad topics such as nearest neighbors, linear regression,
-or merge sort. Every new block has a `topic`; matching names are grouped across
-processing chapters into one section, in first-appearance order. Matching ignores
-case and extra whitespace, but does not merge different names automatically.
-Chapter intervals remain in `notes.json` for provenance. Legacy blocks without a
-topic use their chapter title.
+PDF sections follow lecture chronology: chapters are ordered by their start time,
+and blocks retain their sequence within each chapter. Every new block has a broad
+`topic`, such as nearest neighbors, linear regression, or merge sort. Only adjacent
+blocks with matching topics share a section, including across chapter boundaries.
+Returning to a topic after another topic starts a later section. Matching ignores
+case and extra whitespace. Chapter intervals remain in `notes.json` for provenance.
+Legacy blocks without a topic use their chapter title.
 
 Definitions, theorem statements, and proofs use `definition`, `theorem`, and
 `proof` blocks, rendered with LaTeX `amsthm` environments. Definitions and theorems
@@ -392,7 +393,9 @@ proofs can be separate steps. The model may supply missing reasoning, marked
 Unresolved content is reported and tagged `needs_review`.
 
 New-card positions follow **first appearance in the PDF**, including order within
-a page. All cards belonging to one note share one position. Immediately before
+a page. Generated lecture PDFs preserve the chronological chapter/block sequence;
+separately supplied PDFs define their own reading order. All cards belonging to
+one note share one position. Immediately before
 export, the command reads the local Anki collection, including its current WAL,
 without modifying it. The first note uses the next free position: the larger of
 Anki's allocation counter and the highest existing new-card position plus one.

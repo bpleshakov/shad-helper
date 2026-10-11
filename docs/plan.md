@@ -54,9 +54,10 @@ reject them before any rebuild, review, or rendering writes.
 
 - Use consecutive fifteen-minute chapters, bounded neighboring speech/visual context,
   an editable outline, shared glossary, accumulated topic names, and chapter checkpoints.
-  These chapters are processing intervals; group the rendered sections by broad
-  block topics across intervals, in first-appearance order. Preserve block order
-  within a topic and chapter provenance in JSON. Legacy blocks use chapter titles.
+  These chapters are processing intervals; render them by start time, preserving
+  the block sequence. Only adjacent blocks of the same broad topic share a section,
+  including across intervals. Keep later returns to a topic in their chronological
+  place and chapter provenance in JSON. Legacy blocks use chapter titles.
 - Send speech IDs, timestamps, text and clean visual records. Include the latest
   preceding frame for a potentially continuing slide. Isolate extraction diagnostics from
   generation, checkpoints, review, and render freshness. Lecture blocks cite valid

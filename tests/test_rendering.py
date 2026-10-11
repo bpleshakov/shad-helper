@@ -183,7 +183,7 @@ class RenderingTests(unittest.TestCase):
         self.assertNotIn(r"\maketitle", main)
         self.assertIn(r"\input{chapters/section-001.tex}", main)
 
-    def test_sections_follow_topics_across_processing_chapters(self):
+    def test_sections_preserve_chronology_when_topics_return(self):
         self.notes["glossary"] = []
         self.notes["chapters"][0]["blocks"] = [
             {"id": "knn-1", "kind": "text", "topic": "  Метод   ближайших соседей  ",
@@ -194,26 +194,34 @@ class RenderingTests(unittest.TestCase):
         self.notes["chapters"].append({
             "id": "chapter-2", "title": "Второй интервал", "start": 125, "end": 190,
             "blocks": [
+                {"id": "regression-2", "kind": "text", "topic": "линейная\n регрессия",
+                 "content": "Продолжение второй темы."},
                 {"id": "knn-2", "kind": "text", "topic": "метод ближайших\nсоседей",
                  "content": "Продолжение первой темы."},
-                {"id": "regression-2", "kind": "text", "topic": "Линейная регрессия",
-                 "content": "Продолжение второй темы."},
+                {"id": "regression-3", "kind": "text", "topic": "Линейная регрессия",
+                 "content": "Возвращение ко второй теме."},
             ],
         })
+        self.notes["chapters"].reverse()
         root, manifest = self.project()
         rendering._validate_project(root, manifest)
-        self.assertEqual(manifest["tex_files"], ["main.tex", "chapters/section-001.tex",
-                                               "chapters/section-002.tex"])
-        first = (root / "chapters/section-001.tex").read_text()
-        second = (root / "chapters/section-002.tex").read_text()
-        self.assertEqual(first.count(r"\section"), 1)
-        self.assertIn(r"\section{Метод ближайших соседей}", first)
-        self.assertLess(first.index("Первое определение."), first.index("Продолжение первой темы."))
-        self.assertNotIn("Модель регрессии.", first)
-        self.assertIn(r"\section{Линейная регрессия}", second)
-        self.assertLess(second.index("Модель регрессии."), second.index("Продолжение второй темы."))
-        self.assertNotIn("Второй интервал", first + second)
-        self.assertNotIn("Лекция:", first + second)
+        sections = [f"chapters/section-{number:03}.tex" for number in range(1, 5)]
+        self.assertEqual(manifest["tex_files"], ["main.tex", *sections])
+        sources = [(root / relative).read_text() for relative in sections]
+        self.assertIn(r"\section{Метод ближайших соседей}", sources[0])
+        self.assertIn(r"\section{Линейная регрессия}", sources[1])
+        self.assertEqual(sources[1].count(r"\section"), 1)
+        self.assertLess(sources[1].index("Модель регрессии."),
+                        sources[1].index("Продолжение второй темы."))
+        self.assertEqual([line.removeprefix("% shad-helper: block ")
+                          for source in sources for line in source.splitlines()
+                          if line.startswith("% shad-helper: block ")],
+                         ["knn-1", "regression-1", "regression-2", "knn-2", "regression-3"])
+        main = (root / "main.tex").read_text()
+        self.assertEqual([line for line in main.splitlines() if line.startswith(r"\input")],
+                         [r"\input{" + relative + "}" for relative in sections])
+        self.assertNotIn("Второй интервал", "".join(sources))
+        self.assertNotIn("Лекция:", "".join(sources))
 
     def test_legacy_blocks_use_chapter_title_and_topics_cannot_set_asset_paths(self):
         self.notes["chapters"][0]["blocks"] = [

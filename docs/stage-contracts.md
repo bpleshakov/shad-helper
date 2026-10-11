@@ -1480,12 +1480,14 @@ Times are absolute, floored to whole seconds, deduplicated and sorted; more than
 three times are compacted to their earliest/latest range. Review explanations
 are not printed as an appendix or separate warning passages.
 
-The writer groups blocks by `topic`, collapsing whitespace and comparing names
-case-insensitively. Each topic appears once in the order of its first block;
-blocks retain their relative order within that topic, even across processing
-chapters. Different topic names are not merged semantically. Blank or missing
-legacy topics fall back to the chapter title. Chapters and timestamps remain in
-`notes.json`; topic grouping does not change evidence or review provenance.
+The writer orders chapters by `start` and preserves each chapter's block sequence.
+Only adjacent blocks with matching `topic` names share a section, including across
+processing chapters. Names are compared case-insensitively after collapsing
+whitespace. Returning to a topic after another topic starts a later section;
+blocks are never moved back to an earlier section. Different topic names are not
+merged semantically. Blank or missing legacy topics fall back to the chapter title.
+Chapters and timestamps remain in `notes.json`; section boundaries do not change
+evidence or review provenance.
 
 Generating or importing notes rewrites generated source paths. Rendering
 compiles the existing project and preserves source edits. To edit content, use
@@ -1544,7 +1546,7 @@ appear as separate flags. `draft` is derived from this list during generation;
 the renderer also derives its report's draft flag from the list.
 
 The writer appends diagram files and section files while traversing the
-grouped topics; consumers must use the manifest rather than assume a sorted file
+chronological sections; consumers must use the manifest rather than assume a sorted file
 list. A regenerated project may leave obsolete files on disk. Only declared
 files belong to the current compilation contract. Regeneration removes the
 obsolete generator-owned `review.tex` from earlier projects.
@@ -1562,7 +1564,7 @@ This is the LuaLaTeX entry point. It contains:
 2. The marked draft footer region.
 3. Document start and a compact centered escaped lecture title.
 4. Body content on the same page, without a table of contents or forced page break.
-5. `\input{chapters/section-001.tex}` entries in topic first-appearance order.
+5. `\input{chapters/section-001.tex}` entries in lecture chronology.
 6. An inline glossary section when terms exist.
 7. Document end.
 

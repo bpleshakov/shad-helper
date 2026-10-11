@@ -300,10 +300,10 @@ def write_project(job: Path, notes: dict) -> Path:
     section_sources = []
     block_ids = set()
     chapter_ids = set()
-    topics = {}
+    sections = []
     review = _review_flags(notes)
     evidence_times = _evidence_times(job)
-    for chapter in notes.get("chapters", []):
+    for chapter in sorted(notes.get("chapters", []), key=lambda chapter: chapter["start"]):
         chapter_id = _identifier(chapter["id"])
         if chapter_id in chapter_ids:
             raise RenderError("Chapter IDs must be unique")
@@ -314,9 +314,11 @@ def write_project(job: Path, notes: dict) -> Path:
                 raise RenderError("Block IDs must be unique")
             block_ids.add(block_id)
             title = " ".join((block.get("topic") or "").split()) or " ".join(chapter["title"].split())
-            _, blocks = topics.setdefault(title.casefold(), (title, []))
-            blocks.append((chapter, block))
-    for number, (title, blocks) in enumerate(topics.values(), 1):
+            # A return to an earlier topic stays at its place in the lecture.
+            if not sections or sections[-1][0].casefold() != title.casefold():
+                sections.append((title, []))
+            sections[-1][1].append((chapter, block))
+    for number, (title, blocks) in enumerate(sections, 1):
         lines = ["\\section{" + escape_text(title) + "}"]
         for chapter, block in blocks:
             block_id = block["id"]
