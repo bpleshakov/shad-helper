@@ -29,6 +29,32 @@ def test_normalize_full_latex_with_internal_math_delimiters():
     assert normalize_latex(text) == text.replace("LATEX", "latex")
 
 
+@pytest.mark.parametrize("environment", ["cases", "aligned", "pmatrix"])
+@pytest.mark.parametrize("interval", ["[-1,1]", r"[-\lambda,\lambda]", r"[1,\lambda]", "[a,b]"])
+@pytest.mark.parametrize("delimiters", [(r"\[", r"\]"), ("[$$]", "[/$$]"),
+                                       ("[latex]", "[/latex]")])
+def test_normalize_braces_row_leading_intervals(environment, interval, delimiters):
+    body = r"\begin{" + environment + r"}1&x>0,\\" + interval + r",&x=0.\end{" + environment + "}"
+    source = delimiters[0] + body + delimiters[1]
+    normalized = normalize_latex(source)
+    assert r"\\{" + interval + "}" in normalized
+    assert normalize_latex(normalized) == normalized
+
+
+@pytest.mark.parametrize("spacing", ["2pt", "-1.5em", "1,2pt", "0,5cm", "-.3ex",
+                                     "1,2truept", "--1,2pt"])
+def test_normalize_preserves_explicit_row_spacing(spacing):
+    source = r"[$$]\begin{pmatrix}1&2\\[" + spacing + r"]3&4\end{pmatrix}[/$$]"
+    assert normalize_latex(source) == source
+
+
+def test_row_interval_repair_preserves_whitespace_and_prose():
+    prose = r"Текст с \\[-1,1]. "
+    source = prose + "[$$]" + r"\begin{cases}1,&x>0,\\*" + "\n " + r"[-1,1],&x=0.\end{cases}[/$$]"
+    expected = source.replace("\n [-1,1]", "\n {[-1,1]}")
+    assert normalize_latex(source) == expected
+
+
 @pytest.mark.parametrize(("source", "expected"), [
     (r"\(\widetilde{x}\)", r"[$]\widetilde{x}[/$]"),
     (r"\[\widetilde{AB}\]", r"[$$]\widetilde{AB}[/$$]"),
@@ -167,8 +193,12 @@ def test_real_russian_latex_and_matrix_render_with_snapshot_preamble(tmp_path):
         r"[$]\widetilde{x}\in\mathds{R},\quad \widetilde{x}<2[/$]",
         r"[$$]\text{Матрица } \widetilde{A}=\begin{pmatrix}1&2\\[2pt]3&4\end{pmatrix}[/$$]",
         r"[latex]Если \(x\in\mathbb{R}\), то \[x^2\geq 0.\][/latex]",
+        r"[$$]\partial f(x)=\begin{cases}\{1\},&x>0,\\\{-1\},&x<0,\\[-1,1],&x=0.\end{cases}[/$$]",
+        r"[$$]\partial_xg=x-p+\begin{cases}\{\lambda\},&x>0,\\\{-\lambda\},&x<0,\\[-\lambda,\lambda],&x=0.\end{cases}[/$$]",
+        r"[$$]\begin{pmatrix}1&2\\[1,2pt]3&4\end{pmatrix}[/$$]",
+        r"[$$]\begin{pmatrix}1&2\\[1,2truept]3&4\\[--1,2pt]5&6\end{pmatrix}[/$$]",
     ]
-    escaped = [html.escape(field, quote=False) for field in fields]
+    escaped = [html.escape(normalize_latex(field), quote=False) for field in fields]
     paths = render_latex_media([{"model": "Theorem Full proof", "fields": escaped}], tmp_path)
     assert len(paths) == len(fields)
     for path, field in zip(paths, escaped, strict=True):

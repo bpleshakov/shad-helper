@@ -135,6 +135,37 @@ def test_stage_exports_all_types_in_pdf_order_with_shared_note_positions(job, re
     ]
 
 
+def test_row_intervals_are_repaired_in_fields_and_cache_before_compilation(
+        job, response, client, no_latex_compile):
+    numeric = r"[$$]\begin{cases}1,&x>0,\\[-1,1],&x=0.\end{cases}[/$$]"
+    symbolic = r"[$$]\begin{cases}\lambda,&x>0,\\[-\lambda,\lambda],&x=0.\end{cases}[/$$]"
+    response["notes"][0]["back"] = numeric
+    response["notes"][3]["steps"][0] = symbolic
+    package = anki.generate_anki(job, job / "auth", client=client)
+    rows, _ = inspect_package(package)
+    guids = {row[0] for row in rows}
+    assert any(r"\\{[-1,1]}" in row[1] for row in rows)
+    assert any(r"\\{[-\lambda,\lambda]}" in row[1] for row in rows)
+    compiled_notes = no_latex_compile.call_args.args[0]
+    assert r"\\{[-1,1]}" in compiled_notes[0]["fields"][1]
+    cached = read_json(job / "checkpoints/anki.json")
+    assert r"\\{[-1,1]}" in cached["result"]["notes"][0]["back"]
+    assert r"\\{[-\lambda,\lambda]}" in cached["result"]["notes"][3]["steps"][0]
+
+    # Older cached responses get the same repair without another model request.
+    cached["result"]["notes"][0]["back"] = numeric
+    cached["result"]["notes"][3]["steps"][0] = symbolic
+    write_json(job / "checkpoints/anki.json", cached)
+    client.complete.reset_mock()
+    client.complete.side_effect = AssertionError("Unexpected model request")
+    package = anki.generate_anki(job, job / "auth", client=client)
+    client.complete.assert_not_called()
+    rows, _ = inspect_package(package)
+    assert {row[0] for row in rows} == guids
+    assert any(r"\\{[-1,1]}" in row[1] for row in rows)
+    assert any(r"\\{[-\lambda,\lambda]}" in row[1] for row in rows)
+
+
 def test_stage_positions_follow_existing_collection_and_record_source(
         job, client, collection_reader, tmp_path):
     collection = tmp_path / "selected-profile" / "collection.anki2"

@@ -378,6 +378,11 @@ Anki LaTeX: `[$]…[/$]` inline and `[$$]…[/$$]` for display equations. The ed
 LaTeX remains in the fields. Export requires `latex` and `dvipng` (TeX Live/MacTeX);
 the included images display after import without compiling them again.
 
+Before caching or exporting, Anki math normalization braces row-leading intervals:
+`\\[-1,1]` becomes `\\{[-1,1]}`. The same repair applies to cached responses.
+Explicit row spacing, including decimal-comma lengths such as `\\[1,2pt]`, is
+preserved. Stored fields and precompiled image names use the corrected LaTeX.
+
 Card generation separates statements, complete proofs, proof plans and individual
 steps. Definition steps show the common context and complete outline; proof steps
 show the statement and complete proof plan. Up to 15 populated logical steps are

@@ -26,6 +26,11 @@ _LATEX = re.compile(
 )
 _HTML = re.compile(r"<!--.*?-->|<style.*?>.*?</style>|<script.*?>.*?</script>|<.*?>",
                    re.IGNORECASE | re.DOTALL)
+_ROW_INTERVAL = re.compile(r"(?<!\\)(\\\\\*?)(\s*)(\[([^\[\]\r\n]*,[^\[\]\r\n]*)\])")
+_ROW_LENGTH = re.compile(
+    r"\s*(?:[+-]\s*)*(?:\d+(?:[.,]\d*)?|[.,]\d+)\s*"
+    r"(?:true\s*)?(?:pt|pc|in|bp|cm|mm|dd|cc|sp|ex|em)\s*", re.IGNORECASE,
+)
 # Harmless amsmath/amssymb/dsfont commands available in the existing preamble.
 _EXTRA_COMMANDS = re.compile(
     r"\\(?:mathds|mathfrak|textnormal|pmb|xrightarrow|xleftarrow|lnot|not|"
@@ -47,8 +52,19 @@ def _validate_body(body: str) -> None:
         raise ValueError(str(exc)) from exc
 
 
+def _brace_row_intervals(body: str) -> str:
+    def replace(match):
+        row, whitespace, interval, bounds = match.groups()
+        # TeX accepts decimal commas in lengths, e.g. \\[1,2pt].
+        if _ROW_LENGTH.fullmatch(bounds):
+            return match.group()
+        return row + whitespace + "{" + interval + "}"
+
+    return _ROW_INTERVAL.sub(replace, body)
+
+
 def normalize_latex(text: str) -> str:
-    """Convert legacy delimiters to Anki tags without unescaping LaTeX commands."""
+    """Convert delimiters and brace row-leading intervals without changing their meaning."""
     parts = []
     previous = 0
     active = None
@@ -86,7 +102,7 @@ def normalize_latex(text: str) -> str:
     if active is not None:
         raise ValueError("Unbalanced LaTeX delimiters")
     parts.append(text[previous:])
-    return "".join(parts)
+    return _LATEX.sub(lambda match: _brace_row_intervals(match.group()), "".join(parts))
 
 
 def _extract_latex(field: str) -> list[tuple[str, str]]:
