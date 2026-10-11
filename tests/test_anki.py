@@ -14,7 +14,7 @@ import pymupdf
 import pytest
 
 from shad_helper import anki
-from shad_helper.anki_schema import validate_response
+from shad_helper.anki_schema import generation_schema, validate_response
 from shad_helper.auth import PlanAccessError
 from shad_helper.jobs import fingerprint, read_json, write_json
 from shad_helper.openai_client import DEFAULT_MODEL, ResponseError
@@ -120,6 +120,66 @@ def inspect_package(path):
     return rows, media
 
 
+def sourced_reply(response):
+    reply = copy.deepcopy(response)
+    for note in reply["notes"]:
+        sources = {item["field"]: {key: value for key, value in item.items() if key != "field"}
+                   for item in note.pop("card_sources")}
+        for name, field in [("back", "Back"), ("overview", "Definition steps"),
+                            ("statement", "Statement"), ("proof", "Full proof"),
+                            ("plan", "Steps to prove")]:
+            if note.get(name) is not None:
+                note[name] = {"text": note[name], "source": sources[field]}
+        if "steps" in note:
+            note["steps"] = [{"text": step, "source": sources[f"Step {i}"]}
+                             for i, step in enumerate(note["steps"], 1)]
+    return reply
+
+
+def test_generation_schema_requires_sources_inside_answers_and_steps():
+    definitions = generation_schema()["$defs"]
+    answer = {"$ref": "#/$defs/SourcedText"}
+    for kind, fields in {"BasicNote": ["back"], "DefinitionNote": ["overview"],
+                         "ProofNote": ["statement"], "StepsNote": ["statement", "plan"]}.items():
+        properties = definitions[kind]["properties"]
+        assert "card_sources" not in properties
+        assert all(properties[field] == answer for field in fields)
+        if "steps" in properties:
+            assert properties["steps"]["items"] == answer
+    assert definitions["ProofNote"]["properties"]["proof"] == {
+        "anyOf": [answer, {"type": "null"}]}
+    assert definitions["SourcedText"]["required"] == ["text", "source"]
+    assert "field" not in definitions["AnswerSource"]["properties"]
+
+
+def test_sourced_generation_exports_all_card_types_without_mutating_raw_reply(job, response, client):
+    reply = sourced_reply(response)
+    original = copy.deepcopy(reply)
+    client.complete.return_value = reply
+    rows, _ = inspect_package(anki.generate_anki(job, job / "auth", client=client))
+    assert reply == original
+    assert len(rows) == 10
+    notes = read_json(job / "anki/notes.json")["notes"]
+    assert [[source["field"] for source in note["card_sources"]] for note in notes] == [
+        ["Back"], ["Definition steps", "Step 1", "Step 2"], ["Statement", "Full proof"],
+        ["Statement", "Steps to prove", "Step 1", "Step 2"]]
+    assert len(read_json(job / "anki/report.json")["cards"]) == len(rows)
+    assert client.complete.call_args.kwargs["schema"] == generation_schema()
+
+
+def test_missing_nested_source_is_rejected_and_raw_reply_is_retained(job, response, client):
+    reply = sourced_reply(response)
+    del reply["notes"][0]["back"]["source"]
+    client.complete.return_value = reply
+    with pytest.raises(ValueError, match="source"):
+        anki.generate_anki(job, job / "auth", client=client)
+    attempts = sorted((job / "diagnostics/anki").glob("*/attempt-*/response.json"))
+    assert len(attempts) == 4
+    assert all(read_json(path) == reply for path in attempts)
+    assert all(read_json(path.with_name("status.json"))["status"] == "failed" for path in attempts)
+    assert not (job / "anki/deck.apkg").exists()
+
+
 def test_stage_exports_all_types_in_pdf_order_with_shared_note_positions(job, response, client):
     response["notes"] = [response["notes"][i] for i in (3, 1, 0, 2)]
     package = anki.generate_anki(job, job / "auth", client=client)
@@ -182,6 +242,7 @@ def test_report_resolves_each_proof_step_locally_and_matches_exported_cards(job,
     note["card_sources"][1]["block_ids"] = ["b1", "b2"]
     note["supplemented_fields"] = ["Step 2"]
     note["review_flags"] = ["Проверить дополнение"]
+    client.complete.return_value = sourced_reply(response)
     package = anki.generate_anki(job, job / "auth", client=client)
     rows, _ = inspect_package(package)
     cards = read_json(job / "anki/report.json")["cards"]
@@ -444,7 +505,7 @@ def test_standalone_pdf_job_can_be_repeated_offline_and_rebuilt(tmp_path, client
 
     assert client.complete.call_count == 2
     assert read_json(job / "anki" / "identity.json") == identity
-    assert {path.name for path in job.iterdir()} == {"anki", "checkpoints"}
+    assert {path.name for path in job.iterdir()} == {"anki", "checkpoints", "diagnostics"}
 
 
 def test_cache_repackages_without_model_or_auth_and_keeps_identity(job, client, monkeypatch):
@@ -611,6 +672,13 @@ def test_valid_reply_after_retry_is_cached_and_published(job, client, response, 
     assert client.complete.call_count == 2
     no_retry_wait.assert_called_once_with(5)
     assert len(read_json(job / "checkpoints" / "anki.json")["result"]["notes"]) == 4
+    runs = list((job / "diagnostics/anki").iterdir())
+    assert len(runs) == 1
+    assert read_json(runs[0] / "attempt-01/response.json") == {"notes": []}
+    assert read_json(runs[0] / "attempt-01/status.json")["status"] == "failed"
+    assert read_json(runs[0] / "attempt-02/status.json")["status"] == "success"
+    # Local validation errors and failed responses never become retry inputs.
+    assert client.complete.call_args_list[0] == client.complete.call_args_list[1]
 
 
 def test_pdf_crop_pixels_math_and_supplements_survive_packaging(job, client, response):
@@ -701,6 +769,7 @@ def test_missing_proof_with_review_flag_exports_statement_without_empty_proof_ca
     response["notes"] = [response["notes"][2]]
     response["notes"][0].update(proof=None, review_flags=["Доказательство не восстановлено."])
     response["notes"][0]["card_sources"] = [response["notes"][0]["card_sources"][0]]
+    client.complete.return_value = sourced_reply(response)
     rows, _ = inspect_package(anki.generate_anki(job, job / "auth", client=client))
     assert len(rows) == 1
     assert rows[0][2:4] == (0, 1)

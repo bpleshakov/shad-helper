@@ -372,6 +372,14 @@ whole document or return a complete valid response, the command fails without
 publishing a partial deck. Temporary failures get three retries, after 5, 10 and
 20 seconds.
 
+Each generated answer and proof/definition step carries its own required source
+in the model response. The exporter derives the matching Anki field locally;
+the model does not have to keep a separate list of field names in sync.
+Raw responses and validation errors are retained locally in
+`JOB/diagnostics/anki/<run>/attempt-XX/response.json` and `status.json`.
+The terminal prints the diagnostic path on failure. These files are not sent
+to the model on retries.
+
 Import `JOB/anki/deck.apkg` into Anki. Each job has a distinct, persistent deck
 name ending in a short job ID. The package reuses the four existing note types
 `Basic`, `Multistep definition`, `Theorem Full proof`, and `Theorem step by step`,

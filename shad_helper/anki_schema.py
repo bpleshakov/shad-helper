@@ -1,5 +1,6 @@
 """Structured PDF-to-Anki output, independent of Anki's template ordinals."""
 
+from copy import deepcopy
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -15,16 +16,24 @@ class Source(BaseModel):
     order: int = Field(ge=1, description="Unique note order on its first source page")
 
 
-class CardSource(BaseModel):
+class AnswerSource(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    field: Text = Field(description="Exact answer field: Back, Statement, Full proof, "
-                       "Definition steps, Steps to prove, or Step 1..15")
     page: int = Field(ge=1, description="Physical PDF page containing this card's source")
     location: Text = Field(description="Heading, theorem/formula number or short exact "
                           "excerpt locating this card's source on the page")
     block_ids: list[Text] = Field(default_factory=list,
         description="Supporting block IDs from the supplied source catalog; empty only "
                     "when no catalog was provided")
+
+
+class CardSource(AnswerSource):
+    field: Text
+
+
+class SourcedText(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    text: Text
+    source: AnswerSource
 
 
 class Figure(BaseModel):
@@ -92,6 +101,64 @@ class AnkiResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+_ANSWER_FIELDS = {
+    "Basic": {"back": "Back"},
+    "Multistep definition": {"overview": "Definition steps"},
+    "Theorem Full proof": {"statement": "Statement", "proof": "Full proof"},
+    "Theorem step by step": {"statement": "Statement", "plan": "Steps to prove"},
+}
+
+
+def generation_schema() -> dict:
+    """Require a source alongside each answer, without a parallel field-name list."""
+    schema = AnkiResponse.model_json_schema()
+    sourced = SourcedText.model_json_schema()
+    schema["$defs"].update(sourced.pop("$defs"))
+    schema["$defs"]["SourcedText"] = sourced
+    schema["$defs"].pop("CardSource")
+    for definition in schema["$defs"].values():
+        properties = definition.get("properties", {})
+        kind = properties.get("note_type", {}).get("const")
+        if kind not in _ANSWER_FIELDS:
+            continue
+        properties.pop("card_sources")
+        for field in _ANSWER_FIELDS[kind]:
+            answer = {"$ref": "#/$defs/SourcedText"}
+            properties[field] = {"anyOf": [answer, {"type": "null"}]} if field == "proof" else answer
+        if "steps" in properties:
+            properties["steps"]["items"] = {"$ref": "#/$defs/SourcedText"}
+    return schema
+
+
+def _unpack_sourced_answers(value: dict) -> dict:
+    value = deepcopy(value)
+    if not isinstance(value.get("notes"), list):
+        return value
+    for note in value["notes"]:
+        if not isinstance(note, dict):
+            continue
+        answers = _ANSWER_FIELDS.get(note.get("note_type"), {})
+        steps = note.get("steps", [])
+        if not (any(isinstance(note.get(field), dict) for field in answers)
+                or isinstance(steps, list) and any(isinstance(step, dict) for step in steps)):
+            continue  # Existing caches and internal export data use plain text fields.
+        if "card_sources" in note:
+            raise ValueError("Sourced answers cannot also supply a separate card_sources list")
+        references = []
+        for field, target in answers.items():
+            if note.get(field) is not None:
+                answer = SourcedText.model_validate(note[field])
+                note[field] = answer.text
+                references.append({"field": target, **answer.source.model_dump()})
+        if isinstance(steps, list) and "steps" in note:
+            parsed = [SourcedText.model_validate(step) for step in steps]
+            note["steps"] = [step.text for step in parsed]
+            references.extend({"field": f"Step {i}", **step.source.model_dump()}
+                              for i, step in enumerate(parsed, 1))
+        note["card_sources"] = references
+    return value
+
+
 def note_fields(note: NoteBase) -> dict[str, str]:
     if isinstance(note, BasicNote):
         return {"Front": note.front, "Back": note.back}
@@ -107,7 +174,7 @@ def note_fields(note: NoteBase) -> dict[str, str]:
 
 
 def validate_response(value: dict, page_count: int) -> AnkiResponse:
-    result = AnkiResponse.model_validate(value)
+    result = AnkiResponse.model_validate(_unpack_sourced_answers(value))
     sources = set()
     for note in result.notes:
         for name in ("front", "back", "name", "overview", "statement", "proof", "plan"):

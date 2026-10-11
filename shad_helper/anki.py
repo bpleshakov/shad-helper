@@ -19,7 +19,7 @@ from .anki_latex import render_latex_media
 from .anki_models import get_models
 from .anki_positions import collection_position
 from .anki_prompt import INSTRUCTIONS, PROMPT_VERSION
-from .anki_schema import AnkiResponse, note_fields, validate_response
+from .anki_schema import generation_schema, note_fields, validate_response
 from .anki_sources import (
     card_records,
     load_lecture_sources,
@@ -38,18 +38,25 @@ from .openai_client import (
 )
 
 
-def _generate(client, pdf, page_count, sources):
+def _generate(client, pdf, page_count, sources, diagnostics):
     text = (f"Создай Anki-колоду по всему приложенному PDF ({page_count} страниц). "
             "Сохраняй порядок первого появления объектов и отмечай дополнения модели.")
     text += "\nКаталог блоков конспекта для привязки источников:\n" + json.dumps(
         source_catalog(sources), ensure_ascii=False)
     for attempt in range(4):
+        folder = diagnostics / f"attempt-{attempt + 1:02d}"
         try:
-            response = validate_response(client.complete(
-                INSTRUCTIONS, text, schema=AnkiResponse.model_json_schema(), pdf=pdf), page_count)
+            reply = client.complete(INSTRUCTIONS, text,
+                                    schema=generation_schema(), pdf=pdf)
+            write_json(folder / "response.json", reply)
+            response = validate_response(reply, page_count)
             validate_card_sources(response, page_count, sources)
+            write_json(folder / "status.json", {"status": "success"})
             return response
         except (PlanAccessError, ResponseError, ValueError) as exc:
+            write_json(folder / "status.json", {"status": "failed", "error": str(exc),
+                                               "error_type": type(exc).__name__})
+            print(f"Anki generation failed: {exc}\nDiagnostics: {folder}", flush=True)
             if getattr(exc, "code", None) == "context_length_exceeded":
                 raise RuntimeError("The complete PDF exceeds the model context limit; "
                                    "no partial Anki package was published.") from exc
@@ -57,8 +64,7 @@ def _generate(client, pdf, page_count, sources):
                     or getattr(exc, "code", None) == "model_unavailable"):
                 raise
             delay = 5 * 2 ** attempt
-            print(f"Anki generation failed ({type(exc).__name__}); "
-                  f"retry {attempt + 1}/3 in {delay} seconds.", flush=True)
+            print(f"Retrying Anki generation ({attempt + 1}/3) in {delay} seconds.", flush=True)
             time.sleep(delay)
     raise AssertionError("Unreachable retry state")
 
@@ -178,7 +184,7 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
     model = client.model if client is not None else DEFAULT_MODEL
     signature = fingerprint({"pdf_sha256": pdf_hash, "model": model,
         "reasoning_effort": DEFAULT_REASONING_EFFORT, "prompt_version": PROMPT_VERSION,
-        "instructions": INSTRUCTIONS, "schema": AnkiResponse.model_json_schema(),
+        "instructions": INSTRUCTIONS, "schema": generation_schema(),
         "source_catalog": source_catalog(lecture_sources)})
     cache_path = job / "checkpoints" / "anki.json"
     with pymupdf.open(stream=data, filetype="pdf") as document:
@@ -197,7 +203,9 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
             else:
                 print(f"Generating Anki cards from {len(document)} PDF pages", flush=True)
                 selected_client = client or PlanClient(state_dir, proxy=proxy)
-                response = _generate(selected_client, frozen_pdf, len(document), lecture_sources)
+                diagnostics = job / "diagnostics" / "anki" / str(time.time_ns())
+                response = _generate(selected_client, frozen_pdf, len(document), lecture_sources,
+                                     diagnostics)
                 write_json(cache_path, {"fingerprint": signature,
                                        "result": response.model_dump()})
             identity = _identity(folder, response.title)

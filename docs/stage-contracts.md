@@ -1557,13 +1557,20 @@ the floating figure. A missing destination fails rendering. Old projects without
 `source_blocks` can still render, but must be regenerated before lecture Anki
 export can produce recording references.
 
-Anki responses carry `card_sources` on every note: exactly one
+Model-facing Anki answers (`back`, `overview`, `statement`, `proof`, `plan`, and
+each `steps` item) are `{text, source: {page, location, block_ids}}` objects;
+an absent proof remains null. This makes source coverage part of the response
+schema. The exporter assigns Anki field names and step numbers locally.
+Normalized `anki/notes.json` and checkpoints carry `card_sources` on every note: exactly one
 `{field, page, location, block_ids}` record per populated answer field, including
 individual steps. PDF page/order still defines note identity and chronology.
 The model selects existing block IDs; recording times are resolved locally from
 their speech/frame evidence. The card report uses the actual exported GUID and
 template ordinal, not an assumed card count. `anki/report.json` schema version `2`
 includes these records in `cards`; `anki/sources.md` presents them as Markdown.
+Every model attempt retains its original JSON response and validation status
+under `diagnostics/anki/<run>/attempt-XX/`. Failed validation does not publish
+the deck or save a successful checkpoint, and diagnostics remain local.
 
 `review` entries for marked blocks use the block ID. Entries for unresolved
 issues use the issue ID. An uncertain block and its generated issue can both

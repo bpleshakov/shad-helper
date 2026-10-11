@@ -1,6 +1,7 @@
 """Per-card PDF references and locally resolved lecture timestamps."""
 
 import re
+from collections import Counter
 from pathlib import Path
 from urllib.parse import quote
 
@@ -44,11 +45,18 @@ def source_catalog(sources: dict | None) -> list[dict]:
 
 def validate_card_sources(response, page_count: int, sources: dict | None) -> None:
     for note in response.notes:
-        answers = {name for name, value in note_fields(note).items()
+        fields = note_fields(note)
+        answers = {name for name, value in fields.items()
                    if name not in {"Front", "Name"} and value}
+        counts = Counter(source.field for source in note.card_sources)
         if (len(note.card_sources) != len(answers)
-                or {source.field for source in note.card_sources} != answers):
-            raise ValueError("Every generated answer field requires exactly one card source")
+                or counts.keys() != answers):
+            name = fields.get("Name", fields.get("Front"))
+            raise ValueError("Every generated answer field requires exactly one card source: "
+                             f"{note.note_type} {name!r} (page {note.source.page}, "
+                             f"order {note.source.order}); missing={sorted(answers - counts.keys())}; "
+                             f"unexpected={sorted(counts.keys() - answers)}; "
+                             f"duplicate={sorted(key for key, count in counts.items() if count > 1)}")
         for source in note.card_sources:
             if source.page > page_count:
                 raise ValueError("Card source is outside the PDF")
