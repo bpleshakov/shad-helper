@@ -126,19 +126,21 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def checkpoint(job: Path, key: str, inputs: Any, action: Callable[[], Any]) -> Any:
+def checkpoint(job: Path, key: str, inputs: Any, action: Callable[[], Any], *,
+               progress: tuple[int, int] | None = None) -> Any:
     """Only successful stages are cached; interrupted actions can be rerun."""
     if (not key or Path(key).is_absolute()
             or any(part in ("..", "") for part in key.split("/"))):
         raise ValueError("Invalid checkpoint key")
     path = Path(job) / "checkpoints" / f"{key}.json"
     signature = fingerprint(inputs)
+    label = key if progress is None else f"{key} {progress[0]}/{progress[1]}"
     if path.exists():
         cached = read_json(path)
         if cached.get("fingerprint") == signature:
-            print(f"Reusing {key}", flush=True)
+            print(f"Reusing {label}", flush=True)
             return cached["result"]
-    print(f"Running {key}", flush=True)
+    print(f"Running {label}", flush=True)
     started = time.monotonic()
     result = action()
     write_json(path, {"fingerprint": signature, "seconds": time.monotonic() - started,
