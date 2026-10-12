@@ -86,7 +86,9 @@ def _identity(folder: Path, title: str) -> dict:
 
 
 def _field_html(value: str) -> str:
-    return html.escape(value, quote=False).replace("\n", "<br>\n")
+    # Anki turns <br> back into a newline before compiling LaTeX. A second
+    # literal newline would insert an invalid paragraph break inside math.
+    return html.escape(value, quote=False).replace("\n", "<br>")
 
 
 def _publish(staging: Path, folder: Path) -> None:

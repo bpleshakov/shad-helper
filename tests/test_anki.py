@@ -698,7 +698,7 @@ def test_pdf_crop_pixels_math_and_supplements_survive_packaging(job, client, res
     assert (job / "anki" / "media" / name).read_bytes() == image
     back = rows[0][1].split("\x1f")[1]
     assert f'<img src="{name}">' in back
-    assert "Строка &amp; смысл<br>\n" in back
+    assert "Строка &amp; смысл<br>" in back
     assert r"[$]0 &lt; x &lt; y \Rightarrow x^2 &lt; y^2[/$]" in back
     proof = next(row for row in rows if row[1].startswith("Единственность предела\x1f"))
     assert "Дополнено моделью: содержит сведения сверх PDF." in proof[1]

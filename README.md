@@ -389,6 +389,10 @@ Anki LaTeX: `[$]…[/$]` inline and `[$$]…[/$$]` for display equations. The ed
 LaTeX remains in the fields. Export requires `latex` and `dvipng` (TeX Live/MacTeX);
 the included images display after import without compiling them again.
 
+Field export encodes each source newline as a single `<br>`. Anki converts it
+back to one newline for LaTeX, preserving multiline formulas without introducing
+blank paragraphs in math. This also applies when repackaging a cached response.
+
 Before caching or exporting, Anki math normalization braces row-leading intervals:
 `\\[-1,1]` becomes `\\{[-1,1]}`. The same repair applies to cached responses.
 Explicit row spacing, including decimal-comma lengths such as `\\[1,2pt]`, is

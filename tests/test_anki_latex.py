@@ -11,6 +11,7 @@ import pymupdf
 import pytest
 
 from shad_helper import anki_latex
+from shad_helper.anki import _field_html
 from shad_helper.anki_latex import _extract_latex, normalize_latex, render_latex_media
 from shad_helper.anki_models import get_models
 
@@ -116,6 +117,13 @@ def test_extracted_bodies_and_filenames_match_native_anki(tmp_path):
         collection.close()
 
 
+def test_field_html_roundtrip_keeps_single_math_newlines_and_prose_paragraphs():
+    text = "Первый абзац\n\nВторой абзац\n[$$]x^2\n=1[/$$]"
+    field = _field_html(text)
+    assert "Первый абзац<br><br>Второй абзац<br>" in field
+    assert _extract_latex(field)[0][1] == "\\begin{displaymath}x^2\n=1\\end{displaymath}"
+
+
 def test_renderer_visits_all_fields_deduplicates_and_uses_original_preamble(tmp_path, monkeypatch):
     models = get_models()
     notes = []
@@ -197,8 +205,11 @@ def test_real_russian_latex_and_matrix_render_with_snapshot_preamble(tmp_path):
         r"[$$]\partial_xg=x-p+\begin{cases}\{\lambda\},&x>0,\\\{-\lambda\},&x<0,\\[-\lambda,\lambda],&x=0.\end{cases}[/$$]",
         r"[$$]\begin{pmatrix}1&2\\[1,2pt]3&4\end{pmatrix}[/$$]",
         r"[$$]\begin{pmatrix}1&2\\[1,2truept]3&4\\[--1,2pt]5&6\end{pmatrix}[/$$]",
+        (r"[$$]\hat\theta\in\operatorname*{arg\,min}_{\theta\in\mathbb R^d}"
+         r"\sum_{i=1}^n(y_i-x_i^\top\theta)^2" + "\n"
+         r"=\operatorname*{arg\,min}_{\theta\in\mathbb R^d}\|y-X\theta\|^2.[/$$]"),
     ]
-    escaped = [html.escape(normalize_latex(field), quote=False) for field in fields]
+    escaped = [_field_html(normalize_latex(field)) for field in fields]
     paths = render_latex_media([{"model": "Theorem Full proof", "fields": escaped}], tmp_path)
     assert len(paths) == len(fields)
     for path, field in zip(paths, escaped, strict=True):
