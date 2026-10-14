@@ -541,11 +541,8 @@ def _chapter_budget_error(context: dict, outline: dict,
     if size > MAX_CHAPTER_TEXT_BYTES:
         return (f"{size:,} text bytes exceed the local notes "
                 f"input budget ({MAX_CHAPTER_TEXT_BYTES:,} bytes)")
-    from .openai_client import MAX_IMAGE_ATTACHMENTS, image_attachments_size
+    from .openai_client import image_attachments_size
 
-    count = len({item["image_sha256"] for item in _context_illustrations(context).values()})
-    if count > MAX_IMAGE_ATTACHMENTS:
-        return f"{count} unique images exceed the image budget ({MAX_IMAGE_ATTACHMENTS})"
     if job is not None and evidence is not None:
         try:
             image_attachments_size(_chapter_images(job, evidence, context))

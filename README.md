@@ -192,9 +192,11 @@ can inspect their content directly. Local paths, confidence and extraction diagn
 are not sent. Only
 uncertainties discovered during note generation become note review issues.
 
-Chapters split above 1,200,000 UTF-8 bytes of instructions, context, and response
-schema, 24 unique images, or 40 MB of encoded image attachments. Byte-identical
-crops share one labeled attachment. A typed `context_length_exceeded` response also triggers a split and
+Local preflight thresholds split chapters above 1,200,000 UTF-8 bytes of
+instructions, context, and response schema, or 40 MB of encoded image attachments.
+These are application thresholds, not verified limits of the model endpoint.
+There is no local image-count cap. Byte-identical crops share one labeled
+attachment. A typed `context_length_exceeded` response also triggers a split and
 retry. Splitting stops before creating parts shorter than thirty seconds.
 Irreducible context is exported manually without dropping speech or visuals.
 Editable outlines must cover the entire interval consecutively in chapters

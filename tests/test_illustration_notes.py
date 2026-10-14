@@ -148,13 +148,23 @@ def test_identical_figure_recurring_after_another_frame_reuses_prior_block(tmp_p
     assert client.calls[1][0]["prior_illustrations"][0]["source"]["id"] == "f0_ill01"
 
 
-def test_image_budget_splits_without_dropping_observations(tmp_path):
-    evidence = prepare(tmp_path, times=tuple(range(10, 900, 25)), duration=900)
-    outline = notes._bounded_outline(evidence, notes.default_outline(evidence), job=tmp_path)
-    assert len(outline["chapters"]) > 1
-    assigned = [identifier for chapter in outline["chapters"]
-                for identifier in notes.chapter_context(evidence, chapter)["required_illustration_ids"]]
-    assert len(assigned) == len(set(assigned)) == len(evidence["visuals"])
+@pytest.mark.parametrize("duration,count", [(30, 25), (900, 36)])
+def test_more_than_24_unique_images_stay_in_one_chapter(tmp_path, duration, count):
+    evidence = prepare(tmp_path, times=tuple(number * duration / count for number in range(count)),
+                       duration=duration)
+    outline = notes.default_outline(evidence)
+    assert notes._bounded_outline(evidence, outline, job=tmp_path) == outline
+    client = Client()
+    assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client) == tmp_path / "notes/main.tex"
+    assert len(client.calls) == 1
+    context, images = client.calls[0]
+    expected = [f"f{number}_ill01" for number in range(count)]
+    assert context["required_illustration_ids"] == expected
+    assert [label for label, _ in images] == expected
+    assert len({data for _, data in images}) == count
+    [chapter] = read_json(tmp_path / "notes.json")["chapters"]
+    assert [item["illustration_id"] for item in chapter["illustration_coverage"]] == expected
+    assert read_json(tmp_path / "outline.json") == outline
 
 
 def test_unavailable_verification_falls_back_then_retries_cached_candidate(tmp_path, monkeypatch):

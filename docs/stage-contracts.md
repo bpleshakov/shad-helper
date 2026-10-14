@@ -68,8 +68,9 @@ selected PNGs into `notes/figures/illustration-<ID>.png`, emits confined
 renders without original crops. Model-authored drawing code cannot load files.
 Chapter checks accept the original asset job as their asset source.
 
-The editorial page target never removes illustrations. Request limits are
-1,200,000 text bytes, 24 unique PNG attachments, and 40 MB of base64 image data.
+The editorial page target never removes illustrations. Local request thresholds
+are 1,200,000 text bytes and 40 MB of base64 image data; these are application
+choices, not verified model-endpoint limits. There is no local image-count cap.
 Existing time splitting and complete manual handoff handle oversized contexts.
 
 ## Contents

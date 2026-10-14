@@ -601,8 +601,20 @@ if _FULL_DEPS:
             "input_text", "input_file", "input_text", "input_image"]
 
 
+    def test_more_than_24_images_reach_request_without_truncation(tmp_path):
+        image = png_attachment(tmp_path)
+        images = [(f"ill{number:03d}", image) for number in range(100)]
+        client, requests = client_for(tmp_path, sse(completed('{}')))
+        assert client.complete("Compare", "Lecture", images=images) == {}
+        content = json.loads(requests[-1].content)["input"][0]["content"]
+        assert [item["text"] for item in content[1::2]] == [label for label, _ in images]
+        assert [item["image_url"] for item in content[2::2]] == [
+            "data:image/png;base64," + base64.b64encode(image.read_bytes()).decode("ascii")
+        ] * len(images)
+
+
     @pytest.mark.parametrize("kind", ["missing", "directory", "empty", "wrong_format",
-                                      "malformed", "truncated", "blank_label", "count", "bytes"])
+                                      "malformed", "truncated", "blank_label", "bytes"])
     def test_invalid_image_fails_before_credentials_or_network(tmp_path, monkeypatch, kind):
         image = png_attachment(tmp_path)
         label = "ill01"
@@ -618,9 +630,7 @@ if _FULL_DEPS:
         elif kind == "blank_label":
             label = " "
         images = [(label, image)]
-        if kind == "count":
-            images *= 25
-        elif kind == "bytes":
+        if kind == "bytes":
             monkeypatch.setattr(openai_client, "MAX_IMAGE_ENCODED_BYTES", 12)
         client, requests = client_for(tmp_path, sse(completed('{}')))
         client.token_provider = lambda: pytest.fail("Invalid images must not access credentials")

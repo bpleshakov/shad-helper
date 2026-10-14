@@ -11,15 +11,12 @@ from shad_helper.network import openai_http_client, resolve_openai_proxy
 
 DEFAULT_MODEL = "gpt-6.1-sol"
 DEFAULT_REASONING_EFFORT = "high"
-MAX_PDF_BYTES = 50_000_000
-MAX_IMAGE_ATTACHMENTS = 24
+MAX_PDF_BYTES = 500_000_000
 MAX_IMAGE_ENCODED_BYTES = 40_000_000
 
 
 def _image_data(images):
     """Validate bounded PNG attachments before accessing credentials or the network."""
-    if len(images) > MAX_IMAGE_ATTACHMENTS:
-        raise ValueError(f"At most {MAX_IMAGE_ATTACHMENTS} image attachments are allowed.")
     result = []
     encoded_size = 0
     for label, path in images:
