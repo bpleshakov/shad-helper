@@ -111,13 +111,22 @@ class VisionWorkerTests(unittest.TestCase):
         self.assertEqual(item["content"], CONTENT)
         self.assertEqual(len(item["diagnostics"]["attempts"]), 2)
 
-    def test_detected_diagram_without_region_retries_then_preserves_full_frame(self):
-        self.runtime.infer.return_value = response({**CONTENT, "illustrations": []})
+    def test_matrix_description_without_illustration_preserves_text_and_is_cached(self):
+        content = {**CONTENT, "text": "Матрица признаков X и вектор ответов y.",
+                   "formulas": [r"X = \begin{pmatrix} x_{11} & x_{12} \\ x_{21} & x_{22} \end{pmatrix}"],
+                   "diagrams": [{"description": "Матричные обозначения на правой доске.",
+                                 "labels": ["X", "y"], "relationships": []}],
+                   "illustrations": []}
+        self.runtime.infer.return_value = response(content)
         item = vision_worker.run(self.request)["items"][0]
-        self.assertEqual(item["diagnostics"]["status"], "incomplete")
-        self.assertEqual(len(item["diagnostics"]["attempts"]), 2)
-        self.assertIn("require illustration regions", item["diagnostics"]["attempts"][0]["error"])
-        self.assertEqual(item["content"]["illustrations"][0]["box"], [0, 0, 1, 1])
+        self.assertEqual(item["diagnostics"]["status"], "complete")
+        self.assertEqual(item["content"], content)
+        self.assertEqual(len(item["diagnostics"]["attempts"]), 1)
+        self.runtime.infer.reset_mock()
+        resumed = vision_worker.run(self.request)
+        self.assertEqual(resumed["diagnostics"]["cached_items"], 1)
+        self.assertEqual(resumed["items"][0]["content"], content)
+        self.runtime.infer.assert_not_called()
 
     def test_token_truncation_retries_even_when_json_happens_to_be_valid(self):
         for metrics in ({"finish_reason": "length"},

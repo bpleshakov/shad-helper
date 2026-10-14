@@ -121,7 +121,7 @@ Audio evidence remains schema version 3, with title, media identity and interval
 and speech segments containing `id`, `start`, `end`, and `text`. Video evidence
 uses version 5 and adds timestamped `visuals`: source IDs, completion status,
 content kind, text, formulas, diagram descriptions, unreadable regions, and
-`illustrations` with source kind, crop bounds, stable IDs, and image hashes.
+`illustrations` candidates with source kind, crop bounds, stable IDs, and image hashes.
 Managed PNG crops and their manifest live under `illustrations/`. Crops include
 a three-percent frame margin to preserve nearby labels. Failed visual extraction
 retains an unknown source-image candidate for review instead of losing the frame.
@@ -238,11 +238,21 @@ Drawings become editable TikZ/PGFPlots and undergo a separate visual comparison
 between the rendered drawing and its source crop. Only an explicit pass accepts
 the reconstruction. Uncertain, failed, uncompilable, or unverifiable drawings use
 the source crop and create a review issue; slide illustrations use crops directly.
-Completed drawings and meaningful intermediate stages are preserved. Repeated
-observations can share an illustration block, but every chapter-owned observation
-must have an explicit coverage mapping. Merging different crops also requires a
-visual check; failed or uncertain consolidation preserves a separate source crop.
-Illustrations are never discarded to satisfy the editorial page target.
+Completed drawings and meaningful intermediate stages are preserved. The notes
+model first checks candidate pixels: logos, decoration, lecturer/clothing, code/UI,
+and handwriting or formulas without a figure are excluded with an explicit reason.
+Useful text and equations remain ordinary note content. Every chapter-owned
+candidate has a coverage decision: a figure block or an exclusion reason.
+A whole-frame fallback is a candidate, not a mandatory screenshot.
+Repeated views share a figure. A text catalog of earlier figures enables reuse
+across chapters without reattaching all earlier images. Merging different crops
+requires a visual check focused on the actual figure and its integral labels.
+Failed matches try already retained alternatives before adding another screenshot.
+Selected figures are cropped again from their native frames: include the complete
+drawing, axes, labels and legend, excluding surrounding notes, code and people.
+This can tighten a large crop or recover content clipped by the initial crop.
+Refined crops are separate managed assets; original frames and evidence stay intact.
+Actual illustrations are never discarded to satisfy the editorial page target.
 Ordinary source citations create no footnotes; only marked uncertainty does.
 The PDF has a compact title followed by topical sections, and no review
 appendix. Review issues remain available in the JSON files and through `review`.

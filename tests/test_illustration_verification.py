@@ -46,6 +46,7 @@ def example(tmp_path, monkeypatch):
         return png(folder / "preview.png")
 
     monkeypatch.setattr(verification.rendering, "render_diagram_preview", preview)
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("", False, ""))
     return job, evidence, notes, renders
 
 
@@ -365,3 +366,143 @@ def test_previous_chapter_consolidation_can_fall_back_in_current_chapter(example
     assert block(accepted)["illustration_id"] == "v02_ill01" and not retry
     assert accepted["chapters"][0]["illustration_coverage"][0]["block_id"] == block(accepted)["id"]
     assert block(previous)["illustration_id"] == "v01_ill01"
+
+
+def test_rejected_group_reuses_clearer_crop_but_preserves_new_stage(example):
+    job, evidence, notes, _ = example
+    add_aliased_observation(example)
+    chapter = notes["chapters"][0]
+    manifest = read_json(job / "illustrations" / "manifest.json")
+    # The original (220) is clipped; 100--104 show the complete figure, while
+    # 50--51 show a different meaningful stage. One repeat is byte-identical.
+    for number, shade in enumerate([101, 102, 103, 104, 100, 50, 51], 3):
+        visual_id = f"v{number:02d}"
+        identifier = visual_id + "_ill01"
+        source = png(job / "illustrations" / f"{identifier}.png", shade)
+        observation = {**evidence["visuals"][1]["illustrations"][0],
+                       "id": identifier, "image_sha256": sha256_file(source)}
+        evidence["visuals"].append({"id": visual_id, "timestamp": number + 3,
+                                     "status": "complete", "illustrations": [observation]})
+        manifest["assets"][identifier] = {"path": f"illustrations/{identifier}.png",
+                                          "sha256": observation["image_sha256"]}
+        chapter["illustration_coverage"].append({"illustration_id": identifier,
+                                                 "block_id": "drawing"})
+    write_json(job / "illustrations" / "manifest.json", manifest)
+
+    class FigureClient(Client):
+        def complete(self, instructions, text, schema, *, images):
+            source, representative = [pymupdf.Pixmap(path).samples[0] for _, path in images]
+            self.calls.append((source, representative))
+            same_stage = (100 <= source < 200 and 100 <= representative < 200
+                          or source < 100 and representative < 100)
+            return {"verdict": "pass" if same_stage else "fail",
+                    "reason": "Тот же рисунок." if same_stage else "Обрезан или другая стадия."}
+
+    client = FigureClient()
+    accepted, retry = finalize(example, client)
+    blocks = accepted["chapters"][0]["blocks"]
+    assert [item["illustration_id"] for item in blocks] == [
+        "v01_ill01", "v02_ill01", "v08_ill01"]
+    targets = [item["block_id"] for item in accepted["chapters"][0]["illustration_coverage"]]
+    assert targets == ["drawing", *([blocks[1]["id"]] * 6), *([blocks[2]["id"]] * 2)]
+    assert (101, 100) in client.calls and (51, 50) in client.calls
+    assert (50, 100) in client.calls and (51, 100) in client.calls
+    assert (100, 100) not in client.calls
+    assert not retry and len(accepted["issues"]) == 2
+    count = len(client.calls)
+    repeated, retry = finalize(example, client, "second-attempt")
+    assert repeated == accepted and not retry and len(client.calls) == count
+    archive = job / "attempt" / "illustration-coverage" / "v03_ill01"
+    assert read_json(archive / "accepted.json")["block_id"] == blocks[1]["id"]
+    assert read_json(archive / "alternatives" / blocks[1]["id"] / "verdict.json")["verdict"] == "pass"
+
+
+def test_excluded_observation_skips_consolidation(example):
+    _, _, notes, _ = example
+    add_aliased_observation(example)
+    notes["chapters"][0]["illustration_coverage"][1].update(
+        block_id="", exclusion_reason="decoration")
+    client = Client()
+    accepted, retry = finalize(example, client)
+    assert accepted == notes and not retry and not client.calls
+
+
+@pytest.mark.parametrize("verdict", ["pass", "fail"])
+def test_reconstruction_and_its_fallback_use_the_refined_source(example, monkeypatch, verdict):
+    job, _, _, _ = example
+    cropped = png(job / "refined.png", 80)
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("crop_1", False, ""))
+
+    def resolve(job, evidence, identifier, crop_id=""):
+        assert identifier == "v01_ill01" and crop_id == "crop_1"
+        return cropped
+
+    monkeypatch.setattr(verification, "resolve_crop", resolve)
+    client = Client({"verdict": verdict, "reason": "Результат сравнения."})
+    accepted, retry = finalize(example, client)
+    assert block(accepted)["illustration_crop_id"] == "crop_1"
+    assert block(accepted)["kind"] == ("diagram" if verdict == "pass" else "screenshot")
+    assert client.calls[0][3][0][1].read_bytes() == cropped.read_bytes()
+    assert (job / "attempt/illustration-verification/drawing/source.png").read_bytes() == cropped.read_bytes()
+    assert not retry
+
+
+def test_direct_screenshot_gets_refined_crop_without_reconstruction_check(example, monkeypatch):
+    job, evidence, notes, _ = example
+    block(notes)["kind"] = "screenshot"
+    evidence["visuals"][0]["illustrations"][0]["source_kind"] = "printed"
+    cropped = png(job / "refined.png", 80)
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("crop_1", False, ""))
+    monkeypatch.setattr(verification, "resolve_crop", lambda *args: cropped)
+    client = Client()
+    accepted, retry = finalize(example, client)
+    assert block(accepted)["illustration_crop_id"] == "crop_1"
+    assert not client.calls and not retry and not accepted["issues"]
+
+
+def test_consolidation_checks_refined_pixels_even_when_original_hashes_match(example, monkeypatch):
+    job, _, _, _ = example
+    add_aliased_observation(example, identical=True)
+    cropped = png(job / "refined.png", 80)
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("crop_1", False, ""))
+    monkeypatch.setattr(verification, "resolve_crop", lambda *args: cropped)
+    client = Client()
+    accepted, retry = finalize(example, client)
+    assert not retry and len(accepted["chapters"][0]["blocks"]) == 1
+    assert len(client.calls) == 2
+    for instructions, _, _, images in client.calls:
+        assert instructions == verification.CONSOLIDATION_INSTRUCTIONS
+        assert pymupdf.Pixmap(images[0][1]).samples[0] == 220
+        assert images[1][1].read_bytes() == cropped.read_bytes()
+    finalize(example, client, "second-attempt")
+    assert len(client.calls) == 2
+    png(cropped, 90)
+    finalize(example, client, "third-attempt")
+    assert len(client.calls) == 4
+
+
+def test_failed_consolidation_refines_new_fallback_before_accepting_it(example, monkeypatch):
+    job, _, _, _ = example
+    add_aliased_observation(example)
+    calls = []
+
+    def refine(job, evidence, selected, client, folder):
+        calls.append(selected["illustration_id"])
+        return ("crop_2" if selected["illustration_id"] == "v02_ill01" else "", False, "")
+
+    monkeypatch.setattr(verification, "refine_crop", refine)
+    accepted, retry = finalize(example, Client({"verdict": "fail", "reason": "Новая стадия."}))
+    fallback = accepted["chapters"][0]["blocks"][1]
+    assert calls == ["v01_ill01", "v02_ill01"]
+    assert fallback["illustration_crop_id"] == "crop_2" and not retry
+    archived = read_json(job / "attempt/illustration-coverage/v02_ill01/accepted-block.json")
+    assert archived["illustration_crop_id"] == "crop_2"
+
+
+def test_crop_failure_is_reviewable_and_does_not_hide_reconstruction_failure(example, monkeypatch):
+    reason = "Не удалось подобрать границы исходного рисунка."
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("", True, reason))
+    accepted, retry = finalize(example, Client({"verdict": "fail", "reason": "Неверная стрелка."}))
+    assert retry and block(accepted)["kind"] == "screenshot"
+    assert reason in accepted["issues"][0]["description"]
+    assert "Неверная стрелка." in accepted["issues"][0]["description"]

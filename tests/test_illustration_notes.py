@@ -9,6 +9,14 @@ from shad_helper.illustrations import materialize_illustrations
 from shad_helper.jobs import read_json, write_json
 
 
+@pytest.fixture(autouse=True)
+def no_crop_refinement(monkeypatch):
+    # These orchestration fixtures have synthetic crops but no original video
+    # frames. Native-frame refinement is covered separately.
+    monkeypatch.setattr("shad_helper.illustration_verification.refine_crop",
+                        lambda *args, **kwargs: ("", False, ""))
+
+
 def prepare(job, *, times=(10,), source_kind="printed", duration=120, identical=False):
     frames = []
     for number, timestamp in enumerate(times):
@@ -114,6 +122,52 @@ def test_coverage_rejects_silent_loss_and_invalid_targets(tmp_path, failure):
         notes.validate_notes(reply, evidence)
 
 
+@pytest.mark.parametrize("reason", ["decoration", "lecturer_or_clothing", "code_or_interface",
+                                    "text_or_formulas", "no_instructional_visual"])
+def test_false_candidates_are_explicitly_excluded_without_losing_real_figure(tmp_path, reason):
+    prepare(tmp_path, times=(10, 20))
+    evidence_bytes = (tmp_path / "evidence.json").read_bytes()
+
+    class FilteringClient(Client):
+        def complete(self, instructions, text, schema=None, *, images=None):
+            reply = super().complete(instructions, text, schema, images=images)
+            chapter = reply["chapters"][0]
+            chapter["blocks"].pop(0)
+            chapter["illustration_coverage"][0].update(block_id="", exclusion_reason=reason)
+            return reply
+
+    client = FilteringClient()
+    assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client) == tmp_path / "notes/main.tex"
+    [chapter] = read_json(tmp_path / "notes.json")["chapters"]
+    assert [block["illustration_id"] for block in chapter["blocks"]] == ["f1_ill01"]
+    assert chapter["illustration_coverage"][0] == {
+        "illustration_id": "f0_ill01", "block_id": "", "exclusion_reason": reason}
+    assert read_json(tmp_path / "notes/project.json")["image_files"] == ["figures/illustration-f1_ill01.png"]
+    assert read_json(tmp_path / "review.json")["ready"]
+    assert client.verifications == 0
+    assert (tmp_path / "evidence.json").read_bytes() == evidence_bytes
+
+
+@pytest.mark.parametrize("failure", ["unexplained", "budget", "contradictory", "still_rendered"])
+def test_coverage_rejects_invalid_exclusions(tmp_path, failure):
+    evidence = prepare(tmp_path)
+    context = notes.chapter_context(evidence, notes.default_outline(evidence)["chapters"][0])
+    reply = chapter_reply(context)
+    chapter = reply["chapters"][0]
+    decision = chapter["illustration_coverage"][0]
+    decision.update(block_id="", exclusion_reason="text_or_formulas")
+    if failure == "unexplained":
+        decision["exclusion_reason"] = ""
+    elif failure == "budget":
+        decision["exclusion_reason"] = "too_many_images"
+    elif failure == "contradictory":
+        decision["block_id"] = chapter["blocks"][0]["id"]
+    if failure != "still_rendered":
+        chapter["blocks"] = []
+    with pytest.raises(ValueError):
+        notes.validate_notes(reply, evidence)
+
+
 def test_repeated_observation_can_reuse_previous_chapter_figure(tmp_path):
     prepare(tmp_path, times=(890, 905), duration=1800, identical=True)
     client = Client(reuse=True)
@@ -146,6 +200,25 @@ def test_identical_figure_recurring_after_another_frame_reuses_prior_block(tmp_p
     chapters = read_json(tmp_path / "notes.json")["chapters"]
     assert chapters[1]["blocks"] == []
     assert client.calls[1][0]["prior_illustrations"][0]["source"]["id"] == "f0_ill01"
+
+
+def test_changed_crop_can_reuse_distant_figure_without_reattaching_prior_catalog(tmp_path):
+    evidence = prepare(tmp_path, times=(10, 150), duration=200)
+    evidence["visuals"].insert(1, {"id": "textonly", "timestamp": 50, "status": "complete",
+                                 "kind": "slides", "text": "Объяснение", "formulas": [],
+                                 "diagrams": [], "unreadable": [], "illustrations": []})
+    write_json(tmp_path / "evidence.json", evidence)
+    write_json(tmp_path / "outline.json", notes.default_outline(evidence, chunk_seconds=100))
+    client = Client(reuse=True)
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    chapters = read_json(tmp_path / "notes.json")["chapters"]
+    assert chapters[1]["blocks"] == []
+    assert chapters[1]["illustration_coverage"][0]["block_id"] == chapters[0]["blocks"][0]["id"]
+    context, images = client.calls[1]
+    assert context["prior_illustrations"][0]["source"]["id"] == "f0_ill01"
+    assert [label for label, _ in images] == ["f1_ill01"]
+    assert client.verifications == 1
+    assert len(list((tmp_path / "handoff/inputs/ch002/images").glob("*.png"))) == 1
 
 
 @pytest.mark.parametrize("duration,count", [(30, 25), (900, 36)])

@@ -56,6 +56,79 @@ def test_screenshots_copy_only_declared_crop_and_keep_description(illustrated_jo
     assert manifest["source_blocks"][0]["illustration_id"] == "frame_1_ill01"
 
 
+@pytest.fixture
+def refined_crop(illustrated_job):
+    from shad_helper.illustration_crops import refine_crop, resolve_crop
+
+    job, evidence, notes = illustrated_job
+    evidence["media"]["sha256"] = "a" * 64
+    write_json(job / "evidence.json", evidence)
+    frames = job / "frames"
+    frames.mkdir()
+    shutil.copyfile(job / "illustrations/frame_1_ill01.png", frames / "frame_1_aaaaaaaaaaaa.png")
+
+    def make_crop(box, name="crop"):
+        class Client:
+            def complete(self, *args, **kwargs):
+                return {"status": "cropped", "box": box,
+                        "reason": "Keep only the selected drawing region."}
+
+        crop_id, retry_needed, reason = refine_crop(
+            job, evidence, {**notes["chapters"][0]["blocks"][0], "content": name},
+            Client(), job / name)
+        assert crop_id and not retry_needed and not reason
+        return crop_id, resolve_crop(job, evidence, "frame_1_ill01", crop_id)
+
+    return make_crop
+
+
+def test_refined_screenshot_copies_selected_pixels_and_keeps_crop_provenance(
+        illustrated_job, refined_crop):
+    job, _, notes = illustrated_job
+    crop_id, selected = refined_crop([0, 0, 60, 70])
+    selected_pixels = selected.read_bytes()
+    notes["chapters"][0]["blocks"][0]["illustration_crop_id"] = crop_id
+    root = rendering.write_project(job, notes).parent
+    manifest = read_json(root / "project.json")
+    assert manifest["image_files"] == ["figures/illustration-ch001_b1.png"]
+    copied = root / manifest["image_files"][0]
+    assert copied.read_bytes() == selected_pixels
+    assert copied.read_bytes() != (job / "illustrations/frame_1_ill01.png").read_bytes()
+    assert manifest["source_blocks"][0]["illustration_crop_id"] == crop_id
+    shutil.rmtree(job / "illustrations")
+    shutil.rmtree(job / "illustration-crops")
+    shutil.rmtree(job / "frames")
+    rendering._validate_project(root, manifest)
+    assert copied.read_bytes() == selected_pixels
+
+
+def test_two_refined_crops_of_one_illustration_do_not_overwrite_each_other(
+        illustrated_job, refined_crop):
+    job, _, notes = illustrated_job
+    first_id, first = refined_crop([0, 0, 60, 70], "left-crop")
+    second_id, second = refined_crop([60, 0, 120, 70], "right-crop")
+    first_block = notes["chapters"][0]["blocks"][0]
+    first_block["illustration_crop_id"] = first_id
+    notes["chapters"][0]["blocks"].append({
+        **first_block, "id": "ch001_b2", "illustration_crop_id": second_id})
+    root = rendering.write_project(job, notes).parent
+    manifest = read_json(root / "project.json")
+    assert manifest["image_files"] == ["figures/illustration-ch001_b1.png",
+                                       "figures/illustration-ch001_b2.png"]
+    assert (root / manifest["image_files"][0]).read_bytes() == first.read_bytes()
+    assert (root / manifest["image_files"][1]).read_bytes() == second.read_bytes()
+    assert first.read_bytes() != second.read_bytes()
+    rendering._validate_project(root, manifest)
+
+
+@pytest.mark.parametrize("crop_id", ["missing", "a" * 64, "../crop", r"\input{secret}"])
+def test_screenshot_rejects_invalid_derived_crop_reference(illustrated_job, crop_id):
+    job, _, notes = illustrated_job
+    notes["chapters"][0]["blocks"][0]["illustration_crop_id"] = crop_id
+    with pytest.raises(rendering.RenderError):
+        rendering.write_project(job, notes)
+
+
 def test_legacy_project_without_image_files_remains_valid(illustrated_job):
     job, _, notes = illustrated_job
     notes["chapters"][0]["blocks"][0].update(kind="text", illustration_id="")
@@ -133,13 +206,21 @@ needs_tex = pytest.mark.skipif(not shutil.which("latexmk") or not shutil.which("
 
 
 @needs_tex
-def test_cropped_screenshot_pdf_is_portable_and_keeps_manual_edits(illustrated_job):
+@pytest.mark.parametrize("refined", [False, True])
+def test_cropped_screenshot_pdf_is_portable_and_keeps_manual_edits(
+        illustrated_job, refined_crop, refined):
     job, _, notes = illustrated_job
+    if refined:
+        crop_id, _ = refined_crop([0, 0, 60, 70])
+        notes["chapters"][0]["blocks"][0]["illustration_crop_id"] = crop_id
     root = rendering.write_project(job, notes).parent
     source = root / "chapters/section-001.tex"
     manual = source.read_text() + "\nАвторская правка.\n"
     source.write_text(manual)
     shutil.rmtree(job / "illustrations")
+    shutil.rmtree(job / "frames")
+    if refined:
+        shutil.rmtree(job / "illustration-crops")
     pdf = rendering.render(job)
     assert source.read_text() == manual
     with pymupdf.open(pdf) as document:
@@ -149,6 +230,8 @@ def test_cropped_screenshot_pdf_is_portable_and_keeps_manual_edits(illustrated_j
     assert mapping["illustration_id"] == "frame_1_ill01"
     assert mapping["content"] == "Стрелка A"
     assert mapping["page_start"] == mapping["page_end"] == 1
+    if refined:
+        assert mapping["illustration_crop_id"] == crop_id
 
 
 @needs_tex

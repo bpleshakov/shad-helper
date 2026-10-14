@@ -39,8 +39,9 @@ INSTRUCTIONS = r"""Ты составляешь компактный русски
 Соседний контекст нужен для понимания; не дублируй его в этой главе.
 Источники — предоставленные сегменты речи и, если есть, visual-записи с ID.
 visuals содержит локально распознанные текст, формулы и описания кадров с
-временем timestamp. Это распознавание может ошибаться. Если есть illustrations,
-соответствующие изображения приложены отдельно с их ID; проверяй описания по ним.
+временем timestamp. Это распознавание может ошибаться. illustrations — кандидаты,
+а не подтверждённые учебные рисунки. Их изображения приложены с ID: сначала проверь
+по пикселям, есть ли в каждом настоящая учебная иллюстрация, не доверяй описанию.
 Сопоставляй речь и visual-записи, не исправляй спорные символы по догадке.
 status=complete означает завершение распознавания, а не его точность.
 Отмечай сомнения только в существенном учебном материале, включенном в конспект.
@@ -55,9 +56,19 @@ status=complete означает завершение распознавания
 содержательные объяснения и связи между понятиями. Убирай словесные повторы,
 но сохраняй логические переходы доказательств. Пример добавляй,
 только если он объясняет новый принцип, ограничение или типичную ошибку.
-Все предоставленные учебные illustrations обязательно сохрани: ограничение
-объёма не разрешает их удалять. Повторные виды одного рисунка объединяй;
-сохраняй завершённый рисунок и промежуточные стадии с самостоятельным смыслом.
+Учебная иллюстрация — график, схема, геометрический рисунок, содержательная таблица
+или фотография, чья визуальная структура объясняет учебный материал. Логотипы,
+декорации, лектор/аудитория, принты на одежде, код/импорты/интерфейс notebook,
+обычный текст, рукописные определения, вычисления и формулы сами по себе не являются
+иллюстрациями. Матрица или стрелка между шагами вычисления не делает запись рисунком.
+Содержательные текст и формулы передай обычными блоками, не снимками доски.
+В полном кадре после ошибки распознавания тоже может не быть ни одной иллюстрации.
+Если рядом с настоящим графиком есть код, формулы или лектор, сам график сохрани.
+Все настоящие учебные иллюстрации обязательно сохрани: ограничение объёма не повод
+их удалять. Повторные виды одного рисунка объединяй в один блок с наиболее полным,
+читаемым исходным изображением. Изменение рамки, прокрутка, движение лектора,
+появление обычных записей рядом и косметические правки не создают новый рисунок.
+Сохраняй завершённый рисунок и промежуточные стадии с самостоятельным учебным смыслом.
 Излагай материал прямо: без «лектор сказал», «студент спросил», пересказа диалога,
 описаний кадров/действий лектора, организационных объявлений и правил оценивания.
 Ответ на содержательный вопрос включай как объяснение без истории обсуждения.
@@ -133,12 +144,25 @@ includegraphics, внешних файлов, shell-команд или Lua. С�
 В diagram и screenshot укажи illustration_id выбранного исходного изображения
 и включи его в evidence_ids. В screenshot content — краткое описание смысла,
 caption — учебная подпись; путь и команды загрузки изображения добавит рендерер.
+В рисунок входят только сама фигура, её оси, стрелки, подписи и полная легенда.
+Не включай соседние самостоятельные формулы, текст, код, человека и декорации.
+illustration_crop_id оставляй пустым: точную рамку по исходному кадру уточняет
+отдельный этап после выбора фигуры; он может восстановить обрезанную легенду.
 Для каждого ID из required_illustration_ids верни ровно одну запись
-illustration_coverage: {illustration_id, block_id}. Несколько повторных наблюдений
-могут ссылаться на один блок. Текстовый блок не заменяет иллюстрацию.
-prior_illustrations содержит ранее включённые рисунки; повторное наблюдение можно
-сопоставить их block_id, не создавая дубликат. Если появилась новая существенная
-стадия, создай новый блок. Не сопоставляй разные рисунки одному блоку.
+illustration_coverage: {illustration_id, block_id, exclusion_reason}.
+Для настоящего рисунка укажи block_id и exclusion_reason="". Несколько повторных
+наблюдений должны ссылаться на один блок; текстовый блок не заменяет рисунок.
+Для ложного кандидата не создавай блок: block_id="", а exclusion_reason выбери из
+decoration (логотип/декор), lecturer_or_clothing (лектор/одежда), code_or_interface
+(код/интерфейс), text_or_formulas (только текст/формулы), no_instructional_visual
+(нет учебного изображения). Это явное решение, а не пропуск ID. Не исключай настоящий
+рисунок из-за неясных деталей, сложности, повтора или бюджета: сохрани снимок либо
+сошлись на уже включённую фигуру. Не создавай замечания review о ложных кандидатах.
+prior_illustrations — каталог ранее включённых рисунков всей лекции с описаниями;
+их исходные изображения могут не быть приложены. Для возвращения к тому же рисунку
+сошлись на его block_id, не создавая дубликат: соответствие проверяется отдельно по
+обоим изображениям. Если появилась новая существенная стадия, создай новый блок.
+Не сопоставляй разные рисунки одному блоку.
 Если required_illustration_ids отсутствует, используй illustration_coverage=[].
 Все ID — до 80 символов: ASCII буквы, цифры, дефис или подчеркивание; начни с
 буквы или цифры и используй префикс главы.
@@ -216,31 +240,28 @@ def chapter_context(evidence: dict, chapter: dict, overlap: float | None = None)
     return context
 
 
-def _prior_illustrations(context: dict, previous: list[dict], evidence: dict) -> list[dict]:
+def _prior_illustrations(previous: list[dict], evidence: dict) -> list[dict]:
     from .illustrations import illustration_index
 
-    visible = illustration_index(context)
     sources = illustration_index(evidence)
-    visible_hashes = {item["image_sha256"] for item in visible.values()}
     chapters = [chapter for part in previous for chapter in part["chapters"]]
-    blocks = {block["id"]: block for chapter in chapters for block in chapter["blocks"]}
-    selected = dict.fromkeys(
-        coverage["block_id"] for chapter in chapters
-        for coverage in chapter.get("illustration_coverage", [])
-        if coverage["illustration_id"] in visible
-        or sources.get(coverage["illustration_id"], {}).get("image_sha256") in visible_hashes)
-    return [{"block_id": identifier, "caption": blocks[identifier]["caption"],
-             "source": sources[blocks[identifier]["illustration_id"]]}
-            for identifier in selected if identifier in blocks
-            and blocks[identifier].get("illustration_id") in sources]
+    return [{"block_id": block["id"], "caption": block["caption"],
+             "source": sources[block["illustration_id"]]}
+            for chapter in chapters for block in chapter["blocks"]
+            if block.get("illustration_id") in sources]
 
 
 def _context_illustrations(context: dict) -> dict:
     from .illustrations import illustration_index
 
-    return {**illustration_index(context),
-            **{item["source"]["id"]: item["source"]
-               for item in context.get("prior_illustrations", [])}}
+    visible = illustration_index(context)
+    hashes = {item["image_sha256"] for item in visible.values()}
+    # Keep the complete prior catalog in text, without reattaching the entire
+    # lecture. Reused figures are compared with their original pixels separately.
+    return {**visible, **{item["source"]["id"]: item["source"]
+                         for item in context.get("prior_illustrations", [])
+                         if item["source"]["id"] in visible
+                         or item["source"]["image_sha256"] in hashes}}
 
 
 def _chapter_images(job: Path, evidence: dict, context: dict) -> list[tuple[str, Path]]:
@@ -276,7 +297,7 @@ def _validate_illustration_coverage(notes: dict, evidence: dict, previous: list[
     for chapter in sorted(notes["chapters"], key=lambda item: item["start"]):
         context = chapter_context(evidence, chapter)
         sources = illustration_index(context)
-        prior = _prior_illustrations(context, preceding, evidence)
+        prior = _prior_illustrations(preceding, evidence)
         targets = {item["block_id"] for item in prior}
         for block in chapter["blocks"]:
             source_id = block.get("illustration_id", "")
@@ -294,8 +315,11 @@ def _validate_illustration_coverage(notes: dict, evidence: dict, previous: list[
         if len(covered) != len(set(covered)) or set(covered) != set(required):
             raise ValueError(f"Incomplete illustration coverage in {chapter['id']}; "
                              f"required: {required}")
-        if any(item["block_id"] not in targets for item in coverage):
+        if any(item["block_id"] and item["block_id"] not in targets for item in coverage):
             raise ValueError("Illustration coverage must reference a current or prior illustration block")
+        excluded = {item["illustration_id"] for item in coverage if item["exclusion_reason"]}
+        if any(block.get("illustration_id") in excluded for block in chapter["blocks"]):
+            raise ValueError("Excluded illustration candidates cannot produce figure blocks")
         preceding.append({"chapters": [chapter]})
 
 
@@ -696,7 +720,7 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
             part = _validate_chapter_reply(reply, evidence, chapter, resolutions, previous=parts)
             context = chapter_context(evidence, chapter)
             if illustration_index(context):
-                context["prior_illustrations"] = _prior_illustrations(context, parts, evidence)
+                context["prior_illustrations"] = _prior_illustrations(parts, evidence)
                 part = _finalize_chapter(part, evidence, job, run / "verification" / chapter["id"],
                                          client, resolutions, parts)
                 contexts[chapter["id"]] = _model_context(context, outline, outline["glossary"])
@@ -718,7 +742,7 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                 chapter = outline["chapters"][position]
                 context = chapter_context(evidence, chapter)
                 if illustration_index(context):
-                    context["prior_illustrations"] = _prior_illustrations(context, parts, evidence)
+                    context["prior_illustrations"] = _prior_illustrations(parts, evidence)
                 reason = _chapter_budget_error(context, outline, glossary, list(topics.values()),
                                               job=job, evidence=evidence)
                 if reason:

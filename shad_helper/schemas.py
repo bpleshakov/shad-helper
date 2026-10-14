@@ -51,10 +51,13 @@ class NoteBlock(StrictModel):
     caption: str = ""
     language: str = ""
     illustration_id: Identifier | Literal[""] = ""
+    illustration_crop_id: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     uncertain_fragments: list[UncertainFragment] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def valid_uncertain_fragments(self):
+        if self.illustration_crop_id and not self.illustration_id:
+            raise ValueError("Refined crops require an illustration ID")
         if self.kind == "screenshot" and not self.illustration_id:
             raise ValueError("Screenshots require an illustration ID")
         if self.illustration_id and self.kind not in {"diagram", "screenshot"}:
@@ -98,7 +101,17 @@ class NoteBlock(StrictModel):
 
 class IllustrationCoverage(StrictModel):
     illustration_id: Identifier
-    block_id: Identifier
+    block_id: Identifier | Literal[""] = ""
+    exclusion_reason: Literal[
+        "", "decoration", "lecturer_or_clothing", "code_or_interface",
+        "text_or_formulas", "no_instructional_visual",
+    ] = ""
+
+    @model_validator(mode="after")
+    def represented_or_excluded(self):
+        if bool(self.block_id) == bool(self.exclusion_reason):
+            raise ValueError("Illustration coverage requires either a block or an exclusion reason")
+        return self
 
 
 class Chapter(StrictModel):

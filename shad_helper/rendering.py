@@ -347,15 +347,16 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
                 tex_files.append(relative)
                 lines.append("\\begin{figure}[htbp]\n\\centering\n\\input{" + relative + "}\n\\caption{" + escape_text(block.get("caption", "Схема")) + "}\n\\end{figure}\n")
             elif kind == "screenshot":
-                from .illustrations import resolve_illustration
+                from .illustration_crops import resolve_crop
 
                 illustration_id = _identifier(block.get("illustration_id", ""))
+                crop_id = block.get("illustration_crop_id", "")
                 try:
                     evidence = read_json(job / "evidence.json")
-                    source = resolve_illustration(asset_job or job, evidence, illustration_id)
+                    source = resolve_crop(asset_job or job, evidence, illustration_id, crop_id)
                 except (OSError, ValueError) as error:
                     raise RenderError(f"Cannot resolve illustration {illustration_id}: {error}") from error
-                relative = f"figures/illustration-{illustration_id}.png"
+                relative = f"figures/illustration-{block_id if crop_id else illustration_id}.png"
                 destination = _confined(root, relative)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, destination)
@@ -401,7 +402,9 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
             source_blocks.append({"id": block_id, "topic": title, "content": content,
                                   "evidence_ids": block.get("evidence_ids", []),
                                   **({"illustration_id": block["illustration_id"]}
-                                     if block.get("illustration_id") else {})})
+                                     if block.get("illustration_id") else {}),
+                                  **({"illustration_crop_id": block["illustration_crop_id"]}
+                                     if block.get("illustration_crop_id") else {})})
         relative = f"chapters/section-{number:03}.tex"
         _write(root, relative, "\n\n".join(lines) + "\n")
         tex_files.append(relative)

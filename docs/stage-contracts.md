@@ -26,25 +26,35 @@ Each visual adds `illustrations`, an array of objects with exactly `id`,
 `description`, and `image_sha256`. IDs append `_illNN` to the frame ID. Crop bounds
 include a three-percent frame margin, clamped and rounded to native pixels. Worker
 output contains only source kind, detected box, and description; extraction assigns
-IDs, hashes, and final crop bounds. A detected diagram without an illustration region
-is invalid worker output. Exhausted extraction retries retain an unknown full-frame
+IDs, hashes, and candidate crop bounds. Diagram descriptions alone do not require a
+crop: formulas or matrices may be described there without an illustration.
+Exhausted extraction retries retain an unknown full-frame
 candidate instead of silently dropping instructional content.
 
 `illustrations/manifest.json` contains `{version: 1, assets: {ID: {path, sha256}}}`.
 Paths are job-relative managed PNGs. Every read validates confinement, the evidence
 and manifest hashes, and PNG decoding. These local paths do not enter model context.
 
-Chapter context adds `required_illustration_ids` for observations owned by the core
-interval and `prior_illustrations` for relevant accepted figures. Each chapter
-returns `illustration_coverage: [{illustration_id, block_id}]`; every required ID
-occurs exactly once and targets an illustration block in this or an eligible earlier
-chapter. A text citation alone does not preserve an illustration. Repeated views
-may share a block; meaningful intermediate stages remain separate.
+Chapter context adds `required_illustration_ids` for candidates owned by the core
+interval and a text catalog `prior_illustrations` of accepted figures from all
+earlier chapters. Each chapter returns
+`illustration_coverage: [{illustration_id, block_id, exclusion_reason}]`.
+Every required ID occurs exactly once. Real figures target a block in this or an
+earlier chapter, with an empty exclusion reason. False candidates have an empty
+block ID and one explicit reason: `decoration`, `lecturer_or_clothing`,
+`code_or_interface`, `text_or_formulas`, or `no_instructional_visual`. Excluded
+candidates cannot produce figure blocks. Both/neither decisions and unsupported
+reasons are invalid. Older represented decisions default to an empty reason.
+A text citation alone does not preserve a real illustration. Repeated views share
+a block; meaningful stages remain separate. Full-frame fallbacks undergo the same
+classification and are not automatically included.
 
 `diagram` and new `screenshot` blocks select their source using `illustration_id`
 and cite it in `evidence_ids`. Screenshot content is a description, not a path or
 TeX command. Printed/unknown sources use screenshots; drawn sources prefer TikZ.
 The chapter model receives labeled PNG attachments (`input_image`, high detail).
+Prior catalog images are attached only when already visible or byte-identical to
+current context; proposed reuse is checked separately using both source images.
 Identical hashes share one attachment; `images.json` records all its observation
 IDs and the relative PNG filename in handoffs and request archives.
 
@@ -52,7 +62,10 @@ Before accepting a drawing, the pipeline compiles an isolated preview and compar
 it with the source in a separate model call. Only `pass` preserves TikZ; `fail`,
 `uncertain`, compilation failure, or unavailable verification preserves a source
 screenshot and opens a review issue. Consolidation of different source hashes also
-requires visual verification; failed consolidation creates a separate crop block.
+requires visual verification focused on the figure and integral labels, ignoring
+unrelated surrounding text, formulas, code, people and decoration. A failed match
+tries retained alternative representatives from its group before creating another
+crop block. Excluded candidates skip reconstruction and consolidation checks.
 Imported drawings receive the same checks. Candidates, exact credential-free model
 requests, previews, verdicts, and accepted blocks are archived locally.
 
@@ -67,6 +80,18 @@ selected PNGs into `notes/figures/illustration-<ID>.png`, emits confined
 `includegraphics` references, and preserves source anchors. The copied project
 renders without original crops. Model-authored drawing code cannot load files.
 Chapter checks accept the original asset job as their asset source.
+
+Accepted figures undergo native-frame crop refinement. The model sees the full
+frame and original candidate crop, and selects tight pixel bounds containing the
+whole figure, axes, labels and legend. Bounds may expand beyond the original crop
+to recover clipped content. The block's `illustration_crop_id` selects a separately
+managed derivative under `illustration-crops/`; empty selects the original crop.
+Generated notes leave this field empty until refinement fills it. Refinement caches
+bind frame and candidate hashes, selected figure, prompt/schema and model. Resolvers
+check source-ID/hash binding, path confinement and derivative PNG integrity.
+The renderer copies the selected derivative into the portable project; original
+evidence and crops are preserved. Unavailable or uncertain refinement retains the
+original crop with a review issue.
 
 The editorial page target never removes illustrations. Local request thresholds
 are 1,200,000 text bytes and 40 MB of base64 image data; these are application
@@ -618,7 +643,8 @@ Recognition uses thinking disabled, temperature zero, a 2,200,000-pixel ceiling,
 and an initial output limit of 2,048 tokens. Invalid or truncated JSON receives
 one retry with a corrective prompt and a 4,096-token limit. Both attempts use
 the same source frame. A response that still fails becomes an `incomplete`
-frame with empty clean content; extraction continues with the other frames.
+frame with an unknown full-frame illustration candidate; extraction continues with
+the other frames. Notes can exclude it explicitly if no instructional figure is present.
 Model-loading, inference, and worker-process failures propagate instead.
 
 For slides and physical or digital whiteboards, the prompt requests readable
