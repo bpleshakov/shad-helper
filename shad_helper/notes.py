@@ -69,6 +69,8 @@ status=complete означает завершение распознавания
 читаемым исходным изображением. Изменение рамки, прокрутка, движение лектора,
 появление обычных записей рядом и косметические правки не создают новый рисунок.
 Сохраняй завершённый рисунок и промежуточные стадии с самостоятельным учебным смыслом.
+Обычные незавершённые наброски и частично видимые панели не являются отдельными
+стадиями: выбери законченный рисунок, сохраняющий их содержательные детали.
 Излагай материал прямо: без «лектор сказал», «студент спросил», пересказа диалога,
 описаний кадров/действий лектора, организационных объявлений и правил оценивания.
 Ответ на содержательный вопрос включай как объяснение без истории обсуждения.
@@ -144,6 +146,12 @@ includegraphics, внешних файлов, shell-команд или Lua. С�
 В diagram и screenshot укажи illustration_id выбранного исходного изображения
 и включи его в evidence_ids. В screenshot content — краткое описание смысла,
 caption — учебная подпись; путь и команды загрузки изображения добавит рендерер.
+Помещай рисунок рядом с абзацем, который его объясняет. В таком текстовом блоке
+задай figure_refs — список ID соответствующих блоков diagram/screenshot этой главы
+или prior_illustrations. Ссылайся на рисунки при объяснении их деталей и выводов,
+в том числе при повторном обращении к уже включённому рисунку. Не придумывай номера:
+рендерер добавит ссылки с правильной нумерацией. Не создавай отдельный раздел только
+для рисунка. В блоках без уместной ссылки и во всех нетекстовых блоках figure_refs=[].
 В рисунок входят только сама фигура, её оси, стрелки, подписи и полная легенда.
 Не включай соседние самостоятельные формулы, текст, код, человека и декорации.
 illustration_crop_id оставляй пустым: точную рамку по исходному кадру уточняет
@@ -290,15 +298,20 @@ def _export_images(job: Path, evidence: dict, context: dict, folder: Path) -> No
         write_json(folder / "images.json", records)
 
 
-def _validate_illustration_coverage(notes: dict, evidence: dict, previous: list[dict]) -> None:
+def _validate_illustration_coverage(notes: dict, evidence: dict, previous: list[dict], *,
+                                    finalized: bool = False) -> None:
     from .illustrations import illustration_index
 
     preceding = list(previous)
+    final_targets = {block["id"] for chapter in notes["chapters"]
+                     for block in chapter["blocks"] if block.get("illustration_id")}
     for chapter in sorted(notes["chapters"], key=lambda item: item["start"]):
         context = chapter_context(evidence, chapter)
         sources = illustration_index(context)
         prior = _prior_illustrations(preceding, evidence)
         targets = {item["block_id"] for item in prior}
+        if finalized:
+            targets |= final_targets
         for block in chapter["blocks"]:
             source_id = block.get("illustration_id", "")
             if source_id:
@@ -316,20 +329,36 @@ def _validate_illustration_coverage(notes: dict, evidence: dict, previous: list[
             raise ValueError(f"Incomplete illustration coverage in {chapter['id']}; "
                              f"required: {required}")
         if any(item["block_id"] and item["block_id"] not in targets for item in coverage):
-            raise ValueError("Illustration coverage must reference a current or prior illustration block")
+            raise ValueError("Illustration coverage must reference an accepted illustration block"
+                             if finalized else "Illustration coverage must reference a current or prior illustration block")
         excluded = {item["illustration_id"] for item in coverage if item["exclusion_reason"]}
         if any(block.get("illustration_id") in excluded for block in chapter["blocks"]):
             raise ValueError("Excluded illustration candidates cannot produce figure blocks")
         preceding.append({"chapters": [chapter]})
 
 
+def _validate_figure_refs(notes: dict, previous: list[dict], *, finalized: bool) -> None:
+    targets = {block["id"] for part in previous for chapter in part["chapters"]
+               for block in chapter["blocks"] if block["kind"] in {"diagram", "screenshot"}}
+    if finalized:
+        targets.update(block["id"] for chapter in notes["chapters"] for block in chapter["blocks"]
+                       if block["kind"] in {"diagram", "screenshot"})
+    for chapter in sorted(notes["chapters"], key=lambda item: item["start"]):
+        targets.update(block["id"] for block in chapter["blocks"]
+                       if block["kind"] in {"diagram", "screenshot"})
+        for block in chapter["blocks"]:
+            if set(block.get("figure_refs", [])) - targets:
+                raise ValueError(f"Invalid figure references in {block['id']}")
+
+
 def validate_notes(value: dict, evidence: dict, resolutions: dict | None = None, *,
-                   previous: list[dict] | None = None) -> dict:
+                   previous: list[dict] | None = None, finalized: bool = False) -> dict:
     from .schemas import LectureNotes
 
     notes = LectureNotes.model_validate(value).model_dump()
     notes = _validate_evidence(notes, evidence, resolutions)
-    _validate_illustration_coverage(notes, evidence, previous or [])
+    _validate_illustration_coverage(notes, evidence, previous or [], finalized=finalized)
+    _validate_figure_refs(notes, previous or [], finalized=finalized)
     return LectureNotes.model_validate(notes).model_dump()
 
 
@@ -525,7 +554,7 @@ def _merge_chapters(parts: list[dict], outline: dict, evidence: dict,
         glossary.update({entry["term"]: entry for entry in part["glossary"]})
         issues.update({issue["id"]: issue for issue in part["issues"]})
     notes["glossary"], notes["issues"] = list(glossary.values()), list(issues.values())
-    return validate_notes(notes, evidence, resolutions)
+    return validate_notes(notes, evidence, resolutions, finalized=True)
 
 
 def _finalize_chapter(part: dict, evidence: dict, job: Path, folder: Path, client,
@@ -696,17 +725,18 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
         return folder
     if imported:
         imported = Path(imported)
+        complete_import = not imported.is_dir()
         if imported.is_dir():
             replies = [read_json(imported / f"{c['id']}.json") for c in outline["chapters"]]
         else:
-            notes = validate_notes(read_json(imported), evidence, resolutions)
+            notes = validate_notes(read_json(imported), evidence, resolutions, finalized=True)
             imported_outline = {"title": notes["title"], "chapters": [
                 {key: c[key] for key in ("id", "title", "start", "end")}
                 for c in notes["chapters"]], "glossary": notes["glossary"]}
             validate_outline(imported_outline, evidence)
             outline = imported_outline
             replies = [{**notes, "chapters": [chapter]} for chapter in notes["chapters"]]
-        if client is None and any(block.get("illustration_id") and block["kind"] == "diagram"
+        if client is None and any(block.get("illustration_id")
                                   for reply in replies for chapter in reply["chapters"]
                                   for block in chapter["blocks"]):
             from .openai_client import PlanClient
@@ -716,13 +746,16 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
             except ValueError:
                 print("Visual verification unavailable; preserving source crops for review.")
         parts = []
-        for reply, chapter in zip(replies, outline["chapters"], strict=True):
-            part = _validate_chapter_reply(reply, evidence, chapter, resolutions, previous=parts)
+        for index, (reply, chapter) in enumerate(zip(replies, outline["chapters"], strict=True)):
+            # A validated final document can reuse a later complete figure. Chapter
+            # replies from a handoff still only know the accepted preceding chapters.
+            available = parts + replies[index + 1:] if complete_import else parts
+            part = _validate_chapter_reply(reply, evidence, chapter, resolutions, previous=available)
             context = chapter_context(evidence, chapter)
             if illustration_index(context):
                 context["prior_illustrations"] = _prior_illustrations(parts, evidence)
                 part = _finalize_chapter(part, evidence, job, run / "verification" / chapter["id"],
-                                         client, resolutions, parts)
+                                         client, resolutions, available)
                 contexts[chapter["id"]] = _model_context(context, outline, outline["glossary"])
             parts.append(part)
         notes = _merge_chapters(parts, outline, evidence, resolutions)
@@ -807,6 +840,12 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
             write_json(handoff / "status.json", {"status": "manual_required", "reason": str(exc)})
             print(f"Automatic synthesis unavailable: {exc}\nManual handoff: {handoff}")
             return handoff
+    from .illustration_verification import reconcile_illustrations
+
+    notes, retry_needed = reconcile_illustrations(
+        notes, evidence, job, run / "figure-reconciliation", client)
+    notes = validate_notes(notes, evidence, resolutions, finalized=True)
+    write_json(run / "figure-reconciliation" / "status.json", {"retry_needed": retry_needed})
     (handoff / "status.json").unlink(missing_ok=True)
     write_json(outline_file, outline)
     write_json(job / "notes.json", notes)

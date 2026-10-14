@@ -6,6 +6,7 @@ import httpx
 import pymupdf
 import pytest
 
+from shad_helper import illustration_crops
 from shad_helper.illustration_crops import refine_crop, resolve_crop
 from shad_helper.jobs import fingerprint, read_json, sha256_file, write_json
 from shad_helper.openai_client import PlanClient
@@ -109,15 +110,38 @@ def test_invalid_boxes_do_not_publish_or_poison_cache(example, box):
     assert model.complete.call_count == 2
 
 
-def test_uncertain_crop_keeps_original_and_does_not_cache_success(example):
+@pytest.mark.parametrize("uncertainty", [
+    "Лектор закрывает ось.",
+    "Прокрутка обрезала нижний ряд графиков и подписи осей в исходном кадре.",
+])
+def test_uncertain_crop_keeps_original_and_does_not_cache_success(example, uncertainty):
     model = client()
     model.complete.return_value = {"status": "uncertain", "box": [0, 0, 0, 0],
-                                   "reason": "Лектор закрывает ось."}
+                                   "reason": uncertainty}
     crop_id, retry, reason = run(example, model)
-    assert crop_id == "" and retry is False and "Лектор" in reason
+    assert crop_id == "" and retry is False and uncertainty in reason
+    assert resolve_crop(example[0], example[1], "v01_ill01", crop_id) == example[4]
     assert not list((example[0] / "illustration-crops").glob("*/crop.json"))
     model.complete.return_value = client().complete.return_value
     assert run(example, model)[0]
+
+
+def test_changed_crop_policy_rechecks_old_success_without_deleting_evidence(example, monkeypatch):
+    job, evidence, _, _, source = example
+    model = client()
+    previous_id = run(example, model)[0]
+    original = source.read_bytes()
+    monkeypatch.setattr(illustration_crops, "CROP_INSTRUCTIONS",
+                        illustration_crops.CROP_INSTRUCTIONS + "\nRecheck completeness.")
+    model.complete.return_value = {
+        "status": "uncertain", "box": [0, 0, 0, 0],
+        "reason": "Полная иллюстрация не помещается в исходный кадр.",
+    }
+    assert run(example, model)[0:2] == ("", False)
+    assert model.complete.call_count == 2
+    assert source.read_bytes() == original
+    assert resolve_crop(job, evidence, "v01_ill01", previous_id).is_file()
+    assert read_json(job / "archive/attempt-02/status.json")["status"] == "uncertain"
 
 
 def test_transport_failure_retries_and_restores_request_recorder(example):

@@ -1,6 +1,7 @@
 import shutil
 import subprocess
 import unicodedata
+from copy import deepcopy
 
 import pymupdf
 import pytest
@@ -48,12 +49,133 @@ def test_screenshots_copy_only_declared_crop_and_keep_description(illustrated_jo
         job / "illustrations/frame_1_ill01.png").read_bytes()
     rendering._validate_project(root, manifest)
     source = (root / "chapters/section-001.tex").read_text()
-    assert r"\includegraphics[width=\linewidth,height=.7\textheight,keepaspectratio]" in source
+    assert (r"\includegraphics[width={\ifdim 90bp<\linewidth 90bp\else\linewidth\fi},"
+            r"height=.7\textheight,keepaspectratio]") in source
     assert r"\caption{График \& подпись}" in source
+    assert r"\caption{График \& подпись}\label{fig:ch001_b1}" in source
+    assert r"\begin{figure}[H]" in source
     assert r"\hypertarget{shad-block-ch001_b1}{}" in source
     assert r"\hypertarget{shad-end-ch001_b1}{}" in source
     assert manifest["source_blocks"][0]["content"] == "Стрелка A"
     assert manifest["source_blocks"][0]["illustration_id"] == "frame_1_ill01"
+
+
+def test_large_screenshots_keep_linewidth_bound(illustrated_job):
+    job, evidence, notes = illustrated_job
+    image = job / "illustrations/frame_1_ill01.png"
+    pixels = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 1600, 900), False)
+    pixels.clear_with(255)
+    pixels.save(image)
+    digest = sha256_file(image)
+    evidence["visuals"][0]["illustrations"][0]["image_sha256"] = digest
+    write_json(job / "evidence.json", evidence)
+    manifest = read_json(image.parent / "manifest.json")
+    manifest["assets"]["frame_1_ill01"]["sha256"] = digest
+    write_json(image.parent / "manifest.json", manifest)
+    root = rendering.write_project(job, notes).parent
+    rendering._validate_project(root, read_json(root / "project.json"))
+    source = (root / "chapters/section-001.tex").read_text()
+    assert r"width={\ifdim 1200bp<\linewidth 1200bp\else\linewidth\fi}" in source
+    assert r"height=.7\textheight,keepaspectratio" in source
+
+
+def test_direct_explanation_stays_with_figure_and_reserves_text_space(illustrated_job):
+    job, _, notes = illustrated_job
+    notes["chapters"][0]["blocks"].insert(0, {
+        "id": "explanation", "kind": "text", "content": "На графике показана зависимость.",
+        "figure_refs": ["ch001_b1"],
+    })
+    root = rendering.write_project(job, notes).parent
+    rendering._validate_project(root, read_json(root / "project.json"))
+    source = (root / "chapters/section-001.tex").read_text()
+    assert r"\setbox\shadfiguregroup=\vbox\bgroup" in source
+    assert source.index(r"\vbox\bgroup") < source.index("shad-block-explanation")
+    assert source.index("shad-end-ch001_b1") < source.index(r"\egroup")
+    assert r"\ht\shadfiguregroup+\dp\shadfiguregroup\relax>\textheight" in source
+    assert r"\unvbox\shadfiguregroup" in source
+    assert r"\box\shadfiguregroup" in source
+    assert source.count(r"\label{fig:ch001_b1}") == 1
+    assert r"height=.36\textheight,keepaspectratio" in source
+    assert r"\ifdim 90bp<\linewidth 90bp\else\linewidth\fi" in source
+    assert "minipage" not in source
+    assert "nopagebreak" not in source
+
+
+@pytest.mark.parametrize("kind", ["text", "definition", "theorem", "proof", "clarification"])
+def test_measured_group_has_breakable_fallback_for_long_prose(illustrated_job, kind):
+    job, _, notes = illustrated_job
+    content = "Длинное объяснение учебного материала. " * 300
+    notes["chapters"][0]["blocks"].insert(0, {
+        "id": "explanation", "kind": kind, "content": content, "figure_refs": ["ch001_b1"],
+    })
+    root = rendering.write_project(job, notes).parent
+    rendering._validate_project(root, read_json(root / "project.json"))
+    source = (root / "chapters/section-001.tex").read_text()
+    assert source.count(content) == 1
+    assert r"\unvbox\shadfiguregroup" in source
+    assert r"\box\shadfiguregroup" in source
+
+
+def test_measured_group_does_not_capture_uncertainty_footnotes(illustrated_job):
+    job, _, notes = illustrated_job
+    notes["chapters"][0]["blocks"].insert(0, {
+        "id": "explanation", "kind": "text", "content": "Сомнительная связь.",
+        "evidence_ids": ["frame_1"], "figure_refs": ["ch001_b1"],
+        "uncertain_fragments": [{"text": "Сомнительная", "evidence_ids": ["frame_1"]}],
+    })
+    root = rendering.write_project(job, notes).parent
+    source = (root / "chapters/section-001.tex").read_text()
+    assert r"\footnote{00:00:10}" in source
+    assert r"\setbox" not in source
+
+
+def test_reference_to_nonadjacent_figure_does_not_bind_unrelated_content(illustrated_job):
+    job, _, notes = illustrated_job
+    notes["chapters"][0]["blocks"][0:0] = [
+        {"id": "explanation", "kind": "text", "content": "Ссылка на график.",
+         "figure_refs": ["ch001_b1"]},
+        {"id": "between", "kind": "text", "content": "Отдельное пояснение."},
+    ]
+    root = rendering.write_project(job, notes).parent
+    source = (root / "chapters/section-001.tex").read_text()
+    assert "nopagebreak" not in source
+    assert r"height=.7\textheight,keepaspectratio" in source
+
+
+def test_one_explanation_groups_first_figure_and_sizes_all_consecutive_references(illustrated_job):
+    job, _, notes = illustrated_job
+    blocks = notes["chapters"][0]["blocks"]
+    blocks.append({**blocks[0], "id": "second_figure"})
+    blocks.insert(0, {
+        "id": "explanation", "kind": "text", "content": "Сравним два графика.",
+        "figure_refs": ["ch001_b1", "second_figure"],
+    })
+    root = rendering.write_project(job, notes).parent
+    rendering._validate_project(root, read_json(root / "project.json"))
+    source = (root / "chapters/section-001.tex").read_text()
+    assert source.count(r"\setbox\shadfiguregroup=\vbox\bgroup") == 1
+    assert source.count(r"\egroup") == 1
+    assert source.count(r"height=.36\textheight") == 2
+    assert source.index("shad-end-ch001_b1") < source.index(r"\egroup")
+    assert source.index(r"\egroup") < source.index("shad-block-second_figure")
+    assert source.count(r"\label{fig:ch001_b1}") == 1
+    assert source.count(r"\label{fig:second_figure}") == 1
+    assert r"\unvbox\shadfiguregroup" in source
+
+
+def test_unreferenced_figure_ends_the_directly_explained_group(illustrated_job):
+    job, _, notes = illustrated_job
+    blocks = notes["chapters"][0]["blocks"]
+    blocks.extend([{**blocks[0], "id": "unreferenced"}, {**blocks[0], "id": "later"}])
+    blocks.insert(0, {
+        "id": "explanation", "kind": "text", "content": "Сравним графики.",
+        "figure_refs": ["ch001_b1", "later"],
+    })
+    root = rendering.write_project(job, notes).parent
+    source = (root / "chapters/section-001.tex").read_text()
+    assert source.count(r"height=.36\textheight") == 1
+    assert source.count(r"height=.7\textheight") == 2
+    assert source.index(r"\egroup") < source.index("shad-block-unreferenced")
 
 
 @pytest.fixture
@@ -240,6 +362,60 @@ def test_chapter_validation_copies_assets_from_original_job(illustrated_job, cha
     folder = job / "isolated-validation"
     chapter_latex_checker(notes, evidence, folder, asset_job=job)
     assert (folder / "notes/figures/illustration-frame_1_ill01.png").is_file()
+
+
+@needs_tex
+def test_actual_oversized_prose_figure_group_unboxes_without_duplicate_numbering(illustrated_job):
+    job, _, notes = illustrated_job
+    explanation = ("GROUPBEGIN "
+                   + "Объяснение зависимости показывает характер изменения величин. " * 160
+                   + " GROUPEND")
+    notes["chapters"][0]["blocks"].insert(0, {
+        "id": "explanation", "kind": "text", "content": explanation,
+        "evidence_ids": ["frame_1"], "figure_refs": ["ch001_b1"],
+    })
+    root = rendering.write_project(job, notes).parent
+    pdf = rendering.render(job)
+    report = read_json(root / "render-report.json")
+    assert report["overfull"] == []
+    assert report["missing_glyphs"] == []
+    assert report["missing_fonts"] == []
+    with pymupdf.open(pdf) as document:
+        assert len(document) > 1
+        text = unicodedata.normalize("NFKC", "\n".join(page.get_text() for page in document))
+        assert text.count("GROUPBEGIN") == text.count("GROUPEND") == 1
+        assert text.count("Рис. 1:") == 1
+        assert "Рис. 2:" not in text
+        assert sum(len(page.get_image_info()) for page in document) == 1
+    assert (root / "main.aux").read_text().count(r"\newlabel{fig:ch001_b1}") == 1
+    mapping = read_json(root / "source-map.json")["blocks"]
+    assert mapping["explanation"]["page_start"] < mapping["explanation"]["page_end"]
+    assert mapping["ch001_b1"]["page_start"] == mapping["ch001_b1"]["page_end"]
+
+
+def test_chapter_validation_omits_only_external_figure_refs_without_mutation(
+    illustrated_job, chapter_latex_checker, monkeypatch,
+):
+    job, evidence, notes = illustrated_job
+    notes["chapters"][0]["blocks"].insert(0, {
+        "id": "explanation", "kind": "text", "content": "Сравнение с предыдущей схемой.",
+        "evidence_ids": ["frame_1"], "figure_refs": ["prior_figure", "ch001_b1"],
+    })
+    original = deepcopy(notes)
+
+    def compiler(root):
+        (root / "main.pdf").write_bytes(b"compiler placeholder")
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(rendering, "_run_latex", compiler)
+    folder = job / "isolated-validation"
+    chapter_latex_checker(notes, evidence, folder, asset_job=job)
+    source = (folder / "notes/chapters/section-001.tex").read_text()
+    assert r"\ref{fig:ch001_b1}" in source
+    assert "prior_figure" not in source
+    assert notes == original
+    with pytest.raises(rendering.RenderError, match="unique figure block IDs"):
+        rendering.write_project(job, notes)
     assert (folder / "notes/main.pdf").is_file()
 
 

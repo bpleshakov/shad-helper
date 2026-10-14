@@ -243,6 +243,114 @@ class RenderingTests(unittest.TestCase):
         self.assertIn(r"\section{../../Матрицы \& \textbackslash{}input\{secret\}}",
                       (root / "chapters/section-002.tex").read_text())
 
+    def test_figures_keep_order_without_creating_their_own_topic_sections(self):
+        diagram = self.notes["chapters"][0]["blocks"][3]
+        self.notes["chapters"][0]["blocks"] = [
+            {**diagram, "id": "leading", "topic": "Отдельная подпись"},
+            {"id": "text-a", "kind": "text", "topic": "Первая тема", "content": "Объяснение."},
+            {**diagram, "id": "middle", "topic": "Другая подпись"},
+            {"id": "text-b", "kind": "text", "topic": "Вторая тема", "content": "Продолжение."},
+            {**diagram, "id": "last", "topic": "Первая тема"},
+            {"id": "text-return", "kind": "text", "topic": "Первая тема", "content": "Возврат."},
+        ]
+        root, manifest = self.project()
+        rendering._validate_project(root, manifest)
+        sources = [(root / f"chapters/section-{number:03}.tex").read_text()
+                   for number in range(1, 4)]
+        self.assertIn(r"\section{Первая тема}", sources[0])
+        self.assertIn(r"\section{Вторая тема}", sources[1])
+        self.assertIn(r"\section{Первая тема}", sources[2])
+        self.assertEqual([block["id"] for block in manifest["source_blocks"]],
+                         ["leading", "text-a", "middle", "text-b", "last", "text-return"])
+        self.assertEqual([block["topic"] for block in manifest["source_blocks"]],
+                         ["Первая тема"] * 3 + ["Вторая тема"] + ["Первая тема"] * 2)
+        self.assertIn("% shad-helper: block last", sources[2])
+        self.assertNotIn("% shad-helper: block last", sources[1])
+        self.assertNotIn("Отдельная подпись", "".join(sources))
+        self.assertNotIn("Другая подпись", "".join(sources))
+
+    def test_figure_preceding_new_topic_definition_shares_that_section(self):
+        diagram = self.notes["chapters"][0]["blocks"][3]
+        self.notes["chapters"][0]["blocks"] = [
+            {"id": "linear", "kind": "text", "topic": "Линейная регрессия",
+             "content": "Линейная модель."},
+            {**diagram, "topic": "Метод ближайших соседей"},
+            {"id": "neighbors", "kind": "definition", "topic": "  метод   ближайших соседей ",
+             "content": "Определение метода."},
+        ]
+        root, manifest = self.project()
+        self.assertEqual([block["id"] for block in manifest["source_blocks"]],
+                         ["linear", "diagram-1", "neighbors"])
+        first = (root / "chapters/section-001.tex").read_text()
+        second = (root / "chapters/section-002.tex").read_text()
+        self.assertNotIn("% shad-helper: block diagram-1", first)
+        self.assertIn("% shad-helper: block diagram-1", second)
+        self.assertIn("Определение метода.", second)
+        self.assertEqual(second.count(r"\section"), 1)
+
+    def test_trailing_figure_cannot_create_a_section_without_substantive_text(self):
+        diagram = self.notes["chapters"][0]["blocks"][3]
+        self.notes["chapters"][0]["blocks"] = [
+            {"id": "explanation", "kind": "text", "topic": "Конкретная тема",
+             "content": "Объяснение."},
+            {**diagram, "topic": self.notes["chapters"][0]["title"]},
+        ]
+        root, manifest = self.project()
+        self.assertEqual([block["topic"] for block in manifest["source_blocks"]],
+                         ["Конкретная тема", "Конкретная тема"])
+        self.assertFalse((root / "chapters/section-002.tex").exists())
+
+    def test_stable_figure_references_and_nonfloating_figures_keep_source_anchors(self):
+        self.notes["chapters"][0]["blocks"][0]["figure_refs"] = ["diagram-1"]
+        self.notes["chapters"][0]["blocks"][4]["figure_refs"] = ["diagram-1"]
+        root, manifest = self.project()
+        rendering._validate_project(root, manifest)
+        source = (root / "chapters/section-001.tex").read_text()
+        self.assertEqual(source.count(r"(см. рис. \ref{fig:diagram-1})"), 2)
+        self.assertIn(r"\caption{Схема}\label{fig:diagram-1}", source)
+        self.assertIn(r"\begin{figure}[H]", source)
+        self.assertNotIn("[htbp]", source)
+        self.assertIn(r"\hypertarget{shad-block-diagram-1}{}", source)
+        self.assertIn(r"\hypertarget{shad-end-diagram-1}{}\end{figure}", source)
+        self.assertEqual(manifest["source_blocks"][0]["figure_refs"], ["diagram-1"])
+
+    def test_figure_references_inside_formal_and_uncertain_prose(self):
+        diagram = self.notes["chapters"][0]["blocks"][3]
+        self.notes["chapters"][0]["blocks"] = [
+            {"id": kind, "kind": kind, "content": "Объяснение.", "figure_refs": ["diagram-1"]}
+            for kind in ("text", "definition", "theorem", "proof", "clarification", "uncertain")
+        ] + [diagram]
+        root, manifest = self.project()
+        rendering._validate_project(root, manifest)
+        source = (root / "chapters/section-001.tex").read_text()
+        self.assertEqual(source.count(r"(см. рис. \ref{fig:diagram-1})"), 6)
+        for kind in ("definition", "theorem", "proof"):
+            body = source.split(r"\begin{" + kind + "}", 1)[1].split(r"\end{" + kind + "}", 1)[0]
+            self.assertIn(r"\ref{fig:diagram-1}", body)
+
+    def test_invalid_figure_references_fail_before_project_writes(self):
+        for references in (["missing"], ["text-1"], ["diagram-1", "diagram-1"],
+                           [r"diagram-1}\input{secret"], "diagram-1", [None]):
+            with self.subTest(references=references):
+                self.notes["chapters"][0]["blocks"][0]["figure_refs"] = references
+                with self.assertRaises(rendering.RenderError):
+                    self.project()
+                self.assertFalse((self.job / "notes/main.tex").exists())
+        self.notes["chapters"][0]["blocks"][0]["figure_refs"] = []
+        self.notes["chapters"][0]["blocks"][3]["figure_refs"] = ["diagram-1"]
+        with self.assertRaises(rendering.RenderError):
+            self.project()
+
+    def test_figure_references_can_target_a_previous_chapter(self):
+        self.notes["chapters"].append({
+            "id": "chapter-2", "title": "Продолжение", "start": 125, "end": 190,
+            "blocks": [{"id": "later", "kind": "text", "content": "Возвращаемся к схеме.",
+                        "figure_refs": ["diagram-1"]}],
+        })
+        root, manifest = self.project()
+        rendering._validate_project(root, manifest)
+        self.assertIn(r"\ref{fig:diagram-1}", (root / "chapters/section-002.tex").read_text())
+
     def test_formal_blocks_keep_inline_math_and_uncertainty_inside_environments(self):
         self.notes["chapters"][0]["blocks"] = [
             {"id": kind, "kind": kind, "topic": "Линейная алгебра",

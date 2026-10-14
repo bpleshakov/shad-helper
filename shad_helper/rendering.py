@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 
 from .jobs import check_job, fingerprint, read_json, write_json
@@ -60,7 +61,8 @@ _PROJECT_COMMANDS = set(
     "textbackslash textasciitilde textasciicircum textcolor "
     "input VerbatimInput includegraphics pagestyle fancyhf fancyfoot renewcommand "
     "headrulewidth thepage linewidth textwidth textheight medskip bigskip item "
-    "hypersetup hypertarget emergencystretch newtheorem theoremstyle".split()
+    "hypersetup hypertarget emergencystretch newtheorem theoremstyle ifdim else fi "
+    "newsavebox shadfiguregroup setbox vbox bgroup egroup hsize dimexpr ht dp relax unvbox box".split()
 )
 _SYMBOL_COMMANDS = set("\\{}%&#$_~^ ,;:![]()|") | {"\n", "\r"}
 _MATH_ENVIRONMENTS = set(
@@ -73,8 +75,9 @@ _DRAW_ENVIRONMENTS = {"tikzpicture", "scope", "axis", "groupplot"}
 _ENVIRONMENTS = _MATH_ENVIRONMENTS | _DRAW_ENVIRONMENTS | {"document", "figure", "quote", "center", "itemize", "enumerate", "description", "definition", "theorem", "proof"}
 _PACKAGES = set(
     "geometry fontspec polyglossia unicode-math amsmath amssymb amsthm tikz "
-    "pgfplots fvextra fancyhdr xcolor hyperref microtype graphicx".split()
+    "pgfplots fvextra fancyhdr xcolor hyperref microtype graphicx float".split()
 )
+_PROSE_KINDS = {"text", "definition", "theorem", "proof", "clarification", "uncertain"}
 _ESCAPE = {
     "\\": r"\textbackslash{}", "{": r"\{", "}": r"\}", "$": r"\$",
     "&": r"\&", "#": r"\#", "%": r"\%", "_": r"\_",
@@ -202,9 +205,12 @@ def _timestamp_footnote(evidence_ids: list[str], times: dict[str, float],
 
 
 def _marked_prose(block: dict, times: dict[str, float], fallback: float) -> str:
+    references = block.get("figure_refs", [])
+    suffix = (" (см. рис. " + ", ".join("\\ref{fig:" + identifier + "}"
+                                      for identifier in references) + ")") if references else ""
     fragments = block.get("uncertain_fragments", [])
     if not fragments and block["kind"] != "uncertain":
-        return _prose(block["content"])
+        return _prose(block["content"]) + suffix
     if fragments:
         try:
             NoteBlock.model_validate(block)
@@ -234,7 +240,7 @@ def _marked_prose(block: dict, times: dict[str, float], fallback: float) -> str:
             evidence_ids = block.get("evidence_ids", [])
         parts.append(_timestamp_footnote(evidence_ids, times, fallback, precise=bool(fragments)))
         paragraphs.append("".join(parts))
-    return "\n\n".join(paragraphs)
+    return "\n\n".join(paragraphs) + suffix
 
 
 def _draft_footer(review: list[dict]) -> str:
@@ -276,7 +282,7 @@ _PREAMBLE = r"""\documentclass[a4paper,11pt]{article}
 \newtheorem{definition}[theorem]{Определение}
 \usepackage{unicode-math}
 \setmathfont{Latin Modern Math}
-\usepackage{tikz,pgfplots,fvextra,fancyhdr,xcolor,hyperref,microtype,graphicx}
+\usepackage{tikz,pgfplots,fvextra,fancyhdr,xcolor,hyperref,microtype,graphicx,float}
 \usetikzlibrary{arrows.meta,positioning,calc,shapes.geometric,fit,matrix}
 \usepgfplotslibrary{groupplots}
 \pgfplotsset{compat=1.18}
@@ -286,6 +292,7 @@ _PREAMBLE = r"""\documentclass[a4paper,11pt]{article}
 \fancyfoot[R]{\thepage}
 \renewcommand{\headrulewidth}{0pt}
 \emergencystretch=2em
+\newsavebox{\shadfiguregroup}
 """
 
 
@@ -306,6 +313,7 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
     block_ids = set()
     chapter_ids = set()
     sections = []
+    ordered_blocks = []
     source_blocks = []
     review = _review_flags(notes)
     evidence_times = _evidence_times(job)
@@ -319,17 +327,61 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
             if block_id in block_ids:
                 raise RenderError("Block IDs must be unique")
             block_ids.add(block_id)
-            title = " ".join((block.get("topic") or "").split()) or " ".join(chapter["title"].split())
-            # A return to an earlier topic stays at its place in the lecture.
-            if not sections or sections[-1][0].casefold() != title.casefold():
-                sections.append((title, []))
-            sections[-1][1].append((chapter, block))
+            ordered_blocks.append((chapter, block))
+    figure_ids = {block["id"] for _, block in ordered_blocks
+                  if block["kind"] in {"diagram", "screenshot"}}
+    for _, block in ordered_blocks:
+        references = block.get("figure_refs", [])
+        if not isinstance(references, list):
+            raise RenderError("Figure references must be a list")
+        for identifier in references:
+            _identifier(identifier)
+        if (len(set(references)) != len(references) or set(references) - figure_ids
+                or (references and block["kind"] not in _PROSE_KINDS)):
+            raise RenderError("Figure references must be unique figure block IDs on prose blocks")
+    for index, (chapter, block) in enumerate(ordered_blocks):
+        heading_block, heading_chapter = block, chapter
+        if block["kind"] in {"diagram", "screenshot"}:
+            following = next(
+                ((candidate_chapter, candidate) for candidate_chapter, candidate
+                 in ordered_blocks[index + 1:] if candidate["kind"] not in {"diagram", "screenshot"}),
+                None)
+            heading_chapter, heading_block = following or (chapter, {"topic": ""})
+            following_topic = (" ".join((heading_block.get("topic") or "").split())
+                               or " ".join(heading_chapter["title"].split()))
+            figure_topic = " ".join((block.get("topic") or "").split())
+            if sections and (following is None
+                             or figure_topic.casefold() != following_topic.casefold()):
+                sections[-1][1].append((chapter, block))
+                continue
+        title = (" ".join((heading_block.get("topic") or "").split())
+                 or " ".join(heading_chapter["title"].split()))
+        # Figures share a neighboring substantive topic without changing chronology.
+        if not sections or sections[-1][0].casefold() != title.casefold():
+            sections.append((title, []))
+        sections[-1][1].append((chapter, block))
     for number, (title, blocks) in enumerate(sections, 1):
         lines = ["\\section{" + escape_text(title) + "}"]
-        for chapter, block in blocks:
+        grouped_figure = None
+        explained_figures = set()
+        for position, (chapter, block) in enumerate(blocks):
             block_id = block["id"]
             content = block["content"]
             kind = block["kind"]
+            if kind in _PROSE_KINDS:
+                following_figures = []
+                for following in range(position + 1, len(blocks)):
+                    candidate = blocks[following][1]
+                    if (candidate["kind"] not in {"diagram", "screenshot"}
+                            or candidate["id"] not in block.get("figure_refs", [])):
+                        break
+                    following_figures.append(following)
+                explained_figures.update(following_figures)
+                if (following_figures and kind != "uncertain"
+                        and not block.get("uncertain_fragments")):
+                    grouped_figure = following_figures[0]
+                    lines.append("\\par\\setbox\\shadfiguregroup=\\vbox\\bgroup\n"
+                                 "\\hsize=\\linewidth\n")
             lines.append(f"% shad-helper: block {block_id}")
             if kind == "math":
                 _validate_commands(content)
@@ -345,8 +397,10 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
                 relative = f"figures/diagram-{block_id}.tex"
                 _write(root, relative, content + "\n")
                 tex_files.append(relative)
-                lines.append("\\begin{figure}[htbp]\n\\centering\n\\input{" + relative + "}\n\\caption{" + escape_text(block.get("caption", "Схема")) + "}\n\\end{figure}\n")
+                lines.append("\\begin{figure}[H]\n\\centering\n\\input{" + relative + "}\n\\caption{" + escape_text(block.get("caption", "Схема")) + "}\\label{fig:" + block_id + "}\n\\end{figure}\n")
             elif kind == "screenshot":
+                import pymupdf
+
                 from .illustration_crops import resolve_crop
 
                 illustration_id = _identifier(block.get("illustration_id", ""))
@@ -362,10 +416,19 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
                 shutil.copyfile(source, destination)
                 if relative not in image_files:
                     image_files.append(relative)
-                lines.append("\\begin{figure}[htbp]\n\\centering\n"
-                             "\\includegraphics[width=\\linewidth,height=.7\\textheight,keepaspectratio]{"
+                # 96 dpi gives small native crops a natural display size; larger
+                # images still fit the available line width and page height.
+                natural_width = pymupdf.Pixmap(source).width * 0.75
+                width = ("{\\ifdim " + f"{natural_width:g}bp" + "<\\linewidth "
+                         + f"{natural_width:g}bp" + "\\else\\linewidth\\fi}")
+                # Reserve space for an immediately preceding explanation. This
+                # affects only tall figures; native-size and width bounds remain.
+                height = ".36" if position in explained_figures else ".7"
+                lines.append("\\begin{figure}[H]\n\\centering\n"
+                             "\\includegraphics[width=" + width
+                             + ",height=" + height + "\\textheight,keepaspectratio]{"
                              + relative + "}\n\\caption{" + escape_text(block.get("caption", "Иллюстрация"))
-                             + "}\n\\end{figure}\n")
+                             + "}\\label{fig:" + block_id + "}\n\\end{figure}\n")
             elif kind == "code":
                 relative = f"code/{block_id}.txt"
                 _write(root, relative, content)
@@ -399,8 +462,18 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
                                              + "},breaklines,", 1).rstrip() + end + "\n"
             else:
                 lines[-1] = start + lines[-1].rstrip() + end + "\n"
+            if position == grouped_figure:
+                # Typeset only once so figure numbers, labels and anchors stay
+                # consistent. Oversized groups are unboxed into breakable content.
+                lines.append("\\egroup\n"
+                             "\\ifdim\\dimexpr\\ht\\shadfiguregroup+\\dp\\shadfiguregroup"
+                             "\\relax>\\textheight\n\\unvbox\\shadfiguregroup\n"
+                             "\\else\n\\box\\shadfiguregroup\n\\fi\n")
+                grouped_figure = None
             source_blocks.append({"id": block_id, "topic": title, "content": content,
                                   "evidence_ids": block.get("evidence_ids", []),
+                                  **({"figure_refs": block["figure_refs"]}
+                                     if block.get("figure_refs") else {}),
                                   **({"illustration_id": block["illustration_id"]}
                                      if block.get("illustration_id") else {}),
                                   **({"illustration_crop_id": block["illustration_crop_id"]}
@@ -470,7 +543,7 @@ def _validate_project(root: Path, manifest: dict) -> None:
         total += len(source.encode("utf-8"))
         _validate_commands(source, diagram=relative.startswith("figures/diagram-"), project=True)
         clean = _uncomment(source)
-        if relative != "main.tex" and re.search(r"\\(?:documentclass|usepackage|setmainfont|renewcommand|newtheorem|theoremstyle)\b", clean):
+        if relative != "main.tex" and re.search(r"\\(?:documentclass|usepackage|setmainfont|renewcommand|newtheorem|theoremstyle|newsavebox)\b", clean):
             raise RenderError("Preamble commands are allowed only in main.tex")
         for command, allowed in reference_commands.items():
             matches = list(re.finditer(r"\\" + command + r"\s*(?:\[[^\]\n]*\]\s*)?\{([^{}]*)\}", clean))
@@ -502,6 +575,8 @@ def _validate_project(root: Path, manifest: dict) -> None:
             raise RenderError("Only the configured theorem and definition environments may be declared")
         if len(re.findall(r"\\theoremstyle\{definition\}", clean)) != len(re.findall(r"\\theoremstyle\b", clean)):
             raise RenderError("Only the configured definition style is supported")
+        if len(re.findall(r"\\newsavebox\{\\shadfiguregroup\}", clean)) != len(re.findall(r"\\newsavebox\b", clean)):
+            raise RenderError("Only the configured figure layout box may be declared")
         if re.search(r"\\(?:addplot|path|draw|fill|filldraw)\b[^;]*\b(?:file|table|graphics|shell|external)\b", clean, re.I):
             raise RenderError("Plots cannot load external data files")
     if total > 4 * _MAX_TEX_BYTES or "main.tex" not in tex_files:
@@ -537,6 +612,17 @@ def _run_latex(root: Path) -> subprocess.CompletedProcess:
 def validate_chapter_latex(notes: dict, evidence: dict, folder: Path, *,
                            asset_job: Path | None = None) -> None:
     """Compile a chapter locally; retain sources and logs without PDF previews."""
+    # Notes validation checks cross-chapter references against accepted prior blocks.
+    # Their final numbering exists only in the merged project, so omit those refs
+    # from this isolated compile without changing the accepted notes.
+    notes = deepcopy(notes)
+    local_figures = {block["id"] for chapter in notes["chapters"] for block in chapter["blocks"]
+                     if block["kind"] in {"diagram", "screenshot"}}
+    for chapter in notes["chapters"]:
+        for block in chapter["blocks"]:
+            if block.get("figure_refs"):
+                block["figure_refs"] = [identifier for identifier in block["figure_refs"]
+                                        if identifier in local_figures]
     chapter = notes["chapters"][0]
     context = dict(evidence, segments=[segment for segment in evidence["segments"]
                                       if any(segment["id"] in block["evidence_ids"]

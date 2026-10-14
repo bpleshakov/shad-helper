@@ -122,6 +122,79 @@ def test_coverage_rejects_silent_loss_and_invalid_targets(tmp_path, failure):
         notes.validate_notes(reply, evidence)
 
 
+@pytest.mark.parametrize("target", ["missing", "prose"])
+def test_figure_reference_requires_an_existing_figure(tmp_path, target):
+    evidence = prepare(tmp_path)
+    context = notes.chapter_context(evidence, notes.default_outline(evidence)["chapters"][0])
+    reply = chapter_reply(context)
+    reply["chapters"][0]["blocks"].append({
+        "id": "prose", "kind": "text", "content": "Объяснение рисунка.",
+        "evidence_ids": ["f0_ill01"], "figure_refs": [target],
+    })
+    with pytest.raises(ValueError, match="figure references"):
+        notes.validate_notes(reply, evidence)
+
+
+def test_final_reconciliation_can_reference_a_later_complete_figure(tmp_path):
+    evidence = prepare(tmp_path, times=(10, 130), duration=240)
+    parts = []
+    for number, start in enumerate((0, 120)):
+        chapter = {"id": f"ch{number}", "title": "Рисунок", "start": start, "end": start + 120}
+        parts.append(chapter_reply(notes.chapter_context(evidence, chapter, overlap=0)))
+    first, second = [part["chapters"][0] for part in parts]
+    target = second["blocks"][0]["id"]
+    first["blocks"] = [{"id": "explanation", "kind": "text", "content": "Объяснение рисунка.",
+                         "evidence_ids": ["f0_ill01"], "figure_refs": [target]}]
+    first["illustration_coverage"][0]["block_id"] = target
+    reply = dict(parts[0], chapters=[first, second])
+    with pytest.raises(ValueError, match="current or prior"):
+        notes.validate_notes(reply, evidence)
+    result = notes.validate_notes(reply, evidence, finalized=True)
+    assert result["chapters"][0]["blocks"][0]["figure_refs"] == [target]
+    # Reconciliation does not relax source provenance or permit missing targets.
+    second["blocks"][0]["evidence_ids"] = ["f0_ill01"]
+    with pytest.raises(ValueError, match="Unknown evidence|Invalid illustration source"):
+        notes.validate_notes(reply, evidence, finalized=True)
+
+
+@pytest.mark.parametrize("kind,refs", [("math", ["f"]), ("text", ["f", "f"])])
+def test_figure_references_have_unambiguous_prose_placement(kind, refs):
+    from shad_helper.schemas import NoteBlock
+
+    with pytest.raises(ValueError, match="Figure references"):
+        NoteBlock.model_validate({"id": "b", "kind": kind, "content": "x", "figure_refs": refs})
+
+
+def test_import_accepts_final_coverage_and_references_to_a_later_figure(tmp_path, monkeypatch):
+    evidence = prepare(tmp_path, times=(10, 130), duration=240)
+    chapters = []
+    for number, start in enumerate((0, 120)):
+        interval = {"id": f"ch{number}", "title": "Рисунок", "start": start, "end": start + 120}
+        chapters.append(chapter_reply(notes.chapter_context(evidence, interval))["chapters"][0])
+    target = chapters[1]["blocks"][0]["id"]
+    chapters[0]["blocks"] = [{"id": "explanation", "kind": "text", "content": "Объяснение.",
+                               "evidence_ids": ["f0_ill01"], "figure_refs": [target]}]
+    chapters[0]["illustration_coverage"][0]["block_id"] = target
+    imported = tmp_path / "final.json"
+    write_json(imported, {"title": "Лекция", "chapters": chapters, "issues": [], "glossary": []})
+    clients = []
+
+    class ImportClient(Client):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            clients.append(self)
+
+    monkeypatch.setattr("shad_helper.openai_client.PlanClient", ImportClient)
+    monkeypatch.setattr(rendering, "validate_chapter_latex", lambda *args, **kwargs: None)
+    assert notes.generate_notes(tmp_path, tmp_path / "auth", imported=imported).exists()
+    result = read_json(tmp_path / "notes.json")
+    assert result["chapters"][0]["blocks"][0]["figure_refs"] == [target]
+    assert result["chapters"][0]["illustration_coverage"][0]["block_id"] == target
+    assert len(clients) == 1 and clients[0].verifications == 1
+    assert sum(block["kind"] == "screenshot" for chapter in result["chapters"]
+               for block in chapter["blocks"]) == 1
+
+
 @pytest.mark.parametrize("reason", ["decoration", "lecturer_or_clothing", "code_or_interface",
                                     "text_or_formulas", "no_instructional_visual"])
 def test_false_candidates_are_explicitly_excluded_without_losing_real_figure(tmp_path, reason):

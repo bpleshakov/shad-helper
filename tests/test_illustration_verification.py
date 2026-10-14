@@ -47,6 +47,7 @@ def example(tmp_path, monkeypatch):
 
     monkeypatch.setattr(verification.rendering, "render_diagram_preview", preview)
     monkeypatch.setattr(verification, "refine_crop", lambda *args: ("", False, ""))
+    monkeypatch.setattr(verification.time, "sleep", lambda *_: None)
     return job, evidence, notes, renders
 
 
@@ -349,7 +350,7 @@ def test_consolidation_failure_retries_raw_mapping(example):
     client.response = {"verdict": "pass", "reason": "Тот же рисунок, сдвинут кадр."}
     accepted, retry = finalize(example, client, "second-attempt")
     assert len(accepted["chapters"][0]["blocks"]) == 1 and not retry
-    assert len(client.calls) == 2
+    assert len(client.calls) == 5
 
 
 def test_previous_chapter_consolidation_can_fall_back_in_current_chapter(example):
@@ -465,20 +466,22 @@ def test_consolidation_checks_refined_pixels_even_when_original_hashes_match(exa
     add_aliased_observation(example, identical=True)
     cropped = png(job / "refined.png", 80)
     monkeypatch.setattr(verification, "refine_crop", lambda *args: ("crop_1", False, ""))
-    monkeypatch.setattr(verification, "resolve_crop", lambda *args: cropped)
+    resolve = verification.resolve_crop
+    monkeypatch.setattr(verification, "resolve_crop", lambda job, evidence, identifier, crop_id="":
+                        cropped if crop_id else resolve(job, evidence, identifier))
     client = Client()
     accepted, retry = finalize(example, client)
     assert not retry and len(accepted["chapters"][0]["blocks"]) == 1
-    assert len(client.calls) == 2
+    assert len(client.calls) == 1
     for instructions, _, _, images in client.calls:
         assert instructions == verification.CONSOLIDATION_INSTRUCTIONS
         assert pymupdf.Pixmap(images[0][1]).samples[0] == 220
         assert images[1][1].read_bytes() == cropped.read_bytes()
     finalize(example, client, "second-attempt")
-    assert len(client.calls) == 2
+    assert len(client.calls) == 1
     png(cropped, 90)
     finalize(example, client, "third-attempt")
-    assert len(client.calls) == 4
+    assert len(client.calls) == 2
 
 
 def test_failed_consolidation_refines_new_fallback_before_accepting_it(example, monkeypatch):
@@ -491,6 +494,10 @@ def test_failed_consolidation_refines_new_fallback_before_accepting_it(example, 
         return ("crop_2" if selected["illustration_id"] == "v02_ill01" else "", False, "")
 
     monkeypatch.setattr(verification, "refine_crop", refine)
+    cropped = png(job / "refined.png", 80)
+    resolve = verification.resolve_crop
+    monkeypatch.setattr(verification, "resolve_crop", lambda job, evidence, identifier, crop_id="":
+                        cropped if crop_id else resolve(job, evidence, identifier))
     accepted, retry = finalize(example, Client({"verdict": "fail", "reason": "Новая стадия."}))
     fallback = accepted["chapters"][0]["blocks"][1]
     assert calls == ["v01_ill01", "v02_ill01"]
@@ -506,3 +513,206 @@ def test_crop_failure_is_reviewable_and_does_not_hide_reconstruction_failure(exa
     assert retry and block(accepted)["kind"] == "screenshot"
     assert reason in accepted["issues"][0]["description"]
     assert "Неверная стрелка." in accepted["issues"][0]["description"]
+
+
+def test_own_source_does_not_create_duplicate_when_comparison_is_unavailable(example, monkeypatch):
+    job, evidence, notes, _ = example
+    block(notes)["kind"] = "screenshot"
+    evidence["visuals"][0]["illustrations"][0]["source_kind"] = "printed"
+    notes["chapters"][0]["illustration_coverage"] = [
+        {"illustration_id": "v01_ill01", "block_id": "drawing"}]
+    cropped = png(job / "refined.png", 80)
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("crop_1", False, ""))
+    monkeypatch.setattr(verification, "resolve_crop", lambda *args: cropped)
+    client = Client(OSError("Connection interrupted"))
+    accepted, retry = finalize(example, client)
+    assert len(accepted["chapters"][0]["blocks"]) == 1
+    assert not client.calls and not retry and not accepted["issues"]
+
+
+@pytest.mark.parametrize("failure", [ResponseError("server_is_overloaded"), httpx.ReadError("Interrupted")])
+def test_transient_comparison_retries_before_inserting_duplicate(example, failure):
+    add_aliased_observation(example)
+
+    class RecoveringClient(Client):
+        def complete(self, *args, **kwargs):
+            reply = super().complete(*args, **kwargs)
+            if len(self.calls) == 1:
+                raise failure
+            return reply
+
+    client = RecoveringClient()
+    accepted, retry = finalize(example, client)
+    assert len(client.calls) == 2 and not retry
+    assert len(accepted["chapters"][0]["blocks"]) == 1 and not accepted["issues"]
+
+
+def test_refined_source_is_recompared_before_adding_redundant_fallback(example, monkeypatch):
+    job, _, _, _ = example
+    add_aliased_observation(example)
+    cropped = png(job / "refined.png", 220)
+    monkeypatch.setattr(verification, "refine_crop", lambda job, evidence, block, *args:
+                        ("crop_2" if block["illustration_id"] == "v02_ill01" else "", False, ""))
+    resolve = verification.resolve_crop
+    monkeypatch.setattr(verification, "resolve_crop", lambda job, evidence, identifier, crop_id="":
+                        cropped if crop_id else resolve(job, evidence, identifier))
+    client = Client({"verdict": "fail", "reason": "Разные поля кадра."})
+    accepted, retry = finalize(example, client)
+    assert len(accepted["chapters"][0]["blocks"]) == 1 and not retry
+    assert len(client.calls) == 1  # Refined source pixels exactly match the representative.
+
+
+def test_new_distinct_fallback_extends_existing_prose_references(example):
+    _, _, notes, _ = example
+    add_aliased_observation(example)
+    notes["chapters"][0]["blocks"].append({
+        "id": "explanation", "kind": "text", "content": "Сравним стадии.",
+        "evidence_ids": ["v01"], "figure_refs": ["drawing"]})
+    accepted, _ = finalize(example, Client({"verdict": "fail", "reason": "Иная стадия."}))
+    figures = [item for item in accepted["chapters"][0]["blocks"] if item.get("illustration_id")]
+    prose = next(item for item in accepted["chapters"][0]["blocks"] if item["id"] == "explanation")
+    assert prose["figure_refs"] == ["drawing", figures[1]["id"]]
+
+
+def paired_figures(example, *, across_chapters=False):
+    _, evidence, notes, _ = example
+    add_aliased_observation(example)
+    evidence["visuals"][1]["illustrations"][0]["source_kind"] = "printed"
+    later = {**deepcopy(block(notes)), "id": "later", "illustration_id": "v02_ill01",
+             "evidence_ids": ["v02_ill01"], "caption": "Завершённый рисунок"}
+    chapter = notes["chapters"][0]
+    chapter["blocks"].insert(0, {"id": "explanation", "kind": "text", "content": "Объяснение.",
+                                 "evidence_ids": ["v01"], "figure_refs": ["drawing", "later"]})
+    chapter["illustration_coverage"][1]["block_id"] = "later"
+    if across_chapters:
+        chapter["end"] = 3
+        notes["chapters"].append({"id": "c02", "title": "Продолжение", "start": 3, "end": 10,
+                                  "blocks": [later], "illustration_coverage": [
+                                      chapter["illustration_coverage"].pop()]})
+    else:
+        chapter["blocks"].append(later)
+    return notes
+
+
+@pytest.mark.parametrize("relation,preferred", [("same", "left"), ("left_contains_right", "left"),
+                                                ("right_contains_left", "right")])
+def test_reconciliation_keeps_best_view_and_remaps_cross_chapter_references(example, relation, preferred):
+    job, evidence, _, _ = example
+    notes = paired_figures(example, across_chapters=True)
+    original = deepcopy(notes)
+    dropped = "drawing" if preferred == "right" else "later"
+    kept = "later" if preferred == "right" else "drawing"
+    figures = [item for chapter in notes["chapters"] for item in chapter["blocks"]
+               if item.get("illustration_id")]
+    verification._issue(notes, next(item for item in figures if item["id"] == dropped), "Старая обрезка.")
+    client = Client({"relation": relation, "preferred": preferred, "reason": "Выбран полный вид."})
+    accepted, retry = verification.reconcile_illustrations(notes, evidence, job, job / "reconcile", client)
+    blocks = [item for chapter in accepted["chapters"] for item in chapter["blocks"]]
+    assert [item["id"] for item in blocks] == ["explanation", kept]
+    assert blocks[0]["figure_refs"] == [kept]
+    assert all(item["block_id"] == kept for chapter in accepted["chapters"]
+               for item in chapter["illustration_coverage"])
+    assert accepted["chapters"][0 if preferred == "left" else 1]["blocks"][-1]["id"] == kept
+    assert not accepted["issues"] and not retry and len(client.calls) == 1
+    assert notes["chapters"] == original["chapters"]
+    assert "Завершённый рисунок" in client.calls[0][1]
+    again, retry = verification.reconcile_illustrations(notes, evidence, job, job / "again", client)
+    assert again == accepted and not retry and len(client.calls) == 1
+
+
+@pytest.mark.parametrize("relation", ["distinct", "uncertain"])
+def test_reconciliation_preserves_independent_or_uncertain_figures(example, relation):
+    job, evidence, _, _ = example
+    notes = paired_figures(example)
+    client = Client({"relation": relation, "preferred": "neither", "reason": "Самостоятельные стадии."})
+    accepted, retry = verification.reconcile_illustrations(notes, evidence, job, job / "reconcile", client)
+    assert accepted == notes and not retry and len(client.calls) == 1
+
+
+def test_reconciliation_never_discards_figure_on_unavailable_verification(example):
+    job, evidence, _, _ = example
+    notes = paired_figures(example)
+    client = Client(OSError("Offline"))
+    accepted, retry = verification.reconcile_illustrations(notes, evidence, job, job / "reconcile", client)
+    assert accepted == notes and retry and len(client.calls) == 4
+
+
+def test_reconciliation_skips_different_source_kinds(example):
+    job, evidence, _, _ = example
+    notes = paired_figures(example)
+    evidence["visuals"][1]["illustrations"][0]["source_kind"] = "drawn"
+    client = Client()
+    accepted, retry = verification.reconcile_illustrations(notes, evidence, job, job / "reconcile", client)
+    assert accepted == notes and not retry and not client.calls
+
+
+def test_reconciliation_same_source_preserves_prose_references_without_model_call(example):
+    job, evidence, _, _ = example
+    notes = paired_figures(example)
+    chapter = notes["chapters"][0]
+    chapter["blocks"][-1].update(illustration_id="v01_ill01", evidence_ids=["v01_ill01"])
+    chapter["blocks"].append({"id": "later_explanation", "kind": "text", "content": "Продолжение.",
+                              "evidence_ids": ["v02"], "figure_refs": ["later"]})
+    client = Client(OSError("Offline"))
+    accepted, retry = verification.reconcile_illustrations(notes, evidence, job, job / "reconcile", client)
+    assert [item["id"] for item in accepted["chapters"][0]["blocks"]] == [
+        "explanation", "drawing", "later_explanation"]
+    assert accepted["chapters"][0]["blocks"][0]["figure_refs"] == ["drawing"]
+    assert accepted["chapters"][0]["blocks"][2]["figure_refs"] == ["drawing"]
+    assert not client.calls and not retry
+
+
+@pytest.mark.parametrize("identical_pixels", [False, True])
+def test_reconciliation_compares_different_crops_of_same_source(example, monkeypatch, identical_pixels):
+    job, evidence, _, _ = example
+    notes = paired_figures(example)
+    first, second = notes["chapters"][0]["blocks"][1:]
+    first["illustration_crop_id"] = "a" * 64
+    second.update(illustration_id=first["illustration_id"], illustration_crop_id="b" * 64,
+                  evidence_ids=first["evidence_ids"])
+    crops = {first["illustration_crop_id"]: png(job / "left.png", 220),
+             second["illustration_crop_id"]: png(job / "right.png", 220 if identical_pixels else 50)}
+    monkeypatch.setattr(verification, "resolve_crop",
+                        lambda job, evidence, identifier, crop_id="": crops[crop_id])
+    client = Client({"relation": "distinct", "preferred": "neither", "reason": "Разные рисунки."})
+    accepted, retry = verification.reconcile_illustrations(notes, evidence, job, job / "reconcile", client)
+    assert not retry
+    if identical_pixels:
+        assert not client.calls
+        assert [item["id"] for item in accepted["chapters"][0]["blocks"]] == ["explanation", "drawing"]
+    else:
+        assert accepted == notes and len(client.calls) == 1
+        assert [Path(path).read_bytes() for _, path in client.calls[0][3]] == [
+            crops[first["illustration_crop_id"]].read_bytes(),
+            crops[second["illustration_crop_id"]].read_bytes()]
+
+
+def test_reconciliation_remaps_chain_and_keeps_meaningful_caption_for_better_fallback(example):
+    job, evidence, _, _ = example
+    notes = paired_figures(example, across_chapters=True)
+    later = notes["chapters"][1]["blocks"][0]
+    later["content"] = "Полный рисунок с подписями."
+    generic_caption = "Иллюстрация к теме «Граф»"
+    final = {**deepcopy(later), "id": "best", "illustration_id": "v03_ill01",
+             "evidence_ids": ["v03_ill01"], "caption": generic_caption, "content": generic_caption}
+    source = png(job / "illustrations/v03_ill01.png", 50)
+    observation = {**evidence["visuals"][1]["illustrations"][0], "id": "v03_ill01",
+                   "image_sha256": sha256_file(source)}
+    evidence["visuals"].append({"id": "v03", "timestamp": 6, "status": "complete",
+                                 "illustrations": [observation]})
+    manifest = read_json(job / "illustrations/manifest.json")
+    manifest["assets"]["v03_ill01"] = {"path": "illustrations/v03_ill01.png",
+                                       "sha256": observation["image_sha256"]}
+    write_json(job / "illustrations/manifest.json", manifest)
+    notes["chapters"][1]["blocks"].append(final)
+    notes["chapters"][1]["illustration_coverage"].append({
+        "illustration_id": "v03_ill01", "block_id": "best"})
+    client = Client({"relation": "right_contains_left", "preferred": "right", "reason": "Полнее."})
+    accepted, retry = verification.reconcile_illustrations(notes, evidence, job, job / "reconcile", client)
+    assert not retry and len(client.calls) == 2
+    [kept] = accepted["chapters"][1]["blocks"]
+    assert kept["id"] == "best" and kept["illustration_id"] == "v03_ill01"
+    assert kept["caption"] == later["caption"] and kept["content"] == later["content"]
+    assert accepted["chapters"][0]["blocks"][0]["figure_refs"] == ["best"]
+    assert all(item["block_id"] == "best" for chapter in accepted["chapters"]
+               for item in chapter["illustration_coverage"])

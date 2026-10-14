@@ -52,10 +52,17 @@ class NoteBlock(StrictModel):
     language: str = ""
     illustration_id: Identifier | Literal[""] = ""
     illustration_crop_id: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+    figure_refs: list[Identifier] = Field(default_factory=list)
     uncertain_fragments: list[UncertainFragment] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def valid_uncertain_fragments(self):
+        if len(self.figure_refs) != len(set(self.figure_refs)):
+            raise ValueError("Figure references must be unique")
+        if self.figure_refs and self.kind not in {
+            "text", "definition", "theorem", "proof", "clarification", "uncertain",
+        }:
+            raise ValueError("Figure references are supported only in prose blocks")
         if self.illustration_crop_id and not self.illustration_id:
             raise ValueError("Refined crops require an illustration ID")
         if self.kind == "screenshot" and not self.illustration_id:

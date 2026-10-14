@@ -248,6 +248,10 @@ Repeated views share a figure. A text catalog of earlier figures enables reuse
 across chapters without reattaching all earlier images. Merging different crops
 requires a visual check focused on the actual figure and its integral labels.
 Failed matches try already retained alternatives before adding another screenshot.
+Transient comparison failures are retried. A final comparison of neighboring
+figures within each topic also consolidates independently generated duplicates,
+preferring a complete view over an unfinished drawing or partially visible plot.
+Distinct teaching stages remain separate; uncertain matches retain both figures.
 Selected figures are cropped again from their native frames: include the complete
 drawing, axes, labels and legend, excluding surrounding notes, code and people.
 This can tighten a large crop or recover content clipped by the initial crop.
@@ -256,6 +260,9 @@ Actual illustrations are never discarded to satisfy the editorial page target.
 Ordinary source citations create no footnotes; only marked uncertainty does.
 The PDF has a compact title followed by topical sections, and no review
 appendix. Review issues remain available in the JSON files and through `review`.
+Figures stay in source order beside the surrounding text and do not introduce
+sections by themselves. Prose uses `figure_refs` with stable figure block IDs;
+the renderer supplies numbered links and updates them after consolidation.
 Transcription warnings are informational: inspect or correct them before notes
 when needed. They are ignored by note generation rather than carried into review.
 
