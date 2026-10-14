@@ -4,12 +4,13 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 EVIDENCE_VERSION = 3
-VIDEO_EVIDENCE_VERSION = 4
+VIDEO_EVIDENCE_VERSION = 5
 AUDIO_CONFIG = {"schema_version": EVIDENCE_VERSION, "pipeline": "audio"}
 
 
@@ -21,7 +22,7 @@ def check_job(job: Path) -> None:
         saved = read_json(config)
         video_config = (isinstance(saved, dict)
                         and set(saved) == {"schema_version", "pipeline", "vision_model"}
-                        and saved["schema_version"] == VIDEO_EVIDENCE_VERSION
+                        and saved["schema_version"] in (4, VIDEO_EVIDENCE_VERSION)
                         and saved["pipeline"] == "audio_video"
                         and saved["vision_model"] in ("4b", "9b", "35b"))
         if saved != AUDIO_CONFIG and not video_config:
@@ -57,17 +58,20 @@ def validate_evidence(evidence: dict) -> dict:
         return validate_audio_evidence(evidence)
     message = "Unsupported evidence format; use a new output directory for extraction."
     if (not isinstance(evidence, dict)
-            or evidence.get("schema_version") != VIDEO_EVIDENCE_VERSION
+            or evidence.get("schema_version") not in (4, VIDEO_EVIDENCE_VERSION)
             or set(evidence) != {"schema_version", "title", "media", "segments", "visuals"}
             or not isinstance(evidence["visuals"], list)):
         raise ValueError(message)
     validate_audio_evidence({**{key: value for key, value in evidence.items() if key != "visuals"},
                              "schema_version": EVIDENCE_VERSION})
     identifiers = [segment["id"] for segment in evidence["segments"]]
+    visual_keys = {"id", "timestamp", "status", "kind", "text", "formulas",
+                   "diagrams", "unreadable"}
+    if evidence["schema_version"] == VIDEO_EVIDENCE_VERSION:
+        visual_keys.add("illustrations")
     for visual in evidence["visuals"]:
         if (not isinstance(visual, dict)
-                or set(visual) != {"id", "timestamp", "status", "kind", "text", "formulas",
-                                   "diagrams", "unreadable"}
+                or set(visual) != visual_keys
                 or not isinstance(visual["id"], str) or not visual["id"]
                 or type(visual["timestamp"]) not in (int, float)
                 or not math.isfinite(visual["timestamp"]) or visual["timestamp"] < 0
@@ -89,6 +93,26 @@ def validate_evidence(evidence: dict) -> dict:
                            for key in ("labels", "relationships"))):
                 raise ValueError(message)
         identifiers.append(visual["id"])
+        if evidence["schema_version"] == VIDEO_EVIDENCE_VERSION:
+            from .illustrations import validate_illustration_observation
+
+            illustrations = visual["illustrations"]
+            if not isinstance(illustrations, list):
+                raise ValueError(message)
+            for position, illustration in enumerate(illustrations, 1):
+                if (not isinstance(illustration, dict)
+                        or set(illustration) != {"id", "source_kind", "box", "description",
+                                                "image_sha256"}
+                        or illustration["id"] != f"{visual['id']}_ill{position:02d}"
+                        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", illustration["id"])
+                        or not isinstance(illustration["image_sha256"], str)
+                        or len(illustration["image_sha256"]) != 64
+                        or any(char not in "0123456789abcdef"
+                               for char in illustration["image_sha256"])):
+                    raise ValueError(message)
+                validate_illustration_observation({key: illustration[key] for key in
+                                                  ("source_kind", "box", "description")})
+                identifiers.append(illustration["id"])
     if not all(isinstance(identifier, str) and identifier for identifier in identifiers):
         raise ValueError(message)
     if len(set(identifiers)) != len(identifiers):
@@ -153,7 +177,10 @@ def evidence_index(evidence: dict) -> dict[str, str]:
     return {**{segment["id"]: f"Аудио {timestamp(segment['start'])}"
                for segment in evidence.get("segments", [])},
             **{visual["id"]: f"Видео {timestamp(visual['timestamp'])}"
-               for visual in evidence.get("visuals", [])}}
+               for visual in evidence.get("visuals", [])},
+            **{illustration["id"]: f"Иллюстрация, видео {timestamp(visual['timestamp'])}"
+               for visual in evidence.get("visuals", [])
+               for illustration in visual.get("illustrations", [])}}
 
 
 def timestamp(seconds: float) -> str:

@@ -64,6 +64,7 @@ class FakeClient:
 @pytest.fixture(autouse=True)
 def no_tex(monkeypatch):
     monkeypatch.setattr(notes.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(notes, "MAX_CHAPTER_TEXT_BYTES", 120_000)
 
     def write_project(job, payload):
         destination = job / "notes" / "main.tex"

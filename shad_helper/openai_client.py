@@ -12,6 +12,40 @@ from shad_helper.network import openai_http_client, resolve_openai_proxy
 DEFAULT_MODEL = "gpt-6.1-sol"
 DEFAULT_REASONING_EFFORT = "high"
 MAX_PDF_BYTES = 50_000_000
+MAX_IMAGE_ATTACHMENTS = 24
+MAX_IMAGE_ENCODED_BYTES = 40_000_000
+
+
+def _image_data(images):
+    """Validate bounded PNG attachments before accessing credentials or the network."""
+    if len(images) > MAX_IMAGE_ATTACHMENTS:
+        raise ValueError(f"At most {MAX_IMAGE_ATTACHMENTS} image attachments are allowed.")
+    result = []
+    encoded_size = 0
+    for label, path in images:
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("Image attachments require a non-empty label.")
+        with Path(path).open("rb") as stream:
+            data = stream.read(MAX_IMAGE_ENCODED_BYTES * 3 // 4 + 1)
+        encoded_size += 4 * ((len(data) + 2) // 3)
+        if encoded_size > MAX_IMAGE_ENCODED_BYTES:
+            raise ValueError("Encoded image attachments must not exceed 40 MB.")
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("Image attachments must be valid PNG files.")
+        import pymupdf
+        try:
+            pixels = pymupdf.Pixmap(data)
+            if pixels.width <= 0 or pixels.height <= 0:
+                raise ValueError("Empty PNG")
+        except (RuntimeError, ValueError, pymupdf.mupdf.FzErrorBase) as error:
+            raise ValueError("Image attachments must be valid PNG files.") from error
+        result.append((label, data))
+    return result, encoded_size
+
+
+def image_attachments_size(images: list[tuple[str, Path]]) -> int:
+    """Return base64 bytes after validating the request's attachment budget."""
+    return _image_data(images)[1]
 
 class ResponseError(RuntimeError):
     def __init__(self, message, *, code=None):
@@ -132,7 +166,8 @@ class PlanClient:
             raise ResponseError("ChatGPT returned an invalid account-specific model catalog.") from exc
 
     def complete(self, instructions: str, text: str, schema: dict | None = None,
-                 *, pdf: Path | None = None) -> dict:
+                 *, pdf: Path | None = None,
+                 images: list[tuple[str, Path]] | None = None) -> dict:
         content = [{"type": "input_text", "text": text}]
         if pdf is not None:
             pdf = Path(pdf)
@@ -145,6 +180,12 @@ class PlanClient:
             content.append({"type": "input_file", "filename": pdf.name,
                             "file_data": "data:application/pdf;base64,"
                             + base64.b64encode(data).decode("ascii")})
+        for label, data in _image_data(images or [])[0]:
+            content.extend((
+                {"type": "input_text", "text": label},
+                {"type": "input_image", "detail": "high", "image_url":
+                 "data:image/png;base64," + base64.b64encode(data).decode("ascii")},
+            ))
         body = {"model": self.model, "reasoning": {"effort": DEFAULT_REASONING_EFFORT}, "instructions": instructions, "input": [{"role": "user", "content": content}], "store": False, "stream": True}
         if schema is not None:
             body["text"] = {"format": {"type": "json_schema", "name": "lecture_notes", "schema": _strict_schema(schema), "strict": True}}

@@ -102,7 +102,8 @@ def test_visual_citations_are_scoped_and_static_context_remains_valid():
             notes._validate_chapter_reply(reply(chapter, identifier), data, chapter)
 
 
-def test_visual_budget_splits_without_dropping_frame_evidence():
+def test_visual_budget_splits_without_dropping_frame_evidence(monkeypatch):
+    monkeypatch.setattr(notes, "MAX_CHAPTER_TEXT_BYTES", 120_000)
     frames = [visual(f"frame_{number}", number * 30, text="Теория " + "x" * 9000)
               for number in range(30)]
     data = evidence(duration=900, speech=False, visuals=frames)
@@ -181,6 +182,7 @@ def test_video_diagram_remains_editable_and_render_preserves_its_source(tmp_path
     monkeypatch.setattr(rendering.shutil, "which", lambda name: name)
     monkeypatch.setattr(rendering.subprocess, "run", compile_pdf)
     monkeypatch.setattr(rendering, "_qa", lambda pdf: 1)
+    monkeypatch.setattr("shad_helper.pdf_sources.write_source_map", lambda *args: None)
     assert rendering.render(tmp_path) == tmp_path / "notes/main.pdf"
     assert source.read_text() == corrected
     assert not list((tmp_path / "notes").rglob("*.png"))

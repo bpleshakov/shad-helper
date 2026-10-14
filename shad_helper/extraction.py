@@ -9,6 +9,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
+from .illustrations import materialize_illustrations
 from .jobs import (
     AUDIO_CONFIG,
     EVIDENCE_VERSION,
@@ -254,9 +255,11 @@ def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
                              if selection["items"] else {"items": [], "diagnostics": {
                                  "status": "no_frames", "fresh_items": 0, "cached_items": 0}})
             visuals = []
+            illustrations = materialize_illustrations(out, visual_result["items"])
             for item in visual_result["items"]:
                 status = item["diagnostics"]["status"]
                 content = {**item["content"]}
+                content["illustrations"] = illustrations[item["id"]]
                 if status == "incomplete":
                     # Failure explanations stay local; the clean status is sufficient evidence.
                     content["unreadable"] = []

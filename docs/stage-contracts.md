@@ -6,12 +6,71 @@ the files produced, their structure, and the rules the next stage applies before
 using them.
 
 This contract describes the current implementation. It covers audio-only version
-3 jobs, audio/video version 4 jobs, automatic synthesis, manual ChatGPT handoff
+3 jobs, audio/video version 4/5 jobs, automatic synthesis, manual ChatGPT handoff
 and import, review, and rendering. Video extraction adds local frame selection
 and recognition of slides, physical or digital whiteboards, and notebook theory.
-Only clean textual evidence reaches synthesis; images and recognition diagnostics
-stay local. Diagrams are generated as editable inline TikZ or PGFPlots, without
-a raster fallback. Importing original slides or notebook files is unsupported.
+Version 5 supplies clean evidence and labeled source crops to synthesis; recognition
+diagnostics stay local. Drawings use visually verified TikZ/PGFPlots, with source
+crops as the fallback. Importing original slide or notebook files is unsupported.
+The version 4 field tables below describe the retained legacy format; version 5
+extends them as specified in the following section.
+
+## Illustration contract (version 5)
+
+Explicit video re-extraction writes version 5 while reusing audio, transcription,
+and frame-selection caches. Existing version 3/4 jobs remain readable. Version 4
+inputs require re-extraction before illustration coverage can be enforced.
+
+Each visual adds `illustrations`, an array of objects with exactly `id`,
+`source_kind` (`drawn`, `printed`, or `unknown`), `box` (normalized left/top/right/bottom),
+`description`, and `image_sha256`. IDs append `_illNN` to the frame ID. Crop bounds
+include a three-percent frame margin, clamped and rounded to native pixels. Worker
+output contains only source kind, detected box, and description; extraction assigns
+IDs, hashes, and final crop bounds. A detected diagram without an illustration region
+is invalid worker output. Exhausted extraction retries retain an unknown full-frame
+candidate instead of silently dropping instructional content.
+
+`illustrations/manifest.json` contains `{version: 1, assets: {ID: {path, sha256}}}`.
+Paths are job-relative managed PNGs. Every read validates confinement, the evidence
+and manifest hashes, and PNG decoding. These local paths do not enter model context.
+
+Chapter context adds `required_illustration_ids` for observations owned by the core
+interval and `prior_illustrations` for relevant accepted figures. Each chapter
+returns `illustration_coverage: [{illustration_id, block_id}]`; every required ID
+occurs exactly once and targets an illustration block in this or an eligible earlier
+chapter. A text citation alone does not preserve an illustration. Repeated views
+may share a block; meaningful intermediate stages remain separate.
+
+`diagram` and new `screenshot` blocks select their source using `illustration_id`
+and cite it in `evidence_ids`. Screenshot content is a description, not a path or
+TeX command. Printed/unknown sources use screenshots; drawn sources prefer TikZ.
+The chapter model receives labeled PNG attachments (`input_image`, high detail).
+Identical hashes share one attachment; `images.json` records all its observation
+IDs and the relative PNG filename in handoffs and request archives.
+
+Before accepting a drawing, the pipeline compiles an isolated preview and compares
+it with the source in a separate model call. Only `pass` preserves TikZ; `fail`,
+`uncertain`, compilation failure, or unavailable verification preserves a source
+screenshot and opens a review issue. Consolidation of different source hashes also
+requires visual verification; failed consolidation creates a separate crop block.
+Imported drawings receive the same checks. Candidates, exact credential-free model
+requests, previews, verdicts, and accepted blocks are archived locally.
+
+Candidate chapters use `checkpoints/notes_candidates/`; completed chapter compilation
+uses `checkpoints/notes_final/`. Verification caches bind source pixels, drawing code,
+rendering/verifier policies, model settings, and preview hashes. Temporary verifier
+failures are retried on rerun from the cached candidate. Ordinary legacy chapters
+retain `checkpoints/notes/`.
+
+The version 2 project manifest adds optional `image_files`. The renderer copies
+selected PNGs into `notes/figures/illustration-<ID>.png`, emits confined
+`includegraphics` references, and preserves source anchors. The copied project
+renders without original crops. Model-authored drawing code cannot load files.
+Chapter checks accept the original asset job as their asset source.
+
+The editorial page target never removes illustrations. Request limits are
+1,200,000 text bytes, 24 unique PNG attachments, and 40 MB of base64 image data.
+Existing time splitting and complete manual handoff handle oversized contexts.
 
 ## Contents
 
@@ -947,10 +1006,11 @@ when one exists. This carries a previously shown static slide or board into a
 later chapter. It does not claim that the retained frame's content first
 appeared at the current chapter boundary.
 
-The context has no images, image paths, raw model attempts, model metadata,
+The JSON context has no image bytes, local image paths, raw model attempts, model metadata,
 word probabilities, word timestamps, extraction diagnostics, extraction warnings,
 or existing note issues. Note generation does not open
 `extraction-diagnostics.json` or copy its contents into checkpoints or review.
+Version 5 images are separate labeled attachments as described above.
 
 The model-facing context adds lecture metadata to these fields. Its complete
 audio-only shape, also saved as a manual `context.json`, is:
@@ -1019,7 +1079,7 @@ consistent broad names across responses.
 ### Request size and chapter splitting
 
 Preflight measures UTF-8 bytes of the synthesis instructions, serialized model
-context, and serialized Pydantic response schema. The cap is 120,000 bytes. This
+context, and serialized Pydantic response schema. The cap is 1,200,000 bytes. This
 is a local text budget, not an exact token count or the serialized HTTP body size.
 
 Oversized chapters are bisected in time. Child IDs have the form
@@ -1683,7 +1743,7 @@ supported project configuration is:
 | Configuration | Allowed values |
 | --- | --- |
 | Document class | `article` |
-| Packages | `geometry`, `fontspec`, `polyglossia`, `unicode-math`, `amsmath`, `amssymb`, `amsthm`, `tikz`, `pgfplots`, `fvextra`, `fancyhdr`, `xcolor`, `hyperref`, `microtype` |
+| Packages | `geometry`, `fontspec`, `polyglossia`, `unicode-math`, `amsmath`, `amssymb`, `amsthm`, `tikz`, `pgfplots`, `fvextra`, `fancyhdr`, `xcolor`, `hyperref`, `microtype`, `graphicx` |
 | TikZ libraries | `arrows.meta`, `positioning`, `calc`, `shapes.geometric`, `fit`, `matrix` |
 | PGFPlots libraries | `groupplots` |
 | Languages | Default `russian`, other `english` |
@@ -1693,8 +1753,8 @@ supported project configuration is:
 
 The renderer restricts `documentclass`, `usepackage`, `setmainfont`, and
 `renewcommand`, plus `newtheorem` and `theoremstyle`, to `main.tex`. Supported arithmetic and drawing commands
-operate on inline content; commands for external images, external plot files,
-shell execution, and Lua are outside the contract. The exact command and
+operate on inline content; only renderer-managed PNG image references are permitted.
+External plot files, arbitrary files, shell execution, and Lua are outside the contract. The exact command and
 environment lists are maintained in [rendering.py](../shad_helper/rendering.py).
 
 ## LaTeX to PDF

@@ -49,7 +49,7 @@ _DRAW_COMMANDS = set(
     "draw node path coordinate fill filldraw clip shade shadedraw foreach "
     "tikz tikzset scope addplot addlegendentry legend nextgroupplot "
     "pgfplotsset pgfmathsetmacro pgfmathparse pgfmathresult pgfmathprintnumber "
-    "pgfmathsetlengthmacro".split()
+    "pgfmathsetlengthmacro linewidth textwidth textheight".split()
 )
 _PROJECT_COMMANDS = set(
     "documentclass usepackage setmainfont setmonofont setmathfont "
@@ -58,8 +58,8 @@ _PROJECT_COMMANDS = set(
     "subsection subsubsection paragraph par noindent centering caption "
     "footnote footnotesize scriptsize small normalsize large Large "
     "textbackslash textasciitilde textasciicircum textcolor "
-    "input VerbatimInput pagestyle fancyhf fancyfoot renewcommand "
-    "headrulewidth thepage linewidth textwidth medskip bigskip item "
+    "input VerbatimInput includegraphics pagestyle fancyhf fancyfoot renewcommand "
+    "headrulewidth thepage linewidth textwidth textheight medskip bigskip item "
     "hypersetup hypertarget emergencystretch newtheorem theoremstyle".split()
 )
 _SYMBOL_COMMANDS = set("\\{}%&#$_~^ ,;:![]()|") | {"\n", "\r"}
@@ -73,7 +73,7 @@ _DRAW_ENVIRONMENTS = {"tikzpicture", "scope", "axis", "groupplot"}
 _ENVIRONMENTS = _MATH_ENVIRONMENTS | _DRAW_ENVIRONMENTS | {"document", "figure", "quote", "center", "itemize", "enumerate", "description", "definition", "theorem", "proof"}
 _PACKAGES = set(
     "geometry fontspec polyglossia unicode-math amsmath amssymb amsthm tikz "
-    "pgfplots fvextra fancyhdr xcolor hyperref microtype".split()
+    "pgfplots fvextra fancyhdr xcolor hyperref microtype graphicx".split()
 )
 _ESCAPE = {
     "\\": r"\textbackslash{}", "{": r"\{", "}": r"\}", "$": r"\$",
@@ -161,7 +161,8 @@ def _validate_commands(source: str, *, diagram: bool = False, project: bool = Fa
     for environment in environments:
         if environment not in allowed_environments:
             raise RenderError(f"Unsupported TeX environment: {environment}")
-    if diagram and re.search(r"\b(?:file|table|graphics|shell|external)\b", source, re.I):
+    if diagram and (set(commands) & {"input", "VerbatimInput", "includegraphics"}
+                    or re.search(r"\b(?:file|table|graphics|shell|external)\b", source, re.IGNORECASE)):
         raise RenderError("Diagrams must use inline paths, expressions, or coordinates")
 
 
@@ -182,7 +183,10 @@ def _evidence_times(job: Path) -> dict[str, float]:
         return {}
     evidence = read_json(path)
     return {**{item["id"]: item["start"] for item in evidence.get("segments", [])},
-            **{item["id"]: item["timestamp"] for item in evidence.get("visuals", [])}}
+            **{item["id"]: item["timestamp"] for item in evidence.get("visuals", [])},
+            **{illustration["id"]: visual["timestamp"]
+               for visual in evidence.get("visuals", [])
+               for illustration in visual.get("illustrations", [])}}
 
 
 def _timestamp_footnote(evidence_ids: list[str], times: dict[str, float],
@@ -272,7 +276,7 @@ _PREAMBLE = r"""\documentclass[a4paper,11pt]{article}
 \newtheorem{definition}[theorem]{Определение}
 \usepackage{unicode-math}
 \setmathfont{Latin Modern Math}
-\usepackage{tikz,pgfplots,fvextra,fancyhdr,xcolor,hyperref,microtype}
+\usepackage{tikz,pgfplots,fvextra,fancyhdr,xcolor,hyperref,microtype,graphicx}
 \usetikzlibrary{arrows.meta,positioning,calc,shapes.geometric,fit,matrix}
 \usepgfplotslibrary{groupplots}
 \pgfplotsset{compat=1.18}
@@ -285,7 +289,7 @@ _PREAMBLE = r"""\documentclass[a4paper,11pt]{article}
 """
 
 
-def write_project(job: Path, notes: dict) -> Path:
+def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> Path:
     """Create editable sources from evidence-grounded notes.
 
     Call this only when replacing the note project is intentional. ``render``
@@ -297,6 +301,7 @@ def write_project(job: Path, notes: dict) -> Path:
         raise RenderError("The notes directory escapes the job")
     tex_files = ["main.tex"]
     code_files = []
+    image_files = []
     section_sources = []
     block_ids = set()
     chapter_ids = set()
@@ -341,6 +346,25 @@ def write_project(job: Path, notes: dict) -> Path:
                 _write(root, relative, content + "\n")
                 tex_files.append(relative)
                 lines.append("\\begin{figure}[htbp]\n\\centering\n\\input{" + relative + "}\n\\caption{" + escape_text(block.get("caption", "Схема")) + "}\n\\end{figure}\n")
+            elif kind == "screenshot":
+                from .illustrations import resolve_illustration
+
+                illustration_id = _identifier(block.get("illustration_id", ""))
+                try:
+                    evidence = read_json(job / "evidence.json")
+                    source = resolve_illustration(asset_job or job, evidence, illustration_id)
+                except (OSError, ValueError) as error:
+                    raise RenderError(f"Cannot resolve illustration {illustration_id}: {error}") from error
+                relative = f"figures/illustration-{illustration_id}.png"
+                destination = _confined(root, relative)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                if relative not in image_files:
+                    image_files.append(relative)
+                lines.append("\\begin{figure}[htbp]\n\\centering\n"
+                             "\\includegraphics[width=\\linewidth,height=.7\\textheight,keepaspectratio]{"
+                             + relative + "}\n\\caption{" + escape_text(block.get("caption", "Иллюстрация"))
+                             + "}\n\\end{figure}\n")
             elif kind == "code":
                 relative = f"code/{block_id}.txt"
                 _write(root, relative, content)
@@ -357,7 +381,7 @@ def write_project(job: Path, notes: dict) -> Path:
                 raise RenderError(f"Unsupported note block kind: {kind}")
             start = f"\\hypertarget{{shad-block-{block_id}}}{{}}"
             end = f"\\hypertarget{{shad-end-{block_id}}}{{}}"
-            if kind == "diagram":
+            if kind in {"diagram", "screenshot"}:
                 lines[-1] = lines[-1].replace("\\centering\n", "\\centering\n" + start, 1)
                 lines[-1] = lines[-1].replace("\\end{figure}", end + "\\end{figure}", 1)
             elif kind in {"definition", "theorem", "proof"}:
@@ -375,7 +399,9 @@ def write_project(job: Path, notes: dict) -> Path:
             else:
                 lines[-1] = start + lines[-1].rstrip() + end + "\n"
             source_blocks.append({"id": block_id, "topic": title, "content": content,
-                                  "evidence_ids": block.get("evidence_ids", [])})
+                                  "evidence_ids": block.get("evidence_ids", []),
+                                  **({"illustration_id": block["illustration_id"]}
+                                     if block.get("illustration_id") else {})})
         relative = f"chapters/section-{number:03}.tex"
         _write(root, relative, "\n\n".join(lines) + "\n")
         tex_files.append(relative)
@@ -389,7 +415,7 @@ def write_project(job: Path, notes: dict) -> Path:
     main = _PREAMBLE + _marked_footer(review) + "\\begin{document}\n\\begin{center}\\Large " + escape_text(notes["title"]) + "\\end{center}\n" + "\n".join(section_sources + appendix) + "\n\\end{document}\n"
     _write(root, "main.tex", main)
     manifest = {"version": 2, "draft": bool(review), "tex_files": tex_files,
-                "code_files": code_files, "review": review,
+                "code_files": code_files, "image_files": image_files, "review": review,
                 "source_blocks": source_blocks,
                 "issues": notes.get("issues", []), "evidence_fingerprint": _evidence_fingerprint(job)}
     _write(root, "project.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
@@ -429,7 +455,9 @@ def refresh_review(job: Path, notes: dict) -> Path:
 def _validate_project(root: Path, manifest: dict) -> None:
     tex_files = set(manifest["tex_files"])
     code_files = set(manifest["code_files"])
-    reference_commands = {"input": tex_files, "VerbatimInput": code_files}
+    image_files = set(manifest.get("image_files", []))
+    reference_commands = {"input": tex_files, "VerbatimInput": code_files,
+                          "includegraphics": image_files}
     total = 0
     for relative in tex_files:
         if not relative.endswith(".tex"):
@@ -478,6 +506,15 @@ def _validate_project(root: Path, manifest: dict) -> None:
     for relative in code_files:
         if not _confined(root, relative).is_file() or not relative.startswith("code/"):
             raise RenderError("Missing or invalid verbatim code asset")
+    for relative in image_files:
+        if not re.fullmatch(r"figures/illustration-[A-Za-z0-9][A-Za-z0-9_-]{0,79}\.png", relative):
+            raise RenderError("Invalid illustration image asset")
+        path = _confined(root, relative)
+        if not path.is_file():
+            raise RenderError(f"Missing illustration image asset: {relative}")
+        with path.open("rb") as source:
+            if source.read(8) != b"\x89PNG\r\n\x1a\n":
+                raise RenderError(f"Illustration image asset is not a PNG: {relative}")
 
 
 def _run_latex(root: Path) -> subprocess.CompletedProcess:
@@ -494,7 +531,8 @@ def _run_latex(root: Path) -> subprocess.CompletedProcess:
         )
 
 
-def validate_chapter_latex(notes: dict, evidence: dict, folder: Path) -> None:
+def validate_chapter_latex(notes: dict, evidence: dict, folder: Path, *,
+                           asset_job: Path | None = None) -> None:
     """Compile a chapter locally; retain sources and logs without PDF previews."""
     chapter = notes["chapters"][0]
     context = dict(evidence, segments=[segment for segment in evidence["segments"]
@@ -502,7 +540,7 @@ def validate_chapter_latex(notes: dict, evidence: dict, folder: Path) -> None:
                                              for block in chapter["blocks"])])
     write_json(folder / "evidence.json", context)
     try:
-        root = write_project(folder, notes).parent
+        root = write_project(folder, notes, asset_job=asset_job).parent
         _validate_project(root, read_json(root / "project.json"))
         completed = _run_latex(root)
         if completed.returncode or not (root / "main.pdf").is_file():
@@ -523,6 +561,76 @@ def validate_chapter_latex(notes: dict, evidence: dict, folder: Path) -> None:
             raise RenderError(f"{detail}; inspect {log_path}")
     except (OSError, subprocess.TimeoutExpired, RenderError) as error:
         raise RenderError(f"Chapter {chapter['id']} LaTeX validation failed: {error}") from error
+
+
+def diagram_preview_fingerprint() -> str:
+    """Invalidate visual verdicts when diagram rendering settings change."""
+    return fingerprint({"preamble": _PREAMBLE, "policy": 1, "compiler": "latexmk-lualatex",
+                        "shell_escape": False, "page_style": "empty", "padding": 6, "scale": 2})
+
+
+def render_diagram_preview(content: str, folder: Path) -> Path:
+    """Compile only the drawing and crop its painted bounds for visual comparison."""
+    import pymupdf
+
+    _validate_commands(content, diagram=True)
+    if not content.lstrip().startswith((r"\begin{tikzpicture}", r"\tikz")):
+        content = "\\begin{tikzpicture}\n" + content + "\n\\end{tikzpicture}"
+    folder = Path(folder)
+    if folder.is_symlink():
+        raise RenderError("The diagram preview directory cannot be a symbolic link")
+    folder.mkdir(parents=True, exist_ok=True)
+    source = "figures/diagram-preview.tex"
+    _write(folder, source, content + "\n")
+    _write(folder, "main.tex", _PREAMBLE + "\\pagestyle{empty}\n\\begin{document}\n"
+           "\\noindent\\input{" + source + "}\n\\end{document}\n")
+    manifest = {"version": 2, "tex_files": ["main.tex", source], "code_files": [],
+                "image_files": []}
+    _write(folder, "project.json", json.dumps(manifest, indent=2) + "\n")
+    _validate_project(folder, manifest)
+    for extension in ("pdf", "log", "aux", "out", "toc", "fls", "fdb_latexmk", "synctex.gz"):
+        _confined(folder, f"main.{extension}")
+    pdf = _confined(folder, "main.pdf")
+    preview = _confined(folder, "preview.png")
+    _confined(folder, "compiler-output.log")
+    pdf.unlink(missing_ok=True)
+    preview.unlink(missing_ok=True)
+    _confined(folder, "main.fdb_latexmk").unlink(missing_ok=True)
+    try:
+        completed = _run_latex(folder)
+        log = _confined(folder, "compiler-output.log").read_text(encoding="utf-8", errors="replace")
+        if (folder / "main.log").is_file():
+            log += "\n" + (folder / "main.log").read_text(encoding="utf-8", errors="replace")
+        if completed.returncode or not pdf.is_file():
+            raise RenderError(f"Diagram LaTeX compilation failed; inspect {folder / 'compiler-output.log'}")
+        if re.search(r"Overfull \\[hv]box|Missing character:", log):
+            raise RenderError("Diagram preview has overflow or missing glyphs")
+        with pymupdf.open(pdf) as document:
+            if len(document) != 1:
+                raise RenderError("Diagram preview must occupy exactly one page")
+            page = document[0]
+            bounds = pymupdf.Rect()
+            for kind, box, *_ in page.get_bboxlog():
+                if kind != "ignore-text":
+                    rectangle = pymupdf.Rect(box)
+                    if rectangle.is_empty:
+                        continue
+                    if rectangle.is_infinite or not rectangle.is_valid:
+                        raise RenderError("Diagram preview has invalid painted bounds")
+                    bounds |= rectangle
+            if bounds.is_empty:
+                raise RenderError("Diagram preview is empty")
+            if not page.rect.contains(bounds):
+                raise RenderError("Diagram preview is clipped by the page")
+            bounds = pymupdf.Rect(bounds.x0 - 6, bounds.y0 - 6,
+                                 bounds.x1 + 6, bounds.y1 + 6) & page.rect
+            page.get_pixmap(matrix=pymupdf.Matrix(2, 2), clip=bounds, alpha=False).save(preview)
+        return preview
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired,
+            pymupdf.mupdf.FzErrorBase) as error:
+        if isinstance(error, RenderError):
+            raise
+        raise RenderError(f"Diagram preview failed; compiler sources and logs are retained: {error}") from error
 
 
 def _qa(pdf: Path) -> int:

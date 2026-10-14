@@ -2,7 +2,7 @@
 
 A CLI that turns Russian lecture recordings into detailed, evidence-grounded LaTeX
 notes and PDF. Audio files and video soundtracks share local transcription;
-video frames also supply text, formulas, and diagram descriptions.
+video frames also supply text, formulas, and cropped instructional illustrations.
 Notes include equations, code, TikZ/PGFPlots diagrams, timestamps, and review items.
 
 Video extraction uses a configurable local Qwen model. Handwritten formulas
@@ -119,8 +119,12 @@ Jobs contain `extraction-config.json`, `evidence.json`,
 requests/responses, successful checkpoints, and current-run extraction timings.
 Audio evidence remains schema version 3, with title, media identity and interval,
 and speech segments containing `id`, `start`, `end`, and `text`. Video evidence
-uses version 4 and adds timestamped `visuals`: source IDs, completion status,
-content kind, text, formulas, diagram descriptions and unreadable regions.
+uses version 5 and adds timestamped `visuals`: source IDs, completion status,
+content kind, text, formulas, diagram descriptions, unreadable regions, and
+`illustrations` with source kind, crop bounds, stable IDs, and image hashes.
+Managed PNG crops and their manifest live under `illustrations/`. Crops include
+a three-percent frame margin to preserve nearby labels. Failed visual extraction
+retains an unknown source-image candidate for review instead of losing the frame.
 Frames are saved under `frames/` for local inspection. Model metadata, raw
 responses, timing/token/memory measurements, selection details, ASR confidence
 and extraction warnings stay in worker files and `extraction-diagnostics.json`.
@@ -133,14 +137,15 @@ invalidate affected results. Deleted audio/frame artifacts are rebuilt. Interrup
 work resumes from completed chunks/frames. Invalid vision JSON gets one retry;
 an unsuccessful frame remains explicitly `incomplete` and is retried on rerun.
 
-Version 3 audio and version 4 video jobs can be reused, including enabling or
+Version 3 audio and version 4/5 video jobs can be reused, including enabling or
 disabling vision in an existing supported job. Older formats require a **new
 output directory** and are rejected before changing their files. Re-extraction
 preserves existing notes/PDFs, but changed evidence requires regenerating notes
 before rendering. A fatal vision error preserves the completed transcript and
 audio evidence and returns an error; rerun the extraction to complete video.
-Silent extraction keeps inspectable artifacts; notes require speech or useful
-visual content.
+Silent extraction keeps inspectable artifacts; notes require speech, useful
+visual content, or an illustration candidate. Re-extract version 4 jobs to obtain
+version 5 crops; existing transcription and frame selection are reused.
 
 A transcription smoke check processes thirty seconds and may download Whisper:
 
@@ -181,12 +186,15 @@ Each request contains one chapter, neighboring speech and visual context, a
 shared glossary, and the broad topic names used in preceding replies. Speech
 inputs contain only `id`, `start`, `end`, and `text`.
 Video inputs contain the extracted content and timestamps, including the last
-preceding frame when a static slide spans a chapter boundary. Raw frame images,
-local frame paths, confidence and extraction diagnostics are not sent. Only
+preceding frame when a static slide spans a chapter boundary. Version 5 also sends
+labeled illustration crops, including source-image fallbacks, so the notes model
+can inspect their content directly. Local paths, confidence and extraction diagnostics
+are not sent. Only
 uncertainties discovered during note generation become note review issues.
 
-Chapters split above 120,000 UTF-8 bytes of instructions, context, and response
-schema. A typed `context_length_exceeded` response also triggers a split and
+Chapters split above 1,200,000 UTF-8 bytes of instructions, context, and response
+schema, 24 unique images, or 40 MB of encoded image attachments. Byte-identical
+crops share one labeled attachment. A typed `context_length_exceeded` response also triggers a split and
 retry. Splitting stops before creating parts shorter than thirty seconds.
 Irreducible context is exported manually without dropping speech or visuals.
 Editable outlines must cover the entire interval consecutively in chapters
@@ -224,7 +232,15 @@ range. Detailed uncertainty explanations remain in local review JSON instead of
 large “Требует проверки” passages. Missing essential formula/diagram details must
 be flagged rather than invented. Notebook visuals
 contribute theory, formulas and explanatory comments, not executable code.
-Diagrams remain editable TikZ/PGFPlots; source screenshots are not placed in PDFs.
+Drawings become editable TikZ/PGFPlots and undergo a separate visual comparison
+between the rendered drawing and its source crop. Only an explicit pass accepts
+the reconstruction. Uncertain, failed, uncompilable, or unverifiable drawings use
+the source crop and create a review issue; slide illustrations use crops directly.
+Completed drawings and meaningful intermediate stages are preserved. Repeated
+observations can share an illustration block, but every chapter-owned observation
+must have an explicit coverage mapping. Merging different crops also requires a
+visual check; failed or uncertain consolidation preserves a separate source crop.
+Illustrations are never discarded to satisfy the editorial page target.
 Ordinary source citations create no footnotes; only marked uncertainty does.
 The PDF has a compact title followed by topical sections, and no review
 appendix. Review issues remain available in the JSON files and through `review`.
@@ -258,7 +274,9 @@ contexts, and response schema. Each run also gets a separate archive under
 
 Requests are saved before transmission, including retries and failed parent
 requests that lead to chapter splitting. If saving fails, the request is not sent.
-Cached, manual, and imported chapters create no HTTP request records. Earlier
+Manual export makes no model calls. Cached reconstruction/consolidation verdicts
+are reused, but imported drawings and new consolidation decisions require visual
+verification. Earlier
 run archives survive later runs and `--rebuild`. Authentication headers, tokens,
 proxy credentials, and OAuth exchanges are excluded. A run that fails before
 inputs can be prepared still has a failed `run.json` record.
@@ -274,8 +292,9 @@ UV_CACHE_DIR=.cache/uv uv run shad-helper notes jobs/audio-lecture --manual
 For each chapter listed in the job's `outline.json`, attach
 `handoff/inputs/CHAPTER_ID/context.json` and the shared
 `handoff/inputs/response-schema.json` in ChatGPT, then paste that chapter's
-`prompt.txt`. These are the three model inputs: instructions, lecture data, and
-response structure. The context contains the lecture title, glossary, topics, writing budget, chapter
+`prompt.txt`. If `images.json` is present, also attach its listed PNGs with their
+illustration IDs. The text inputs supply instructions, lecture data, and response
+structure. The context contains the lecture title, glossary, topics, writing budget, chapter
 metadata, speech and (for video jobs) extracted visuals once. `handoff/README.txt`
 and any `status.json` are operator
 instructions and should not be sent to the model.
@@ -290,8 +309,11 @@ UV_CACHE_DIR=.cache/uv uv run shad-helper notes jobs/audio-lecture --import repl
 
 All expected replies must be present. A complete combined response can also
 be imported with `--import response.json`. Automatic and manual responses use
-the same schema and evidence validation. Success and imports refresh and archive
-the handoff without making additional model calls.
+the same schema and evidence validation. Imports undergo the same illustration
+verification as automatic notes; unavailable verification preserves source crops
+and flags them for review. Inputs, candidates, comparison requests, previews and
+accepted results remain in local archives. Transient verification failures retry
+on rerun without regenerating cached candidate chapters.
 
 ## Review and render PDF
 
@@ -319,8 +341,10 @@ Rendering preserves sources and produces `notes/main.pdf`, `notes/qa/` page
 previews, and `notes/render-report.json`. Inspect previews for clipped text,
 labels, equations, and glyphs. Compilation errors retain logs and sources.
 Changed evidence requires regeneration/import before rendering.
-TeX references are confined to declared sources and code; shell escape and
-external images are disabled.
+TeX references are confined to declared sources, code, and copied PNG assets;
+shell escape and arbitrary external files are disabled. The notes project remains
+renderable without the original frame/crop directories. Rendering preserves edits
+and does not make model calls.
 
 ## Checks and synthetic example
 

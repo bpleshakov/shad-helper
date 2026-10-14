@@ -43,17 +43,22 @@ class UncertainFragment(StrictModel):
 class NoteBlock(StrictModel):
     id: Identifier
     kind: Literal[
-        "text", "definition", "theorem", "proof", "math", "code", "diagram", "clarification", "uncertain",
+        "text", "definition", "theorem", "proof", "math", "code", "diagram", "screenshot", "clarification", "uncertain",
     ]
     content: str = Field(min_length=1)
     topic: str = ""
     evidence_ids: list[str] = Field(default_factory=list)
     caption: str = ""
     language: str = ""
+    illustration_id: Identifier | Literal[""] = ""
     uncertain_fragments: list[UncertainFragment] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def valid_uncertain_fragments(self):
+        if self.kind == "screenshot" and not self.illustration_id:
+            raise ValueError("Screenshots require an illustration ID")
+        if self.illustration_id and self.kind not in {"diagram", "screenshot"}:
+            raise ValueError("Only illustration blocks may select a source crop")
         if not self.uncertain_fragments:
             return self
         if self.kind not in {"text", "definition", "theorem", "proof", "clarification", "uncertain"}:
@@ -91,12 +96,18 @@ class NoteBlock(StrictModel):
         return self
 
 
+class IllustrationCoverage(StrictModel):
+    illustration_id: Identifier
+    block_id: Identifier
+
+
 class Chapter(StrictModel):
     id: Identifier
     title: str = Field(min_length=1)
     start: float = Field(ge=0)
     end: float = Field(gt=0)
     blocks: list[NoteBlock]
+    illustration_coverage: list[IllustrationCoverage] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def valid_interval(self):

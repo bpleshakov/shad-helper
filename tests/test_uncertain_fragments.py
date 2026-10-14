@@ -129,6 +129,7 @@ def test_an_empty_chapter_retains_its_outline_interval():
     chapter = Chapter(id="c1", title="Организационные вопросы", start=60, end=120, blocks=[])
     assert chapter.model_dump() == {
         "id": "c1", "title": "Организационные вопросы", "start": 60, "end": 120, "blocks": [],
+        "illustration_coverage": [],
     }
     with pytest.raises(ValidationError, match="end must be after"):
         Chapter(id="c1", title="Вопросы", start=60, end=30, blocks=[])

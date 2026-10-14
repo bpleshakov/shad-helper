@@ -8,14 +8,22 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from shad_helper import extraction, local_worker, video, vision_worker
-from shad_helper.jobs import AUDIO_CONFIG, check_job, fingerprint, read_json, validate_evidence
+from shad_helper.illustrations import resolve_illustration
+from shad_helper.jobs import (
+    AUDIO_CONFIG,
+    check_job,
+    fingerprint,
+    read_json,
+    validate_evidence,
+    write_json,
+)
 from shad_helper.vision_config import DEFAULT_VISION_MODEL, VISION_MODELS
 
 CONTENT = {"kind": "whiteboard", "text": "Определение", "formulas": [r"x^T\theta"],
-           "diagrams": [{"description": "Два блока", "labels": ["A", "B"],
-                         "relationships": ["A → B"]}], "unreadable": []}
+           "diagrams": [], "illustrations": [], "unreadable": []}
 
 
 @pytest.fixture
@@ -62,7 +70,7 @@ def pipeline(tmp_path, monkeypatch):
 
     def native(media, metadata, timestamp, image):
         image.parent.mkdir(exist_ok=True)
-        image.write_bytes(f"frame {timestamp}".encode())
+        Image.new("RGB", (320, 180), "white").save(image)
 
     native = Mock(side_effect=native)
     monkeypatch.setattr(video, "_native_frame", native)
@@ -103,14 +111,14 @@ def test_presets_load_pinned_models_sequentially_and_keep_source_timeline(
     pipeline.loader.assert_called_once_with(model, revision)
     assert pipeline.order == ["asr", "selection", "vision"]
     assert validate_evidence(evidence) == evidence
-    assert evidence["schema_version"] == 4
+    assert evidence["schema_version"] == 5
     assert [item["timestamp"] for item in evidence["visuals"]] == [105.25, 106.75]
     assert evidence["segments"][0]["start"] == 105.3
     assert evidence["media"]["clip_start"] == 105
     assert all(set(item) == {"id", "timestamp", "status", "kind", "text", "formulas",
-                             "diagrams", "unreadable"} for item in evidence["visuals"])
+                             "diagrams", "illustrations", "unreadable"} for item in evidence["visuals"])
     assert read_json(pipeline.job / "extraction-config.json") == {
-        "schema_version": 4, "pipeline": "audio_video", "vision_model": alias}
+        "schema_version": 5, "pipeline": "audio_video", "vision_model": alias}
     diagnostics = read_json(pipeline.job / "extraction-diagnostics.json")
     assert diagnostics["evidence_fingerprint"] == fingerprint(evidence)
     assert diagnostics["models"]["vision"] == {"preset": alias, "model": model,
@@ -157,11 +165,11 @@ def test_default_audio_or_attached_cover_stays_audio_only(pipeline, monkeypatch,
 ORIGINAL_PROBE_VIDEO = video.probe_video
 
 
-def test_video_without_frames_keeps_v4_without_loading_vision(pipeline, monkeypatch):
+def test_video_without_frames_keeps_v5_without_loading_vision(pipeline, monkeypatch):
     monkeypatch.setattr(extraction, "select_frames", lambda *args, **kwargs: {
         "items": [], "diagnostics": {"selected_frames": 0, "proxy_frames": 0}})
     evidence = run(pipeline)
-    assert evidence["schema_version"] == 4
+    assert evidence["schema_version"] == 5
     assert evidence["visuals"] == []
     assert read_json(pipeline.job / "extraction-config.json")["vision_model"] == "35b"
     pipeline.loader.assert_not_called()
@@ -215,6 +223,36 @@ def test_model_switches_reuse_audio_and_frames_but_refresh_visuals(pipeline):
     assert pipeline.transcribe.call_count == 1
 
 
+def test_illustration_crops_persist_and_legacy_jobs_upgrade_without_retranscription(pipeline):
+    evidence = run(pipeline)
+    legacy = {**evidence, "schema_version": 4}
+    for visual in legacy["visuals"]:
+        visual.pop("illustrations")
+    write_json(pipeline.job / "evidence.json", legacy)
+    write_json(pipeline.job / "extraction-config.json", {
+        "schema_version": 4, "pipeline": "audio_video", "vision_model": "35b"})
+    for checkpoint in (pipeline.job / "checkpoints/vision").glob("*.json"):
+        value = read_json(checkpoint)
+        value["fingerprint"] = "legacy prompt"
+        write_json(checkpoint, value)
+    content = {**CONTENT, "illustrations": [
+        {"source_kind": "drawn", "box": [0.1, 0.1, 0.5, 0.9], "description": "Стрелка"},
+        {"source_kind": "printed", "box": [0.5, 0.1, 0.9, 0.9], "description": "График"},
+    ]}
+    pipeline.runtime.infer.return_value = (json.dumps(content), {"finish_reason": "stop"})
+    upgraded = run(pipeline)
+    assert upgraded["schema_version"] == 5
+    assert pipeline.transcribe.call_count == 1
+    assert pipeline.scan.call_count == 1
+    assert pipeline.native.call_count == 2
+    for visual in upgraded["visuals"]:
+        assert len(visual["illustrations"]) == 2
+        for observation in visual["illustrations"]:
+            path = resolve_illustration(pipeline.job, upgraded, observation["id"])
+            with Image.open(path) as image:
+                assert image.size == (148, 156)
+
+
 def test_fatal_vision_error_preserves_audio_evidence_and_can_resume(pipeline):
     pipeline.loader.side_effect = RuntimeError("model unavailable")
     with pytest.raises(RuntimeError, match="model unavailable"):
@@ -229,7 +267,7 @@ def test_fatal_vision_error_preserves_audio_evidence_and_can_resume(pipeline):
     assert "vision_seconds" in read_json(pipeline.job / "extraction-timings.json")
     check_job(pipeline.job)
     pipeline.loader.side_effect = None
-    assert run(pipeline)["schema_version"] == 4
+    assert run(pipeline)["schema_version"] == 5
     assert pipeline.transcribe.call_count == 1
     assert pipeline.scan.call_count == 1
 
@@ -264,7 +302,7 @@ def test_longer_video_retains_tail_and_only_transcribes_available_audio(
         asr.assert_not_called()
         assert evidence["segments"] == []
         assert read_json(pipeline.job / "transcript.json") == []
-    assert evidence["schema_version"] == 4
+    assert evidence["schema_version"] == 5
 
 
 def test_off_still_rejects_clip_beyond_audio_even_with_longer_video(pipeline, monkeypatch):

@@ -10,7 +10,9 @@ from shad_helper import vision_worker
 
 CONTENT = {"kind": "whiteboard", "text": "Определение", "formulas": [r"\frac{x_i}{\theta} = 1"],
            "diagrams": [{"description": "A слева, B справа", "labels": ["A", "B"],
-                         "relationships": ["стрелка A → B"]}], "unreadable": []}
+                         "relationships": ["стрелка A → B"]}],
+           "illustrations": [{"source_kind": "drawn", "box": [0.1, 0.2, 0.8, 0.9],
+                              "description": "Стрелка от A к B"}], "unreadable": []}
 
 
 def response(content=CONTENT, **metrics):
@@ -43,6 +45,16 @@ class ParseOutputTests(unittest.TestCase):
         for formula in ("\theta", "\frac{a}{b}", "\beta", "\rho", "\nu"):
             with self.subTest(formula=formula), self.assertRaisesRegex(ValueError, "escape LaTeX"):
                 vision_worker.parse_output(json.dumps({**CONTENT, "formulas": [formula]}))
+
+    def test_reject_invalid_illustration_boxes_and_classification(self):
+        valid = CONTENT["illustrations"][0]
+        invalid = [None, {}, {**valid, "source_kind": "slide"}, {**valid, "description": ""}]
+        invalid += [{**valid, "box": box} for box in
+                    ([0, 0, 1], [0, 0, 1, float("nan")], [0, 0, 2, 1],
+                     [0.5, 0, 0.4, 1], [0, 0.5, 1, 0.5], [False, 0, 1, 1])]
+        for observation in invalid:
+            with self.subTest(observation=observation), self.assertRaises(ValueError):
+                vision_worker.parse_output(json.dumps({**CONTENT, "illustrations": [observation]}))
 
 
 class VisionWorkerTests(unittest.TestCase):
@@ -91,6 +103,22 @@ class VisionWorkerTests(unittest.TestCase):
         self.assertIn("error", item["diagnostics"]["attempts"][0])
         self.assertEqual(item["diagnostics"]["attempts"][0]["raw"], "{broken")
 
+    def test_invalid_box_uses_existing_retry(self):
+        invalid = {**CONTENT, "illustrations": [{**CONTENT["illustrations"][0],
+                                                 "box": [-1, 0, 1, 1]}]}
+        self.runtime.infer.side_effect = [response(invalid), response()]
+        item = vision_worker.run(self.request)["items"][0]
+        self.assertEqual(item["content"], CONTENT)
+        self.assertEqual(len(item["diagnostics"]["attempts"]), 2)
+
+    def test_detected_diagram_without_region_retries_then_preserves_full_frame(self):
+        self.runtime.infer.return_value = response({**CONTENT, "illustrations": []})
+        item = vision_worker.run(self.request)["items"][0]
+        self.assertEqual(item["diagnostics"]["status"], "incomplete")
+        self.assertEqual(len(item["diagnostics"]["attempts"]), 2)
+        self.assertIn("require illustration regions", item["diagnostics"]["attempts"][0]["error"])
+        self.assertEqual(item["content"]["illustrations"][0]["box"], [0, 0, 1, 1])
+
     def test_token_truncation_retries_even_when_json_happens_to_be_valid(self):
         for metrics in ({"finish_reason": "length"},
                         {"finish_reason": None, "generation_tokens": 2048}):
@@ -106,6 +134,8 @@ class VisionWorkerTests(unittest.TestCase):
         item = vision_worker.run(self.request)["items"][0]
         self.assertEqual(item["diagnostics"]["status"], "incomplete")
         self.assertTrue(item["content"]["unreadable"])
+        self.assertEqual(item["content"]["illustrations"][0]["source_kind"], "unknown")
+        self.assertEqual(item["content"]["illustrations"][0]["box"], [0, 0, 1, 1])
         self.assertFalse((self.root / "job/checkpoints/vision/v0001.json").exists())
         diagnostics = vision_worker.read_json(self.root / "job/diagnostics/vision/v0001.json")
         self.assertEqual(diagnostics["status"], "incomplete")

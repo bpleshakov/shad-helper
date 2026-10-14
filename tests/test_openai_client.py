@@ -566,5 +566,78 @@ if _FULL_DEPS:
         assert requests[0].url.path == "/v1/models"
 
 
+    def png_attachment(tmp_path, name="drawing.png"):
+        import pymupdf
+
+        path = tmp_path / name
+        pixels = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 12, 8), False)
+        pixels.clear_with(220)
+        pixels.save(path)
+        return path
+
+
+    def test_labeled_images_preserve_exact_png_bytes_and_high_detail(tmp_path):
+        image = png_attachment(tmp_path)
+        client, requests = client_for(tmp_path, sse(completed('{}')))
+        assert client.complete("Compare", "Lecture", images=[("Рисунок ill01", image)]) == {}
+        body = json.loads(requests[-1].content)
+        assert body["input"][0]["content"] == [
+            {"type": "input_text", "text": "Lecture"},
+            {"type": "input_text", "text": "Рисунок ill01"},
+            {"type": "input_image", "detail": "high", "image_url":
+             "data:image/png;base64," + base64.b64encode(image.read_bytes()).decode("ascii")},
+        ]
+        assert str(tmp_path) not in requests[-1].content.decode()
+
+
+    def test_images_and_pdf_preserve_attachment_order(tmp_path):
+        image = png_attachment(tmp_path)
+        pdf = tmp_path / "notes.pdf"
+        pdf.write_bytes(b"%PDF-1.7\n")
+        client, requests = client_for(tmp_path, sse(completed('{}')))
+        client.complete("Compare", "Lecture", pdf=pdf, images=[("ill01", image)])
+        content = json.loads(requests[-1].content)["input"][0]["content"]
+        assert [item["type"] for item in content] == [
+            "input_text", "input_file", "input_text", "input_image"]
+
+
+    @pytest.mark.parametrize("kind", ["missing", "directory", "empty", "wrong_format",
+                                      "malformed", "truncated", "blank_label", "count", "bytes"])
+    def test_invalid_image_fails_before_credentials_or_network(tmp_path, monkeypatch, kind):
+        image = png_attachment(tmp_path)
+        label = "ill01"
+        if kind == "missing":
+            image.unlink()
+        elif kind == "directory":
+            image.unlink()
+            image.mkdir()
+        elif kind in ("empty", "wrong_format", "malformed", "truncated"):
+            image.write_bytes({"empty": b"", "wrong_format": b"%PDF-1.7",
+                               "malformed": b"\x89PNG\r\n\x1a\nnot png",
+                               "truncated": image.read_bytes()[:30]}[kind])
+        elif kind == "blank_label":
+            label = " "
+        images = [(label, image)]
+        if kind == "count":
+            images *= 25
+        elif kind == "bytes":
+            monkeypatch.setattr(openai_client, "MAX_IMAGE_ENCODED_BYTES", 12)
+        client, requests = client_for(tmp_path, sse(completed('{}')))
+        client.token_provider = lambda: pytest.fail("Invalid images must not access credentials")
+        client.request_recorder = lambda *args: pytest.fail("Invalid images must not record requests")
+        with pytest.raises((ValueError, OSError)):
+            client.complete("Compare", "Lecture", images=images)
+        assert requests == []
+
+
+    def test_image_budget_counts_base64_and_allows_exact_limit(tmp_path, monkeypatch):
+        image = png_attachment(tmp_path)
+        size = len(base64.b64encode(image.read_bytes()))
+        monkeypatch.setattr(openai_client, "MAX_IMAGE_ENCODED_BYTES", size * 2)
+        assert openai_client.image_attachments_size([("first", image), ("second", image)]) == size * 2
+        with pytest.raises(ValueError, match="40 MB"):
+            openai_client.image_attachments_size([("image", image)] * 3)
+
+
 if __name__ == "__main__":
     unittest.main()
