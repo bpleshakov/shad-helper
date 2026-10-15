@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pymupdf
 
-from .jobs import write_json
+from .jobs import sha256_file, write_json
 
 
 def write_source_map(pdf: Path, manifest: dict) -> None:
@@ -13,6 +13,12 @@ def write_source_map(pdf: Path, manifest: dict) -> None:
     with pymupdf.open(pdf) as document:
         destinations = document.resolve_names()
         for block in manifest["source_blocks"]:
+            if asset := block.get("figure_asset"):
+                path = (pdf.parent / asset["path"]).resolve()
+                if not path.is_relative_to(pdf.parent.resolve()) or not path.is_file():
+                    raise ValueError("Figure asset is missing or escapes the notes project")
+                # Editable project assets may have changed since write_project.
+                block = {**block, "figure_asset": {**asset, "sha256": sha256_file(path)}}
             identifier = block["id"]
             anchor = f"shad-block-{identifier}"
             start = destinations.get(anchor, {}).get("page", -1)

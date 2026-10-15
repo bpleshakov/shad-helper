@@ -1,4 +1,5 @@
 import json
+import shutil
 from copy import deepcopy
 from unittest.mock import Mock
 
@@ -6,7 +7,7 @@ import httpx
 import pymupdf
 import pytest
 
-from shad_helper import illustration_crops
+from shad_helper import crop_validation, illustration_crops
 from shad_helper.illustration_crops import refine_crop, resolve_crop
 from shad_helper.jobs import fingerprint, read_json, sha256_file, write_json
 from shad_helper.openai_client import PlanClient
@@ -41,8 +42,25 @@ def example(tmp_path):
 
 
 def client(box=(30, 25, 90, 60)):
-    return Mock(model="test-model", complete=Mock(return_value={
+    model = Mock(model="test-model", complete=Mock(return_value={
         "status": "cropped", "box": list(box), "reason": "Оси и легенда сохранены."}))
+
+    def complete(instructions, text, schema, **kwargs):
+        if schema == crop_validation.CROP_VERIFICATION_SCHEMA:
+            return verdict()
+        return model.complete.return_value
+
+    model.complete.side_effect = complete
+    return model
+
+
+def verdict(check=None, defect="clipped_content", repair="recrop", status="fail"):
+    checks = dict.fromkeys(("identity", "completeness", "readability", "cleanliness"), "pass")
+    if check:
+        checks[check] = status
+    return {"verdict": status if check else "pass", "checks": checks,
+            "defects": [defect] if check else [], "repair": repair if check else "none",
+            "reason": "Подпись оси обрезана." if check else "Рисунок полный и соответствует кадру."}
 
 
 def run(example, model=None, folder="archive"):
@@ -67,7 +85,7 @@ def test_shrinks_or_expands_using_native_pixels_and_preserves_originals(example,
     assert evidence == original_evidence and block == original_block
     assert all(path.read_bytes() == original for path, original in original_assets.items())
     assert resolve_crop(job, evidence, "v01_ill01") == source
-    args, kwargs = model.complete.call_args
+    args, kwargs = model.complete.call_args_list[0]
     context = json.loads(args[1])
     assert context["frame_size"] == [120, 80]
     assert context["source_box"] == evidence["visuals"][0]["illustrations"][0]["box"]
@@ -85,7 +103,7 @@ def test_cache_reuses_completed_crop_and_tracks_selected_figure_and_native_frame
     model = client()
     first = run(example, model)[0]
     assert run(example, model)[0] == first
-    assert model.complete.call_count == 1
+    assert model.complete.call_count == 2
     assert read_json(job / "archive/attempt-02/status.json")["status"] == "cached"
     block["caption"] = "Изменённая подпись"
     second = run(example, model)[0]
@@ -94,7 +112,7 @@ def test_cache_reuses_completed_crop_and_tracks_selected_figure_and_native_frame
     pixels.set_pixel(0, 0, (0, 0, 0))
     pixels.save(frame)
     assert run(example, model)[0] not in (first, second)
-    assert model.complete.call_count == 3
+    assert model.complete.call_count == 6
     assert resolve_crop(job, evidence, "v01_ill01", first).is_file()
 
 
@@ -107,7 +125,7 @@ def test_invalid_boxes_do_not_publish_or_poison_cache(example, box):
     assert not list((example[0] / "illustration-crops").glob("*/crop.json"))
     model.complete.return_value["box"] = [20, 10, 90, 70]
     assert run(example, model)[0]
-    assert model.complete.call_count == 2
+    assert model.complete.call_count == 3
 
 
 @pytest.mark.parametrize("uncertainty", [
@@ -138,7 +156,7 @@ def test_unusable_fragment_is_explicit_and_preserves_source_for_later_recheck(ex
     assert read_json(example[0] / "archive/attempt-01/status.json")["status"] == "unusable"
     model.complete.return_value = client().complete.return_value
     assert run(example, model)[0]
-    assert model.complete.call_count == 2
+    assert model.complete.call_count == 3
 
 
 @pytest.mark.parametrize("box", [[0, 0, 0], [False, 0, 0, 0], [0.0, 0, 0, 0], [0, 0, 0, 1]])
@@ -162,7 +180,7 @@ def test_changed_crop_policy_rechecks_old_success_without_deleting_evidence(exam
         "reason": "Полная иллюстрация не помещается в исходный кадр.",
     }
     assert run(example, model)[0:2] == ("", False)
-    assert model.complete.call_count == 2
+    assert model.complete.call_count == 3
     assert source.read_bytes() == original
     assert resolve_crop(job, evidence, "v01_ill01", previous_id).is_file()
     assert read_json(job / "archive/attempt-02/status.json")["status"] == "uncertain"
@@ -270,3 +288,239 @@ def test_raw_http_transport_error_is_reported(example):
     model = client()
     model.complete.side_effect = httpx.ConnectError("offline")
     assert run(example, model)[0:2] == ("", True)
+
+
+def test_verifier_sees_actual_crop_without_selector_justification(example):
+    job, _, _, frame, source = example
+    model = client()
+    selector_reason = "THIS IS DEFINITELY CORRECT"
+    model.complete.return_value["reason"] = selector_reason
+    original = {path: path.read_bytes() for path in (frame, source)}
+    crop_id = run(example, model)[0]
+    args, kwargs = model.complete.call_args_list[1]
+    assert args[2] == crop_validation.CROP_VERIFICATION_SCHEMA
+    context = json.loads(args[1])
+    assert selector_reason not in args[1] and "repair_feedback" not in context
+    assert [label for label, _ in kwargs["images"]] == ["FULL_FRAME", "MARKED_FRAME", "CROP"]
+    images = dict(kwargs["images"])
+    assert images["CROP"].read_bytes() == resolve_crop(job, example[1], "v01_ill01", crop_id).read_bytes()
+    assert images["FULL_FRAME"].read_bytes() == original[frame]
+    assert images["MARKED_FRAME"].read_bytes() != original[frame]
+    assert all(path.read_bytes() == contents for path, contents in original.items())
+    record = read_json(job / "illustration-crops" / crop_id / "crop.json")
+    assert record["verification"]["result"] == verdict()
+    assert record["verification"]["image_sha256"] == sha256_file(images["CROP"])
+
+
+@pytest.mark.parametrize("check,defect", [("completeness", "clipped_content"),
+                                        ("identity", "wrong_figure")])
+def test_repair_uses_concrete_feedback_and_rechecks_new_pixels(example, check, defect):
+    model = client()
+    rejected = verdict(check, defect)
+    corrected = {"status": "cropped", "box": [5, 10, 115, 78], "reason": "Подпись восстановлена."}
+    model.complete.side_effect = [model.complete.return_value, rejected, corrected, verdict()]
+    crop_id, retry, reason, unusable = run(example, model)
+    assert crop_id and not retry and not reason and not unusable
+    repair_args, repair_kwargs = model.complete.call_args_list[2]
+    assert json.loads(repair_args[1])["repair_feedback"] == rejected
+    assert dict(repair_kwargs["images"])["CANDIDATE"].read_bytes() == (
+        example[0] / "archive/attempt-01/verification/crop.png").read_bytes()
+    verifier_context = json.loads(model.complete.call_args_list[3].args[1])
+    assert "repair_feedback" not in verifier_context and rejected["reason"] not in str(verifier_context)
+    pixels = pymupdf.Pixmap(resolve_crop(example[0], example[1], "v01_ill01", crop_id))
+    assert pixels.pixel(0, 0) == (5, 10, 42)
+    assert (pixels.width, pixels.height) == (110, 68)
+    assert len(list((example[0] / "illustration-crops").glob("*/crop.json"))) == 1
+    assert read_json(example[0] / "archive/attempt-01/status.json")["repairs"] == 1
+    archive = example[0] / "archive/attempt-01"
+    assert sha256_file(archive / "crop.png") == read_json(archive / "crop.json")["image_sha256"]
+    assert (archive / "initial-crop.png").read_bytes() == (archive / "verification/crop.png").read_bytes()
+
+
+def test_exhausted_repairs_keep_source_without_publishing_wrong_crop(example):
+    model = client()
+    model.complete.side_effect = [model.complete.return_value, verdict("identity", "wrong_figure")] * 3
+    crop_id, retry, reason, unusable = run(example, model)
+    assert crop_id == "" and not retry and reason and not unusable
+    assert model.complete.call_count == 6
+    assert not list((example[0] / "illustration-crops").glob("*/crop.json"))
+    assert resolve_crop(example[0], example[1], "v01_ill01") == example[4]
+    assert read_json(example[0] / "archive/attempt-01/status.json")["repairs"] == 2
+
+
+@pytest.mark.parametrize("status", ["fail", "uncertain"])
+def test_no_supported_repair_stops_and_never_caches_acceptance(example, status):
+    model = client()
+    model.complete.side_effect = [model.complete.return_value,
+                                  verdict("readability", "unreadable", "none", status)]
+    assert run(example, model)[0:2] == ("", False)
+    assert model.complete.call_count == 2
+    assert not list((example[0] / "illustration-crops").glob("*/crop.json"))
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("offline"), {"verdict": "pass"},
+                                    {**verdict(), "checks": {}}])
+def test_unavailable_or_malformed_verifier_does_not_publish_and_can_retry(example, failure):
+    model = client()
+    model.complete.side_effect = [model.complete.return_value, failure]
+    assert run(example, model)[0:2] == ("", True)
+    assert not list((example[0] / "illustration-crops").glob("*/crop.json"))
+    assert run(example, client())[0]
+
+
+def add_frame(example, identifier, timestamp, shade=150, size=(140, 90)):
+    job, evidence, _, _, _ = example
+    path = job / "frames" / f"{identifier}_{'a' * 12}.png"
+    pixels = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, *size), False)
+    pixels.clear_with(shade)
+    pixels.save(path)
+    evidence["visuals"].append({"id": identifier, "timestamp": timestamp,
+                                "status": "complete", "illustrations": []})
+    return path
+
+
+@pytest.mark.parametrize("initial", ["cropped", "uncertain"])
+def test_nearby_frame_recovery_verifies_original_identity_and_records_provenance(example, initial):
+    job, evidence, _, original, source = example
+    alternate = add_frame(example, "v02", 8)
+    snapshots = {path: path.read_bytes() for path in (original, alternate, source)}
+    original_evidence = deepcopy(evidence)
+    model = client()
+    first = ([model.complete.return_value, verdict("completeness", repair="nearby_frame")]
+             if initial == "cropped" else [{"status": "uncertain", "box": [0, 0, 0, 0],
+                                            "reason": "График обрезан краем кадра."}])
+    model.complete.side_effect = [*first,
+        {"status": "cropped", "box": [10, 10, 135, 85], "reason": "В соседнем кадре рисунок полный."},
+        verdict()]
+    crop_id, retry, reason, unusable = run(example, model)
+    assert crop_id and not retry and not reason and not unusable
+    verifier = model.complete.call_args_list[-1]
+    images = dict(verifier.kwargs["images"])
+    assert images["ORIGINAL_FRAME"].read_bytes() == snapshots[original]
+    assert images["FULL_FRAME"].read_bytes() == snapshots[alternate]
+    assert json.loads(verifier.args[1])["frame"]["visual_id"] == "v02"
+    record = read_json(job / "illustration-crops" / crop_id / "crop.json")
+    assert record["frame"]["visual_id"] == "v02"
+    assert record["frame"]["timestamp"] == 8
+    assert record["frame"]["sha256"] == sha256_file(alternate)
+    assert record["inputs"]["reference_frame"]["sha256"] == sha256_file(original)
+    assert record["inputs"]["illustration_id"] == "v01_ill01"
+    assert pymupdf.Pixmap(resolve_crop(job, evidence, "v01_ill01", crop_id)).width == 125
+    assert evidence == original_evidence
+    assert all(path.read_bytes() == contents for path, contents in snapshots.items())
+    assert run(example, model)[0] == crop_id  # no remaining mocked responses: must reuse cache
+    cached = job / "archive/attempt-02"
+    assert (cached / "verification/frame.png").read_bytes() == snapshots[alternate]
+    assert (cached / "verification/original-frame.png").read_bytes() == snapshots[original]
+    assert sha256_file(cached / "crop.png") == read_json(cached / "crop.json")["image_sha256"]
+    changed = pymupdf.Pixmap(alternate)
+    changed.set_pixel(0, 0, (9, 9, 9))
+    changed.save(alternate)
+    assert run(example, client())[0] != crop_id
+    assert resolve_crop(job, evidence, "v01_ill01", crop_id).is_file()  # archived snapshot
+
+
+def test_nearby_wrong_stage_is_rejected_even_when_crop_is_complete(example):
+    add_frame(example, "v02", 8)
+    model = client()
+    model.complete.side_effect = [
+        model.complete.return_value, verdict("readability", "occluded", "nearby_frame"),
+        model.complete.return_value, verdict("identity", "wrong_stage", "none")]
+    assert run(example, model)[0:2] == ("", False)
+    assert model.complete.call_count == 4
+    assert not list((example[0] / "illustration-crops").glob("*/crop.json"))
+
+
+def test_nearby_selection_skips_missing_duplicates_symlinks_and_distant_frames(example):
+    job, evidence, _, original, _ = example
+    missing = add_frame(example, "missing", 3.1)
+    missing.unlink()
+    duplicate = add_frame(example, "duplicate", 3.2)
+    duplicate.write_bytes(original.read_bytes())
+    linked = add_frame(example, "linked", 3.3)
+    linked.unlink()
+    linked.symlink_to(original)
+    corrupt = add_frame(example, "corrupt", 3.4)
+    corrupt.write_bytes(b"not an image")
+    add_frame(example, "earlier", 2, shade=100)
+    add_frame(example, "later", 6, shade=200)
+    add_frame(example, "distant", 34, shade=99)
+    reference = illustration_crops._native_frame(job, "a" * 64, evidence["visuals"][0])[1]
+    nearby = illustration_crops._nearby_frames(job, evidence, "a" * 64, reference)
+    assert [frame[1]["visual_id"] for frame in nearby] == ["earlier", "later"]
+
+
+def test_warning_flags_are_sent_to_verifier_but_do_not_reject_a_pass(example):
+    pixels = pymupdf.Pixmap(example[3])
+    pixels.set_pixel(0, 0, (255, 255, 255))
+    pixels.save(example[3])
+    model = client((0, 0, 120, 80))
+    crop_id = run(example, model)[0]
+    assert crop_id
+    context = json.loads(model.complete.call_args_list[1].args[1])
+    assert "frame_edge" in context["warnings"]
+    assert "content_at_boundary" in context["warnings"]
+
+
+def test_verifier_policy_change_invalidates_previous_pass(example, monkeypatch):
+    model = client()
+    first = run(example, model)[0]
+    monkeypatch.setattr(crop_validation, "CROP_VERIFICATION_INSTRUCTIONS",
+                        crop_validation.CROP_VERIFICATION_INSTRUCTIONS + "\nRecheck stage.")
+    second = run(example, model)[0]
+    assert second and first != second and model.complete.call_count == 4
+
+
+@pytest.mark.parametrize("missing", ["all", "marked-frame.png", "verdict.json"])
+def test_incomplete_verification_archive_is_rebuilt_instead_of_permanent_fallback(example, missing):
+    model = client()
+    crop_id = run(example, model)[0]
+    archive = example[0] / "illustration-crops" / crop_id / "verification"
+    if missing == "all":
+        shutil.rmtree(archive)
+    else:
+        (archive / missing).unlink()
+    assert run(example, model) == (crop_id, False, "", False)
+    assert model.complete.call_count == 4
+    assert (archive / "marked-frame.png").is_file()
+    assert read_json(archive / "verdict.json") == verdict()
+
+
+@pytest.mark.parametrize("mutation", ["verdict", "crop_hash", "frame_hash", "box", "frame"])
+def test_resolver_requires_verified_pixels_and_frame_binding(example, mutation):
+    job, evidence, _, _, _ = example
+    crop_id = run(example)[0]
+    path = job / "illustration-crops" / crop_id / "crop.json"
+    record = read_json(path)
+    if mutation == "verdict":
+        record["verification"]["result"] = verdict("identity", "wrong_figure")
+    elif mutation == "crop_hash":
+        record["verification"]["image_sha256"] = "b" * 64
+    elif mutation == "frame_hash":
+        record["verification"]["frame_sha256"] = "b" * 64
+    elif mutation == "box":
+        record["verification"]["box"] = [0, 0, 120, 80]
+    else:
+        record["frame"]["visual_id"] = "wrong"
+    write_json(path, record)
+    with pytest.raises(ValueError, match="verification"):
+        resolve_crop(job, evidence, "v01_ill01", crop_id)
+
+
+def test_legacy_crop_assets_remain_resolvable_but_are_not_reused_as_verified(example):
+    job, evidence, _, _, _ = example
+    current_id = run(example)[0]
+    root = job / "illustration-crops" / current_id
+    record = read_json(root / "crop.json")
+    record["version"] = 1
+    record.pop("verification")
+    record["inputs"] = {"illustration_id": "v01_ill01", "source_sha256": sha256_file(example[4]),
+                        "frame_size": [120, 80], "policy": 1}
+    legacy_id = fingerprint(record["inputs"])
+    legacy = root.with_name(legacy_id)
+    root.rename(legacy)
+    write_json(legacy / "crop.json", record)
+    assert resolve_crop(job, evidence, "v01_ill01", legacy_id).is_file()
+    model = client()
+    assert run(example, model)[0] == current_id
+    assert model.complete.call_count == 2

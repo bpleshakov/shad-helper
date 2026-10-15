@@ -7,6 +7,7 @@ from urllib.parse import quote
 
 from .anki_models import get_models
 from .anki_schema import note_fields
+from .illustrations import illustration_index
 from .jobs import fingerprint, read_json
 
 
@@ -32,6 +33,9 @@ def load_lecture_sources(job: Path, pdf: Path, pdf_hash: str) -> dict | None:
              for item in evidence.get("segments", [])}
     times.update({item["id"]: {"start": item["timestamp"], "end": item["timestamp"]}
                   for item in evidence.get("visuals", [])})
+    # A figure can cite its managed crop directly; its time belongs to the parent frame.
+    times.update({identifier: {"start": item["timestamp"], "end": item["timestamp"]}
+                  for identifier, item in illustration_index(evidence).items()})
     return {"blocks": mapping["blocks"], "times": times,
             "media": evidence.get("media", {}).get("path")}
 

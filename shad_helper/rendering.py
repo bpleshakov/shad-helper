@@ -10,7 +10,7 @@ import subprocess
 from copy import deepcopy
 from pathlib import Path
 
-from .jobs import check_job, fingerprint, read_json, write_json
+from .jobs import check_job, fingerprint, read_json, sha256_file, write_json
 from .schemas import NoteBlock
 
 
@@ -470,8 +470,11 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
                              "\\relax>\\textheight\n\\unvbox\\shadfiguregroup\n"
                              "\\else\n\\box\\shadfiguregroup\n\\fi\n")
                 grouped_figure = None
-            source_blocks.append({"id": block_id, "topic": title, "content": content,
+            source_blocks.append({"id": block_id, "kind": kind, "topic": title, "content": content,
                                   "evidence_ids": block.get("evidence_ids", []),
+                                  **({"figure_asset": {"path": relative,
+                                                       "sha256": sha256_file(_confined(root, relative))}}
+                                     if kind in {"diagram", "screenshot"} else {}),
                                   **({"figure_refs": block["figure_refs"]}
                                      if block.get("figure_refs") else {}),
                                   **({"illustration_id": block["illustration_id"]}

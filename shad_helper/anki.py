@@ -15,11 +15,12 @@ import genanki
 import pymupdf
 
 from .anki_export import write_package
+from .anki_figures import export_figure, load_figure_assets
 from .anki_latex import render_latex_media
 from .anki_models import get_models
 from .anki_positions import collection_position
 from .anki_prompt import INSTRUCTIONS, PROMPT_VERSION
-from .anki_schema import generation_schema, note_fields, validate_response
+from .anki_schema import SourceFigure, generation_schema, note_fields, validate_response
 from .anki_sources import (
     card_records,
     load_lecture_sources,
@@ -38,19 +39,40 @@ from .openai_client import (
 )
 
 
-def _generate(client, pdf, page_count, sources, diagnostics):
+def _figure_catalog(sources, assets):
+    return [{"block_id": identifier, "kind": asset["kind"],
+             **{key: sources["blocks"][identifier][key]
+                for key in ("topic", "content", "page_start", "page_end")}}
+            for identifier, asset in assets.items()]
+
+
+def _validate_figure_sources(response, sources, assets):
+    for note in response.notes:
+        for figure in note.figures:
+            if isinstance(figure, SourceFigure):
+                if sources is None or figure.block_id not in assets:
+                    raise ValueError("Figure must reference an original figure block from figure_catalog")
+            elif sources is not None:
+                raise ValueError("Lecture figures require block_id references, not PDF crop coordinates")
+
+
+def _generate(client, pdf, page_count, sources, diagnostics, figure_assets):
     text = (f"Создай Anki-колоду по всему приложенному PDF ({page_count} страниц). "
             "Сохраняй порядок первого появления объектов и отмечай дополнения модели.")
     text += "\nКаталог блоков конспекта для привязки источников:\n" + json.dumps(
         source_catalog(sources), ensure_ascii=False)
+    if sources is not None:
+        text += "\nfigure_catalog:\n" + json.dumps(
+            _figure_catalog(sources, figure_assets), ensure_ascii=False)
     for attempt in range(4):
         folder = diagnostics / f"attempt-{attempt + 1:02d}"
         try:
             reply = client.complete(INSTRUCTIONS, text,
-                                    schema=generation_schema(), pdf=pdf)
+                                    schema=generation_schema(source_figures=sources is not None), pdf=pdf)
             write_json(folder / "response.json", reply)
             response = validate_response(reply, page_count)
             validate_card_sources(response, page_count, sources)
+            _validate_figure_sources(response, sources, figure_assets)
             write_json(folder / "status.json", {"status": "success"})
             return response
         except (PlanAccessError, ResponseError, ValueError) as exc:
@@ -112,10 +134,12 @@ def _publish(staging: Path, folder: Path) -> None:
         raise
 
 
-def _prepare_notes(response, document, media_dir, identity, pdf_hash, *, start_position=1):
+def _prepare_notes(response, document, media_dir, identity, pdf_hash, *, start_position=1,
+                   job=None, figure_assets=None):
     models = get_models()
     notes, provenance, media = [], [], {}
     position = start_position
+    exported_figures = {}
     for note in response.notes:
         plain_fields = note_fields(note)
         fields = {name: _field_html(value) for name, value in plain_fields.items()}
@@ -123,19 +147,28 @@ def _prepare_notes(response, document, media_dir, identity, pdf_hash, *, start_p
             fields[name] += '<br><small>Дополнено моделью: содержит сведения сверх PDF.</small>'
         figure_records = []
         for figure in note.figures:
-            page = document[figure.page - 1]
-            left, top, right, bottom = figure.box
-            rect = page.rect
-            clip = pymupdf.Rect(left * rect.width, top * rect.height,
-                                right * rect.width, bottom * rect.height)
-            png = page.get_pixmap(clip=clip, dpi=200, alpha=False).tobytes("png")
+            source_record = {}
+            if isinstance(figure, SourceFigure):
+                asset = figure_assets[figure.block_id]
+                if figure.block_id not in exported_figures:
+                    exported_figures[figure.block_id] = export_figure(
+                        job, asset, media_dir.parent / "figures")
+                png = exported_figures[figure.block_id].read_bytes()
+                source_record = {"source_asset": asset}
+            else:
+                page = document[figure.page - 1]
+                left, top, right, bottom = figure.box
+                rect = page.rect
+                clip = pymupdf.Rect(left * rect.width, top * rect.height,
+                                    right * rect.width, bottom * rect.height)
+                png = page.get_pixmap(clip=clip, dpi=200, alpha=False).tobytes("png")
             filename = f"shad-{hashlib.sha256(png).hexdigest()}.png"
             path = media_dir / filename
             if filename not in media:
                 path.write_bytes(png)
                 media[filename] = path
             fields[figure.field] += f'<br><img src="{filename}">'
-            figure_records.append({**figure.model_dump(), "file": filename})
+            figure_records.append({**figure.model_dump(), "file": filename, **source_record})
         model = models[note.note_type]
         values = [fields.get(field["name"], "") for field in model.fields]
         key = {"source": note.source.model_dump(), "type": note.note_type,
@@ -181,13 +214,16 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
     position_source = collection_position(anki_collection)
     pdf_hash = hashlib.sha256(data).hexdigest()
     lecture_sources = load_lecture_sources(job, source, pdf_hash)
+    figure_assets = load_figure_assets(job, lecture_sources)
     folder = job / "anki"
     folder.mkdir(parents=True, exist_ok=True)
     model = client.model if client is not None else DEFAULT_MODEL
     signature = fingerprint({"pdf_sha256": pdf_hash, "model": model,
         "reasoning_effort": DEFAULT_REASONING_EFFORT, "prompt_version": PROMPT_VERSION,
-        "instructions": INSTRUCTIONS, "schema": generation_schema(),
-        "source_catalog": source_catalog(lecture_sources)})
+        "instructions": INSTRUCTIONS,
+        "schema": generation_schema(source_figures=lecture_sources is not None),
+        "source_catalog": source_catalog(lecture_sources),
+        "figure_catalog": _figure_catalog(lecture_sources, figure_assets)})
     cache_path = job / "checkpoints" / "anki.json"
     with pymupdf.open(stream=data, filetype="pdf") as document:
         if document.needs_pass or len(document) == 0:
@@ -202,19 +238,21 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
                 print("Reusing anki generation", flush=True)
                 response = validate_response(cached["result"], len(document))
                 validate_card_sources(response, len(document), lecture_sources)
+                _validate_figure_sources(response, lecture_sources, figure_assets)
             else:
                 print(f"Generating Anki cards from {len(document)} PDF pages", flush=True)
                 selected_client = client or PlanClient(state_dir, proxy=proxy)
                 diagnostics = job / "diagnostics" / "anki" / str(time.time_ns())
                 response = _generate(selected_client, frozen_pdf, len(document), lecture_sources,
-                                     diagnostics)
+                                     diagnostics, figure_assets)
                 write_json(cache_path, {"fingerprint": signature,
                                        "result": response.model_dump()})
             identity = _identity(folder, response.title)
             media_dir = staging / "media"
             media_dir.mkdir()
             notes, media, provenance = _prepare_notes(
-                response, document, media_dir, identity, pdf_hash)
+                response, document, media_dir, identity, pdf_hash,
+                job=job, figure_assets=figure_assets)
             media.extend(render_latex_media(notes, media_dir))
             # Generation and TeX compilation can take minutes. Read the allocation
             # cursor again immediately before packaging, including current WAL data.

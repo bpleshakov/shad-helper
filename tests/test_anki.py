@@ -272,6 +272,59 @@ def test_report_resolves_each_proof_step_locally_and_matches_exported_cards(job,
     assert str(job) not in outbound
 
 
+@pytest.mark.parametrize("evidence_ids, expected", [
+    (["v1_ill01"], [{"evidence_id": "v1_ill01", "start": 113.5, "end": 113.5}]),
+    (["v1_ill01", "s1", "v1", "v1_ill02", "v1_ill01"], [
+        {"evidence_id": "s1", "start": 61.25, "end": 67.5},
+        {"evidence_id": "v1_ill01", "start": 113.5, "end": 113.5},
+        {"evidence_id": "v1", "start": 113.5, "end": 113.5},
+        {"evidence_id": "v1_ill02", "start": 113.5, "end": 113.5},
+    ]),
+])
+def test_illustration_card_sources_keep_parent_frame_time_and_crop_identity(
+        job, client, response, evidence_ids, expected):
+    mapping = mapped_lecture(job, response)
+    evidence = read_json(job / "evidence.json")
+    evidence["visuals"][0].update(
+        status="complete", illustrations=[{"id": "v1_ill01"}, {"id": "v1_ill02"}])
+    write_json(job / "evidence.json", evidence)
+    mapping["evidence_fingerprint"] = fingerprint(evidence)
+    mapping["blocks"]["b1"]["evidence_ids"] = evidence_ids
+    write_json(job / "notes/source-map.json", mapping)
+    response["notes"] = [response["notes"][0]]
+    client.complete.return_value = sourced_reply(response)
+
+    package = anki.generate_anki(job, job / "auth", client=client)
+
+    rows, _ = inspect_package(package)
+    cards = read_json(job / "anki/report.json")["cards"]
+    assert len(rows) == len(cards) == 1
+    assert cards[0]["timestamps"] == expected
+    markdown = (job / "anki/sources.md").read_text()
+    assert "#t=113.5)" in markdown
+    assert "`v1_ill01`" in markdown
+    outbound = json.dumps(client.complete.call_args.args, ensure_ascii=False)
+    assert "113.5" not in outbound
+    assert "PRIVATE_" not in outbound
+
+
+def test_unknown_illustration_source_does_not_borrow_its_frame_time(job, client, response):
+    mapping = mapped_lecture(job, response)
+    evidence = read_json(job / "evidence.json")
+    evidence["visuals"][0].update(status="complete", illustrations=[{"id": "v1_ill01"}])
+    write_json(job / "evidence.json", evidence)
+    mapping["evidence_fingerprint"] = fingerprint(evidence)
+    mapping["blocks"]["b1"]["evidence_ids"] = ["v1_ill99"]
+    write_json(job / "notes/source-map.json", mapping)
+
+    with pytest.raises(ValueError, match="Lecture block b1 has no valid timed evidence"):
+        anki.generate_anki(job, job / "auth", client=client)
+
+    assert not (job / "anki/deck.apkg").exists()
+    assert not (job / "anki/sources.md").exists()
+    assert not (job / "checkpoints/anki.json").exists()
+
+
 @pytest.mark.parametrize("error", ["missing", "duplicate", "unknown", "page", "no_evidence"])
 def test_invalid_card_sources_do_not_publish(job, client, response, error):
     mapping = mapped_lecture(job, response)
@@ -710,6 +763,86 @@ def test_pdf_crop_pixels_math_and_supplements_survive_packaging(job, client, res
     assert report["notes"][2]["review_flags"] == response["notes"][2]["review_flags"]
     assert read_json(job / "anki" / "notes.json")["notes"][0]["back"] == (
         "Строка & смысл\n" + r"[$]0 < x < y \Rightarrow x^2 < y^2[/$]")
+
+
+def mapped_figure(job, response):
+    mapping = mapped_lecture(job, response)
+    evidence = read_json(job / "evidence.json")
+    evidence["visuals"][0].update(status="complete", illustrations=[{"id": "v1_ill01"}])
+    write_json(job / "evidence.json", evidence)
+    mapping["evidence_fingerprint"] = fingerprint(evidence)
+    relative = "figures/illustration-v1_ill01.png"
+    path = job / "notes" / relative
+    path.parent.mkdir()
+    pixels = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 48, 24), False)
+    pixels.clear_with(120)
+    pixels.save(path)
+    block = {"id": "fig1", "kind": "screenshot", "topic": "График", "content": "Точный график",
+             "illustration_id": "v1_ill01", "evidence_ids": ["v1_ill01"],
+             "anchor": "shad-block-fig1", "page_start": 1, "page_end": 1,
+             "figure_asset": {"path": relative, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}}
+    mapping["blocks"]["fig1"] = block
+    write_json(job / "notes/source-map.json", mapping)
+    write_json(job / "notes/project.json", {"version": 2, "tex_files": [],
+               "image_files": [relative], "source_blocks": [block]})
+    response["notes"][0]["figures"] = [{"field": "Back", "block_id": "fig1"}]
+    return path
+
+
+def test_original_figure_bytes_are_packaged_without_pdf_cropping_and_reused_offline(
+        job, client, response, monkeypatch):
+    original = mapped_figure(job, response).read_bytes()
+    monkeypatch.setattr(pymupdf.Page, "get_pixmap", Mock(side_effect=AssertionError("PDF crop")))
+
+    package = anki.generate_anki(job, job / "auth", client=client)
+
+    rows, media = inspect_package(package)
+    assert list(media.values()) == [original]
+    report = read_json(job / "anki/report.json")
+    figure = report["notes"][0]["figures"][0]
+    assert figure["block_id"] == "fig1" and "box" not in figure
+    assert figure["source_asset"]["sha256"] == hashlib.sha256(original).hexdigest()
+    assert f'<img src="{figure["file"]}">' in rows[0][1]
+    outbound = json.dumps(client.complete.call_args.args, ensure_ascii=False)
+    assert "figure_catalog" in outbound and "fig1" in outbound
+    assert "PRIVATE_" not in outbound and "figures/" not in outbound
+    assert client.complete.call_args.kwargs["schema"] == generation_schema(source_figures=True)
+    before_guids = {row[0] for row in rows}
+    anki.generate_anki(job, job / "auth", client=client)
+    assert {row[0] for row in inspect_package(package)[0]} == before_guids
+    assert client.complete.call_count == 1
+
+
+@pytest.mark.parametrize("target", ["unknown", "b1", "pdf_crop"])
+def test_lecture_figures_cannot_select_unknown_prose_or_pdf_crops(job, client, response, target):
+    mapped_figure(job, response)
+    response["notes"][0]["figures"] = (
+        [{"field": "Back", "page": 1, "box": [0, 0, 1, 1]}] if target == "pdf_crop"
+        else [{"field": "Back", "block_id": target}])
+    with pytest.raises(ValueError, match="Figure must reference|Lecture figures require"):
+        anki.generate_anki(job, job / "auth", client=client)
+    assert not (job / "anki/deck.apkg").exists()
+    assert not (job / "checkpoints/anki.json").exists()
+
+
+@pytest.mark.parametrize("change", ["missing", "changed"])
+def test_missing_or_changed_original_figure_fails_before_model(job, client, response, change):
+    path = mapped_figure(job, response)
+    if change == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"Changed source")
+    with pytest.raises(ValueError, match="missing|changed"):
+        anki.generate_anki(job, job / "auth", client=client)
+    client.complete.assert_not_called()
+    assert not (job / "anki/deck.apkg").exists()
+
+
+def test_source_figure_reference_requires_lecture_assets(job, client, response):
+    response["notes"][0]["figures"] = [{"field": "Back", "block_id": "fig1"}]
+    with pytest.raises(ValueError, match="Figure must reference"):
+        anki.generate_anki(job, job / "auth", client=client)
+    assert not (job / "anki/deck.apkg").exists()
 
 
 @pytest.mark.parametrize(("index", "update"), [

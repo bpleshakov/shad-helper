@@ -37,6 +37,7 @@ class SourcedText(BaseModel):
 
 
 class Figure(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     field: Text = Field(description="Exact destination Anki field name")
     page: int = Field(ge=1)
     box: list[Coordinate] = Field(min_length=4, max_length=4,
@@ -50,11 +51,17 @@ class Figure(BaseModel):
         return self
 
 
+class SourceFigure(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    field: Text = Field(description="Exact destination Anki field name")
+    block_id: Text = Field(description="Figure block ID from the supplied figure catalog")
+
+
 class NoteBase(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     source: Source
     card_sources: list[CardSource] = Field(default_factory=list)
-    figures: list[Figure] = Field(default_factory=list)
+    figures: list[SourceFigure | Figure] = Field(default_factory=list)
     supplemented_fields: list[str] = Field(default_factory=list,
         description="Exact Anki fields containing reasoning added beyond the PDF")
     review_flags: list[str] = Field(default_factory=list)
@@ -109,19 +116,22 @@ _ANSWER_FIELDS = {
 }
 
 
-def generation_schema() -> dict:
+def generation_schema(*, source_figures: bool = False) -> dict:
     """Require a source alongside each answer, without a parallel field-name list."""
     schema = AnkiResponse.model_json_schema()
     sourced = SourcedText.model_json_schema()
     schema["$defs"].update(sourced.pop("$defs"))
     schema["$defs"]["SourcedText"] = sourced
     schema["$defs"].pop("CardSource")
+    figure_type = "SourceFigure" if source_figures else "Figure"
+    schema["$defs"].pop("Figure" if source_figures else "SourceFigure")
     for definition in schema["$defs"].values():
         properties = definition.get("properties", {})
         kind = properties.get("note_type", {}).get("const")
         if kind not in _ANSWER_FIELDS:
             continue
         properties.pop("card_sources")
+        properties["figures"]["items"] = {"$ref": f"#/$defs/{figure_type}"}
         for field in _ANSWER_FIELDS[kind]:
             answer = {"$ref": "#/$defs/SourcedText"}
             properties[field] = {"anyOf": [answer, {"type": "null"}]} if field == "proof" else answer
@@ -194,7 +204,8 @@ def validate_response(value: dict, page_count: int) -> AnkiResponse:
             if not fields.get(target):
                 raise ValueError("Supplement marker must refer to a populated Anki field")
         for figure in note.figures:
-            if figure.page > page_count or not fields.get(figure.field):
+            if (isinstance(figure, Figure) and figure.page > page_count
+                    or not fields.get(figure.field)):
                 raise ValueError("Figure must refer to a PDF page and populated Anki field")
         for text in fields.values():
             if text and not text.strip():

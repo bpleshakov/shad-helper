@@ -180,6 +180,7 @@ def test_unreferenced_figure_ends_the_directly_explained_group(illustrated_job):
 
 @pytest.fixture
 def refined_crop(illustrated_job):
+    from shad_helper.crop_validation import CROP_VERIFICATION_SCHEMA
     from shad_helper.illustration_crops import refine_crop, resolve_crop
 
     job, evidence, notes = illustrated_job
@@ -191,7 +192,12 @@ def refined_crop(illustrated_job):
 
     def make_crop(box, name="crop"):
         class Client:
-            def complete(self, *args, **kwargs):
+            def complete(self, instructions, text, schema, **kwargs):
+                if schema == CROP_VERIFICATION_SCHEMA:
+                    return {"verdict": "pass", "checks": {
+                        check: "pass" for check in
+                        ("identity", "completeness", "readability", "cleanliness")},
+                        "defects": [], "repair": "none", "reason": "Полный выбранный рисунок."}
                 return {"status": "cropped", "box": box,
                         "reason": "Keep only the selected drawing region."}
 

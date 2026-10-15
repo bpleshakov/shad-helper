@@ -260,6 +260,17 @@ Distinct teaching stages remain separate; uncertain matches retain both figures.
 Selected figures are cropped again from their native frames: include the complete
 drawing, axes, labels and legend, excluding surrounding notes, code and people.
 This can tighten a large crop or recover content clipped by the initial crop.
+During notes finalization, each proposed crop undergoes cheap checks for blank or
+thin content and suspicious boundaries, followed by an independent visual check
+of the actual crop against the native frame and intended figure. The checks cover
+identity and drawing stage, completeness, readability, and unrelated content;
+heuristic warnings alone never reject a crop. Failed crops get at most two repair
+attempts, including the nearest saved frame on either side within 30 seconds when
+the original frame is clipped or occluded. An alternate frame must preserve the
+same figure and stage. Only visually verified crops are reused as successful
+refinements or accepted as sources for LaTeX verification. Unresolved crops retain
+their original screenshot and a review issue. See [crop verification](docs/illustration-crops.md)
+for the repair limits, saved diagnostics, and validation plan.
 Refined crops are separate managed assets; original frames and evidence stay intact.
 Actual illustrations are never discarded to satisfy the editorial page target.
 Ordinary source citations create no footnotes; only marked uncertainty does.
@@ -413,7 +424,10 @@ The default input is `JOB/notes/main.pdf`. The command sends the complete PDF to
 `gpt-6.1-sol` with high reasoning through the existing ChatGPT sign-in and explicit
 OpenAI proxy. It includes text and page images. For generated lecture PDFs it also
 sends a catalog of the saved note blocks and their PDF page ranges to identify
-sources. Raw transcripts, recording paths, timestamps, and pipeline diagnostics
+sources. Figures reference their original figure block IDs: screenshots reuse
+the exact managed PNGs embedded in the notes, and drawings are rendered from
+the same TikZ source. Missing or changed assets stop export rather than falling
+back to PDF crops. Raw transcripts, recording paths, timestamps, and pipeline diagnostics
 are not model inputs. The PDF must be
 unencrypted and smaller than 50,000,000 bytes. If the model cannot process the
 whole document or return a complete valid response, the command fails without
@@ -432,7 +446,8 @@ Import `JOB/anki/deck.apkg` into Anki. Each job has a distinct, persistent deck
 name ending in a short job ID. The package reuses the four existing note types
 `Basic`, `Multistep definition`, `Theorem Full proof`, and `Theorem step by step`,
 with their original fields, model IDs, and template order. It includes the
-templates, cropped PDF figures, and precompiled LaTeX images. All math uses native
+templates, original lecture figures, and precompiled LaTeX images. Standalone PDFs
+without a lecture source map still use PDF crops. All math uses native
 Anki LaTeX: `[$]…[/$]` inline and `[$$]…[/$$]` for display equations. The editable
 LaTeX remains in the fields. Export requires `latex` and `dvipng` (TeX Live/MacTeX);
 the included images display after import without compiling them again.

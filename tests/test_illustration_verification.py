@@ -8,6 +8,7 @@ import pytest
 
 from shad_helper import illustration_crops
 from shad_helper import illustration_verification as verification
+from shad_helper.crop_validation import CROP_VERIFICATION_SCHEMA
 from shad_helper.jobs import read_json, sha256_file, write_json
 from shad_helper.openai_client import PlanClient, ResponseError
 from shad_helper.rendering import RenderError
@@ -354,6 +355,11 @@ def test_real_crop_result_controls_coverage_fallback_without_losing_evidence(exa
 
     class CropClient(Client):
         def complete(self, instructions, text, schema, *, images):
+            if schema == CROP_VERIFICATION_SCHEMA:
+                return {"verdict": "pass", "checks": {
+                    check: "pass" for check in
+                    ("identity", "completeness", "readability", "cleanliness")},
+                    "defects": [], "repair": "none", "reason": "Полный выбранный рисунок."}
             if instructions != illustration_crops.CROP_INSTRUCTIONS:
                 return {"verdict": "uncertain", "reason": "По исходному фрагменту сравнить нельзя."}
             if json.loads(text)["figure"]["caption"] == "Связь вершин" or outcome == "correctable":
@@ -588,13 +594,41 @@ def test_failed_consolidation_refines_new_fallback_before_accepting_it(example, 
     assert archived["illustration_crop_id"] == "crop_2"
 
 
-def test_crop_failure_is_reviewable_and_does_not_hide_reconstruction_failure(example, monkeypatch):
-    reason = "Не удалось подобрать границы исходного рисунка."
-    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("", True, reason, False))
-    accepted, retry = finalize(example, Client({"verdict": "fail", "reason": "Неверная стрелка."}))
-    assert retry and block(accepted)["kind"] == "screenshot"
+@pytest.mark.parametrize("kind", ["diagram", "screenshot"])
+@pytest.mark.parametrize("transient", [False, True])
+def test_unverified_crop_preserves_source_for_review_without_reconstruction(
+        example, monkeypatch, kind, transient):
+    job, evidence, notes, renders = example
+    block(notes)["kind"] = kind
+    evidence["visuals"][0]["illustrations"][0]["source_kind"] = "printed"
+    reason = "Выбран другой рисунок; исправить границы не удалось."
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("", transient, reason, False))
+    client = Client()
+    accepted, retry = finalize(example, client)
+    assert retry is transient and block(accepted)["kind"] == "screenshot"
     assert reason in accepted["issues"][0]["description"]
-    assert "Неверная стрелка." in accepted["issues"][0]["description"]
+    assert not renders and not client.calls
+    archive = job / "attempt/illustration-verification/drawing"
+    assert read_json(archive / "verdict.json") == {
+        "verdict": "uncertain", "reason": reason, "retry_needed": transient}
+    assert (archive / "source.png").read_bytes() == (
+        job / "illustrations/v01_ill01.png").read_bytes()
+
+
+def test_unsuccessful_refinement_removes_imported_crop_reference(example, monkeypatch):
+    job, _, notes, renders = example
+    block(notes)["illustration_crop_id"] = "f" * 64
+    reason = "Исходный фрагмент не прошёл проверку."
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("", False, reason, False))
+    accepted, retry = finalize(example, Client())
+    assert not retry and not renders
+    assert "illustration_crop_id" not in block(accepted)
+    assert block(notes)["illustration_crop_id"] == "f" * 64
+    assert block(accepted)["kind"] == "screenshot"
+    archive = job / "attempt/illustration-verification/drawing"
+    assert read_json(archive / "candidate.json")["illustration_crop_id"] == "f" * 64
+    assert (archive / "source.png").read_bytes() == (
+        job / "illustrations/v01_ill01.png").read_bytes()
 
 
 def test_own_source_does_not_create_duplicate_when_comparison_is_unavailable(example, monkeypatch):

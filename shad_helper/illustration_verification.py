@@ -339,12 +339,17 @@ def finalize_illustrations(notes: dict, evidence: dict, job: Path, folder: Path,
             # keep explicitly selected figures reviewable under the existing policy.
             crop_id, crop_retry, crop_reason, _unusable = refine_crop(
                 job, evidence, block, client, archive / "crop")
+            block.pop("illustration_crop_id", None)
             if crop_id:
                 block["illustration_crop_id"] = crop_id
             source = resolve_crop(job, evidence, identifier, block.get("illustration_crop_id", ""))
             shutil.copyfile(source, archive / "source.png")
             transient = crop_retry
-            if block["kind"] == "screenshot":
+            if crop_reason:
+                verdict = {"verdict": "uncertain", "reason": crop_reason}
+                if block["kind"] == "diagram":
+                    _fallback(block)
+            elif block["kind"] == "screenshot":
                 verdict = {"verdict": "source", "reason": "Использован исходный снимок."}
                 if observation["source_kind"] != "printed":
                     _issue(result, block, "Рисунок сохранён снимком; надёжная реконструкция "
