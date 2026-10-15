@@ -271,8 +271,15 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous):
                             "content": caption, "caption": caption, "topic": topic,
                             "evidence_ids": [observation["id"]],
                             "language": "", "uncertain_fragments": []}
-                crop_id, crop_retry, crop_reason = refine_crop(
+                crop_id, crop_retry, crop_reason, unusable = refine_crop(
                     job, evidence, fallback, client, archive / "crop")
+                if unusable and not any(item.get("illustration_id") == observation["id"]
+                                        for item in blocks.values()):
+                    coverage.update(block_id="", exclusion_reason="no_instructional_visual")
+                    _issue(notes, fallback, "Наблюдение оставлено в материалах для проверки, "
+                           "без отдельного рисунка в конспекте. " + crop_reason)
+                    write_json(archive / "accepted.json", coverage)
+                    continue
                 if crop_id:
                     fallback["illustration_crop_id"] = crop_id
                 retry_needed |= crop_retry
@@ -328,7 +335,9 @@ def finalize_illustrations(notes: dict, evidence: dict, job: Path, folder: Path,
             archive = Path(folder) / "illustration-verification" / block["id"]
             archive.mkdir(parents=True, exist_ok=True)
             write_json(archive / "candidate.json", candidate)
-            crop_id, crop_retry, crop_reason = refine_crop(
+            # The exclusion guard applies only to automatically added observations;
+            # keep explicitly selected figures reviewable under the existing policy.
+            crop_id, crop_retry, crop_reason, _unusable = refine_crop(
                 job, evidence, block, client, archive / "crop")
             if crop_id:
                 block["illustration_crop_id"] = crop_id

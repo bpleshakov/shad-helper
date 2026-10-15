@@ -248,6 +248,11 @@ Repeated views share a figure. A text catalog of earlier figures enables reuse
 across chapters without reattaching all earlier images. Merging different crops
 requires a visual check focused on the actual figure and its integral labels.
 Failed matches try already retained alternatives before adding another screenshot.
+An automatic fallback is excluded only when native-frame inspection explicitly
+finds no meaningful figure content, such as plot headings with only a thin edge.
+The observation stays in the evidence, with an exclusion decision and a review
+issue. Partial drawings with meaningful content, uncertain crops and unavailable
+inspection still retain their screenshot fallback.
 Transient comparison failures are retried. A final comparison of neighboring
 figures within each topic also consolidates independently generated duplicates,
 preferring a complete view over an unfinished drawing or partially visible plot.

@@ -14,7 +14,7 @@ def no_crop_refinement(monkeypatch):
     # These orchestration fixtures have synthetic crops but no original video
     # frames. Native-frame refinement is covered separately.
     monkeypatch.setattr("shad_helper.illustration_verification.refine_crop",
-                        lambda *args, **kwargs: ("", False, ""))
+                        lambda *args, **kwargs: ("", False, "", False))
 
 
 def prepare(job, *, times=(10,), source_kind="printed", duration=120, identical=False):

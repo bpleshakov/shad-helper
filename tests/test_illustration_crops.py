@@ -57,8 +57,8 @@ def test_shrinks_or_expands_using_native_pixels_and_preserves_originals(example,
     original_assets = {path: path.read_bytes() for path in
                        (frame, source, source.parent / "manifest.json")}
     model = client(box)
-    crop_id, retry, reason = run(example, model)
-    assert crop_id and retry is False and reason == ""
+    crop_id, retry, reason, unusable = run(example, model)
+    assert crop_id and retry is False and reason == "" and not unusable
     result = resolve_crop(job, evidence, "v01_ill01", crop_id)
     pixels = pymupdf.Pixmap(result)
     assert (pixels.width, pixels.height) == (box[2] - box[0], box[3] - box[1])
@@ -102,8 +102,8 @@ def test_cache_reuses_completed_crop_and_tracks_selected_figure_and_native_frame
                                    [-1, 0, 30, 40], [0, 0, 121, 80], [30, 20, 30, 40]])
 def test_invalid_boxes_do_not_publish_or_poison_cache(example, box):
     model = client(box)
-    crop_id, retry, reason = run(example, model)
-    assert crop_id == "" and retry is True and reason
+    crop_id, retry, reason, unusable = run(example, model)
+    assert crop_id == "" and retry is True and reason and not unusable
     assert not list((example[0] / "illustration-crops").glob("*/crop.json"))
     model.complete.return_value["box"] = [20, 10, 90, 70]
     assert run(example, model)[0]
@@ -118,12 +118,36 @@ def test_uncertain_crop_keeps_original_and_does_not_cache_success(example, uncer
     model = client()
     model.complete.return_value = {"status": "uncertain", "box": [0, 0, 0, 0],
                                    "reason": uncertainty}
-    crop_id, retry, reason = run(example, model)
-    assert crop_id == "" and retry is False and uncertainty in reason
+    crop_id, retry, reason, unusable = run(example, model)
+    assert crop_id == "" and retry is False and uncertainty in reason and not unusable
     assert resolve_crop(example[0], example[1], "v01_ill01", crop_id) == example[4]
     assert not list((example[0] / "illustration-crops").glob("*/crop.json"))
     model.complete.return_value = client().complete.return_value
     assert run(example, model)[0]
+
+
+def test_unusable_fragment_is_explicit_and_preserves_source_for_later_recheck(example):
+    model = client()
+    reason = "В кадре остались только заголовок и край графика без учебного содержания."
+    model.complete.return_value = {"status": "unusable", "box": [0, 0, 0, 0], "reason": reason}
+    original = example[4].read_bytes()
+    crop_id, retry, detail, unusable = run(example, model)
+    assert crop_id == "" and not retry and unusable and reason in detail
+    assert example[4].read_bytes() == original
+    assert not list((example[0] / "illustration-crops").glob("*/crop.json"))
+    assert read_json(example[0] / "archive/attempt-01/status.json")["status"] == "unusable"
+    model.complete.return_value = client().complete.return_value
+    assert run(example, model)[0]
+    assert model.complete.call_count == 2
+
+
+@pytest.mark.parametrize("box", [[0, 0, 0], [False, 0, 0, 0], [0.0, 0, 0, 0], [0, 0, 0, 1]])
+def test_invalid_unusable_result_cannot_authorize_exclusion(example, box):
+    model = client()
+    model.complete.return_value = {"status": "unusable", "box": box, "reason": "Только заголовок."}
+    crop_id, retry, reason, unusable = run(example, model)
+    assert crop_id == "" and retry and reason and not unusable
+    assert resolve_crop(example[0], example[1], "v01_ill01") == example[4]
 
 
 def test_changed_crop_policy_rechecks_old_success_without_deleting_evidence(example, monkeypatch):

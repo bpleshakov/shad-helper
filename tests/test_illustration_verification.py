@@ -6,10 +6,12 @@ import httpx
 import pymupdf
 import pytest
 
+from shad_helper import illustration_crops
 from shad_helper import illustration_verification as verification
 from shad_helper.jobs import read_json, sha256_file, write_json
 from shad_helper.openai_client import PlanClient, ResponseError
 from shad_helper.rendering import RenderError
+from shad_helper.schemas import LectureNotes
 
 
 def png(path, shade=220):
@@ -46,7 +48,7 @@ def example(tmp_path, monkeypatch):
         return png(folder / "preview.png")
 
     monkeypatch.setattr(verification.rendering, "render_diagram_preview", preview)
-    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("", False, ""))
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("", False, "", False))
     monkeypatch.setattr(verification.time, "sleep", lambda *_: None)
     return job, evidence, notes, renders
 
@@ -333,6 +335,86 @@ def test_distinct_or_uncertain_observation_gets_separate_crop_and_mapping(exampl
     assert read_json(archive / "accepted-block.json") == blocks[1]
 
 
+@pytest.mark.parametrize("outcome", [
+    "unusable", "uncertain", "occluded", "offline", "invalid", "correctable",
+])
+def test_real_crop_result_controls_coverage_fallback_without_losing_evidence(example, monkeypatch, outcome):
+    job, evidence, notes, _ = example
+    add_aliased_observation(example)
+    notes["chapters"][0]["blocks"].append({
+        "id": "explanation", "kind": "text", "content": "Сравним стадии.",
+        "evidence_ids": ["v01"], "figure_refs": ["drawing"]})
+    evidence["media"] = {"sha256": "a" * 64}
+    png(job / "frames" / f"v01_{'a' * 12}.png", 220)
+    png(job / "frames" / f"v02_{'a' * 12}.png", 220 if outcome == "correctable" else 100)
+    original = {path: path.read_bytes() for directory in ("frames", "illustrations")
+                for path in (job / directory).iterdir()}
+    monkeypatch.setattr(verification, "refine_crop", illustration_crops.refine_crop)
+    reason = "В кадре остались только заголовок и край графика."
+
+    class CropClient(Client):
+        def complete(self, instructions, text, schema, *, images):
+            if instructions != illustration_crops.CROP_INSTRUCTIONS:
+                return {"verdict": "uncertain", "reason": "По исходному фрагменту сравнить нельзя."}
+            if json.loads(text)["figure"]["caption"] == "Связь вершин" or outcome == "correctable":
+                return {"status": "cropped", "box": [0, 0, 16, 12], "reason": "Полный рисунок."}
+            if outcome == "offline":
+                raise OSError("Offline")
+            if outcome == "invalid":
+                return {"status": "unusable", "box": [False, 0, 0, 0], "reason": reason}
+            return {"status": "unusable" if outcome == "unusable" else "uncertain",
+                    "box": [0, 0, 0, 0],
+                    "reason": "Лектор закрыл подпись, но стрелки читаются." if outcome == "occluded" else reason}
+
+    accepted, retry = finalize(example, CropClient())
+    chapter = accepted["chapters"][0]
+    figures = [item for item in chapter["blocks"] if item.get("illustration_id")]
+    coverage = chapter["illustration_coverage"][1]
+    prose = next(item for item in chapter["blocks"] if item["id"] == "explanation")
+    assert {item["illustration_id"] for item in chapter["illustration_coverage"]} == {"v01_ill01", "v02_ill01"}
+    assert all(path.read_bytes() == data for path, data in original.items())
+    assert retry is (outcome in {"offline", "invalid"})
+    if outcome == "unusable":
+        assert len(figures) == 1 and prose["figure_refs"] == ["drawing"]
+        assert coverage == {"illustration_id": "v02_ill01", "block_id": "",
+                            "exclusion_reason": "no_instructional_visual"}
+        archive = job / "attempt/illustration-coverage/v02_ill01"
+        assert read_json(archive / "accepted.json") == coverage
+        assert not (archive / "accepted-block.json").exists()
+    elif outcome == "correctable":
+        assert len(figures) == 1 and coverage["block_id"] == "drawing"
+        assert prose["figure_refs"] == ["drawing"]
+    else:
+        assert len(figures) == 2 and coverage["block_id"] == figures[1]["id"]
+        assert not coverage.get("exclusion_reason")
+        assert prose["figure_refs"] == ["drawing", figures[1]["id"]]
+    LectureNotes.model_validate(accepted)
+
+
+def test_unusable_status_does_not_remove_a_directly_selected_figure(example, monkeypatch):
+    _, evidence, notes, _ = example
+    block(notes)["kind"] = "screenshot"
+    evidence["visuals"][0]["illustrations"][0]["source_kind"] = "printed"
+    reason = "Видны только заголовок и край рисунка."
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("", False, reason, True))
+    accepted, retry = finalize(example, Client())
+    assert block(accepted) == block(notes) and not retry
+    assert reason in accepted["issues"][0]["description"]
+
+
+def test_unusable_alias_cannot_exclude_source_of_an_existing_selected_figure(example, monkeypatch):
+    _, _, notes, _ = example
+    add_aliased_observation(example)
+    selected = {**deepcopy(block(notes)), "id": "selected",
+                "illustration_id": "v02_ill01", "evidence_ids": ["v02_ill01"]}
+    notes["chapters"][0]["blocks"].append(selected)
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("", False, "Фрагмент.", True))
+    accepted, _ = finalize(example, Client({"verdict": "uncertain", "reason": "Сравнить нельзя."}))
+    assert any(item["id"] == "selected" for item in accepted["chapters"][0]["blocks"])
+    assert not accepted["chapters"][0]["illustration_coverage"][1].get("exclusion_reason")
+    LectureNotes.model_validate(accepted)
+
+
 def test_separate_intermediate_crop_precedes_completed_drawing(example):
     _, _, notes, _ = example
     add_aliased_observation(example, timestamp=1)
@@ -432,7 +514,7 @@ def test_excluded_observation_skips_consolidation(example):
 def test_reconstruction_and_its_fallback_use_the_refined_source(example, monkeypatch, verdict):
     job, _, _, _ = example
     cropped = png(job / "refined.png", 80)
-    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("crop_1", False, ""))
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("crop_1", False, "", False))
 
     def resolve(job, evidence, identifier, crop_id=""):
         assert identifier == "v01_ill01" and crop_id == "crop_1"
@@ -453,7 +535,7 @@ def test_direct_screenshot_gets_refined_crop_without_reconstruction_check(exampl
     block(notes)["kind"] = "screenshot"
     evidence["visuals"][0]["illustrations"][0]["source_kind"] = "printed"
     cropped = png(job / "refined.png", 80)
-    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("crop_1", False, ""))
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("crop_1", False, "", False))
     monkeypatch.setattr(verification, "resolve_crop", lambda *args: cropped)
     client = Client()
     accepted, retry = finalize(example, client)
@@ -465,7 +547,7 @@ def test_consolidation_checks_refined_pixels_even_when_original_hashes_match(exa
     job, _, _, _ = example
     add_aliased_observation(example, identical=True)
     cropped = png(job / "refined.png", 80)
-    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("crop_1", False, ""))
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("crop_1", False, "", False))
     resolve = verification.resolve_crop
     monkeypatch.setattr(verification, "resolve_crop", lambda job, evidence, identifier, crop_id="":
                         cropped if crop_id else resolve(job, evidence, identifier))
@@ -491,7 +573,7 @@ def test_failed_consolidation_refines_new_fallback_before_accepting_it(example, 
 
     def refine(job, evidence, selected, client, folder):
         calls.append(selected["illustration_id"])
-        return ("crop_2" if selected["illustration_id"] == "v02_ill01" else "", False, "")
+        return ("crop_2" if selected["illustration_id"] == "v02_ill01" else "", False, "", False)
 
     monkeypatch.setattr(verification, "refine_crop", refine)
     cropped = png(job / "refined.png", 80)
@@ -508,7 +590,7 @@ def test_failed_consolidation_refines_new_fallback_before_accepting_it(example, 
 
 def test_crop_failure_is_reviewable_and_does_not_hide_reconstruction_failure(example, monkeypatch):
     reason = "Не удалось подобрать границы исходного рисунка."
-    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("", True, reason))
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("", True, reason, False))
     accepted, retry = finalize(example, Client({"verdict": "fail", "reason": "Неверная стрелка."}))
     assert retry and block(accepted)["kind"] == "screenshot"
     assert reason in accepted["issues"][0]["description"]
@@ -522,7 +604,7 @@ def test_own_source_does_not_create_duplicate_when_comparison_is_unavailable(exa
     notes["chapters"][0]["illustration_coverage"] = [
         {"illustration_id": "v01_ill01", "block_id": "drawing"}]
     cropped = png(job / "refined.png", 80)
-    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("crop_1", False, ""))
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("crop_1", False, "", False))
     monkeypatch.setattr(verification, "resolve_crop", lambda *args: cropped)
     client = Client(OSError("Connection interrupted"))
     accepted, retry = finalize(example, client)
@@ -552,7 +634,7 @@ def test_refined_source_is_recompared_before_adding_redundant_fallback(example, 
     add_aliased_observation(example)
     cropped = png(job / "refined.png", 220)
     monkeypatch.setattr(verification, "refine_crop", lambda job, evidence, block, *args:
-                        ("crop_2" if block["illustration_id"] == "v02_ill01" else "", False, ""))
+                        ("crop_2" if block["illustration_id"] == "v02_ill01" else "", False, "", False))
     resolve = verification.resolve_crop
     monkeypatch.setattr(verification, "resolve_crop", lambda job, evidence, identifier, crop_id="":
                         cropped if crop_id else resolve(job, evidence, identifier))

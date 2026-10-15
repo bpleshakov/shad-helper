@@ -195,10 +195,10 @@ def refined_crop(illustrated_job):
                 return {"status": "cropped", "box": box,
                         "reason": "Keep only the selected drawing region."}
 
-        crop_id, retry_needed, reason = refine_crop(
+        crop_id, retry_needed, reason, unusable = refine_crop(
             job, evidence, {**notes["chapters"][0]["blocks"][0], "content": name},
             Client(), job / name)
-        assert crop_id and not retry_needed and not reason
+        assert crop_id and not retry_needed and not reason and not unusable
         return crop_id, resolve_crop(job, evidence, "frame_1_ill01", crop_id)
 
     return make_crop
