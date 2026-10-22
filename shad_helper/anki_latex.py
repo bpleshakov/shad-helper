@@ -31,12 +31,11 @@ _ROW_LENGTH = re.compile(
     r"\s*(?:[+-]\s*)*(?:\d+(?:[.,]\d*)?|[.,]\d+)\s*"
     r"(?:true\s*)?(?:pt|pc|in|bp|cm|mm|dd|cc|sp|ex|em)\s*", re.IGNORECASE,
 )
-# Harmless amsmath/amssymb/dsfont commands available in the existing preamble.
+# Additional amssymb/dsfont commands; amsmath uses the shared renderer allowlist.
 _EXTRA_COMMANDS = re.compile(
-    r"\\(?:mathds|mathfrak|textnormal|pmb|xrightarrow|xleftarrow|lnot|not|"
+    r"\\(?:mathds|mathfrak|textnormal|lnot|not|"
     r"smallsetminus|nsubseteq|nsupseteq|subsetneqq|supsetneqq|because|therefore|"
-    r"vdash|dashv|vDash|Vdash|models|nmid|nparallel|overleftrightarrow|"
-    r"underleftarrow|underrightarrow|underleftrightarrow)(?![A-Za-z@])"
+    r"vdash|dashv|vDash|Vdash|models|nmid|nparallel)(?![A-Za-z@])"
 )
 
 

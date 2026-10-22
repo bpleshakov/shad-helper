@@ -21,29 +21,45 @@ class RenderError(RuntimeError):
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}\Z")
 _COMMAND = re.compile(r"\\([A-Za-z@]+|.)", re.DOTALL)
 _MAX_TEX_BYTES = 2_000_000
+# Public formula commands from amsmath and its amstext/amsopn/amsbsy dependencies,
+# alongside the supported core LaTeX commands. Package internals and declarations
+# are not formula content; keep those out of this allowlist.
 _MATH_COMMANDS = set(
     "alpha beta gamma delta epsilon varepsilon zeta eta theta vartheta iota kappa "
     "lambda mu nu xi pi varpi rho varrho sigma varsigma tau upsilon phi varphi chi "
     "psi omega Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi Omega "
-    "frac dfrac tfrac cfrac binom dbinom sqrt sum prod coprod int iint iiint oint "
+    "frac dfrac tfrac cfrac genfrac binom dbinom tbinom sqrt leftroot uproot "
+    "sum prod coprod int iint iiint iiiint idotsint oint "
+    "bigvee bigwedge biguplus bigcap bigcup bigotimes bigoplus bigodot bigsqcup "
     "lim limsup liminf inf sup min max log ln exp sin cos tan cot sec csc sinh cosh "
-    "tanh arcsin arccos arctan det gcd Pr arg ker dim mod bmod pmod "
+    "tanh coth arcsin arccos arctan det gcd Pr arg ker dim deg hom lg "
+    "injlim projlim varinjlim varprojlim varliminf varlimsup mod bmod pmod pod "
     "left right middle big Big bigg Bigg bigl bigr Bigl Bigr biggl biggr Biggl Biggr "
+    "bigm Bigm biggm Biggm "
     "langle rangle lvert rvert lVert rVert vert Vert lceil rceil lfloor rfloor "
     "infty partial nabla ell hbar imath jmath Re Im emptyset varnothing "
     "in notin ni subset supset subseteq supseteq subsetneq supsetneq "
     "cup cap setminus union times cdot div pm mp ast star circ bullet oplus otimes colon "
-    "le leq ge geq neq ne approx sim simeq equiv cong propto ll gg "
+    "le leq ge geq neq ne approx sim simeq equiv cong propto ll gg doteq "
     "to mapsto rightarrow leftarrow leftrightarrow Rightarrow Leftarrow "
-    "Leftrightarrow longrightarrow longleftarrow Longrightarrow Longleftrightarrow "
-    "uparrow downarrow updownarrow iff implies forall exists nexists neg land lor "
+    "Leftrightarrow longrightarrow longleftarrow longleftrightarrow longmapsto "
+    "Longrightarrow Longleftarrow Longleftrightarrow hookrightarrow hookleftarrow "
+    "xrightarrow xleftarrow relbar Relbar "
+    "uparrow downarrow updownarrow iff implies impliedby And forall exists nexists neg land lor "
     "wedge vee top bot perp parallel mid angle triangle square checkmark "
-    "ldots cdots vdots ddots dots dot ddot hat widehat tilde widetilde bar overline underline "
-    "vec overrightarrow overbrace underbrace overset underset stackrel "
-    "mathrm mathbf mathit mathsf mathtt mathcal mathbb mathscr boldsymbol "
-    "operatorname text textrm textsf texttt textbf textit mathop limits nolimits "
+    "ldots cdots vdots ddots dots dotsb dotsc dotsi dotsm dotso hdots hdotsfor "
+    "dot ddot dddot ddddot hat widehat tilde widetilde bar overline underline "
+    "acute grave breve check mathring Hat Check Tilde Acute Grave Dot Ddot Breve Bar Vec "
+    "varGamma varDelta varTheta varLambda varXi varPi varSigma varUpsilon varPhi varPsi varOmega "
+    "vec overrightarrow overleftarrow overleftrightarrow underrightarrow underleftarrow "
+    "underleftrightarrow overbrace underbrace overset underset overunderset stackrel sideset "
+    "mathrm mathbf mathit mathsf mathtt mathcal mathbb mathscr boldsymbol pmb "
+    "operatorname operatornamewithlimits operatorfont text textrm textsf texttt textbf textit "
+    "mathop limits nolimits displaylimits "
     "quad qquad hspace vspace phantom hphantom vphantom substack label ref eqref "
-    "nonumber notag tag underbracket overbracket boxed displaystyle textstyle "
+    "thinspace medspace thickspace negthinspace negmedspace negthickspace mspace smash nobreakdash "
+    "nonumber notag tag thetag underbracket overbracket boxed displaystyle textstyle "
+    "intertext shoveleft shoveright raisetag displaybreak allowdisplaybreaks "
     "scriptstyle scriptscriptstyle mathrm mathnormal cases begin end".split()
 )
 _DRAW_COMMANDS = set(
@@ -68,9 +84,16 @@ _SYMBOL_COMMANDS = set("\\{}%&#$_~^ ,;:![]()|") | {"\n", "\r"}
 _MATH_ENVIRONMENTS = set(
     "equation equation* "
     "align align* aligned alignedat gather gather* gathered multline multline* "
+    "alignat alignat* xalignat xalignat* xxalignat flalign flalign* subequations subarray "
     "split cases matrix pmatrix bmatrix Bmatrix vmatrix Vmatrix smallmatrix "
     "array".split()
 )
+_DISPLAY_ENVIRONMENT = r"\{(?:(?:equation|align|alignat|xalignat|flalign|gather|multline)\*?|xxalignat|subequations)\}"
+# These displays consume a column-count argument before their math body. Source
+# anchors must follow that argument, otherwise TeX reads the anchor as the count.
+_DISPLAY_BEGIN = (r"\\begin\s*\{(?:alignat\*?|xalignat\*?|xxalignat)\}"
+                  r"(?:\s|%[^\n]*\n)*(?:\{[^{}]+\}|[0-9])"
+                  r"|\\begin\s*" + _DISPLAY_ENVIRONMENT)
 _DRAW_ENVIRONMENTS = {"tikzpicture", "scope", "axis", "groupplot"}
 _ENVIRONMENTS = _MATH_ENVIRONMENTS | _DRAW_ENVIRONMENTS | {"document", "figure", "quote", "center", "itemize", "enumerate", "description", "definition", "theorem", "proof"}
 _PACKAGES = set(
@@ -385,7 +408,7 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
             lines.append(f"% shad-helper: block {block_id}")
             if kind == "math":
                 _validate_commands(content)
-                display_environment = re.match(r"\s*\\begin\s*\{(?:equation|align|gather|multline)\*?\}", content)
+                display_environment = re.match(r"\s*\\begin\s*" + _DISPLAY_ENVIRONMENT, content)
                 if content.lstrip().startswith(r"\[") or display_environment:
                     lines.append(content + "\n")
                 else:
@@ -452,10 +475,9 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
                 lines[-1] = lines[-1].replace("\n", "\n" + start, 1)
                 lines[-1] = lines[-1].replace("\n\\end{", end + "\n\\end{", 1)
             elif kind == "math":
-                environment = r"\{(?:equation|align|gather|multline)\*?\}"
-                lines[-1] = re.sub(r"\\(?:\[|begin" + environment + ")",
+                lines[-1] = re.sub(r"\\\[|" + _DISPLAY_BEGIN,
                                    lambda match, start=start: match[0] + start, lines[-1], count=1)
-                lines[-1] = re.sub(r"\\(?:\]|end" + environment + r")\s*$",
+                lines[-1] = re.sub(r"\\(?:\]|end\s*" + _DISPLAY_ENVIRONMENT + r")\s*$",
                                    lambda match, end=end: end + match[0], lines[-1])
             elif kind == "code":
                 lines[-1] = lines[-1].replace("[breaklines,", "[formatcom={" + start

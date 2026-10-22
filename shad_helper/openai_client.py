@@ -12,7 +12,7 @@ from shad_helper.network import openai_http_client, resolve_openai_proxy
 DEFAULT_MODEL = "gpt-6.1-sol"
 DEFAULT_REASONING_EFFORT = "high"
 MAX_PDF_BYTES = 500_000_000
-MAX_IMAGE_ENCODED_BYTES = 40_000_000
+MAX_IMAGE_ENCODED_BYTES = 400_000_000
 
 
 def _image_data(images):

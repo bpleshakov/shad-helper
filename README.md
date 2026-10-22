@@ -226,6 +226,17 @@ share numbering within each section; proofs have a Russian heading. Examples,
 clarifications, and explanations remain plain prose. The model supplies prose and
 inline math, while the renderer supplies the environments.
 
+Notes and Anki share support for the public built-in mathematical commands and
+environments of `amsmath` (including its `amsopn`, `amsbsy`, and `amstext`
+dependencies), following the [official user guide](https://www.latex-project.org/help/documentation/amsldoc.pdf).
+This includes labeled arrows such as `\xrightarrow`, generalized fractions,
+operator names, accents, and the `alignat`, `flalign`, and `subequations`
+environments. This expansion excludes preamble declarations such as
+`\DeclareMathOperator`, document configuration, and package internals, and does not
+add commands from separately loaded packages; use `\operatorname{...}` for custom
+names. The existing file-access, shell-command, and macro-definition restrictions
+remain in effect. Commands must still be used in a valid LaTeX context.
+
 Lecture blocks cite speech or visual evidence IDs. Questionable phrases or whole inline formulas are listed in
 `uncertain_fragments` with their exact text and supporting evidence IDs. The PDF
 colors only these fragments and adds one short `hh:mm:ss` footnote per affected
