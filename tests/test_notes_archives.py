@@ -66,10 +66,6 @@ def isolate_generation(monkeypatch):
     monkeypatch.setattr("shad_helper.rendering.write_project", write_project)
 
 
-def runs(job):
-    return sorted((job / "handoff/runs").iterdir())
-
-
 def snapshot(folder):
     return {path.relative_to(folder): path.read_bytes()
             for path in folder.rglob("*") if path.is_file()}
@@ -80,7 +76,8 @@ def test_automatic_handoff_matches_calls_including_glossary_and_topics(tmp_path)
     client = FakeClient()
     assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client).exists()
 
-    [run] = runs(tmp_path)
+    run = tmp_path / "handoff"
+    assert not (run / "runs").exists()
     assert read_json(run / "run.json") == {
         "mode": "automatic", "status": "completed", "rebuild": False,
     }
@@ -90,10 +87,9 @@ def test_automatic_handoff_matches_calls_including_glossary_and_topics(tmp_path)
     for call in client.calls:
         context = json.loads(call["text"])
         identifier = context["chapter"]["id"]
-        for root in (tmp_path / "handoff", run):
-            assert read_json(root / "inputs" / identifier / "context.json") == context
-            assert (root / "inputs" / identifier / "prompt.txt").read_text() == call["instructions"]
-            assert read_json(root / "inputs/response-schema.json") == call["schema"]
+        assert read_json(run / "inputs" / identifier / "context.json") == context
+        assert (run / "inputs" / identifier / "prompt.txt").read_text() == call["instructions"]
+        assert read_json(run / "inputs/response-schema.json") == call["schema"]
         attempt = run / "requests" / identifier / "attempt-01"
         saved = read_json(attempt / "call.json")
         assert all(saved[key] == value for key, value in call.items())
@@ -127,58 +123,178 @@ def test_cached_chapters_replay_normalized_topics_in_first_appearance_order(tmp_
     cached = TopicClient()
     notes.generate_notes(tmp_path, tmp_path / "auth", client=cached)
     assert cached.calls == []
-    latest = runs(tmp_path)[-1]
+    latest = tmp_path / "handoff"
     assert list(read_json(latest / "chapters.json").values()) == ["cached"] * 3
     assert [read_json(latest / "inputs" / f"ch{number:03d}" / "context.json")["topics"]
             for number in range(1, 4)] == expected
 
 
-def test_cached_and_rebuilt_runs_keep_old_archives_and_distinguish_requests(tmp_path):
+def test_cached_and_rebuilt_runs_replace_current_diagnostics_without_creating_archives(tmp_path):
     prepare_job(tmp_path)
     notes.generate_notes(tmp_path, tmp_path / "auth", client=FakeClient())
-    [first] = runs(tmp_path)
-    before = snapshot(first)
+    handoff = tmp_path / "handoff"
+    assert len(list(handoff.glob("requests/**/call.json"))) == 1
 
     cached = FakeClient()
     notes.generate_notes(tmp_path, tmp_path / "auth", client=cached)
     assert cached.calls == []
-    first_again, second = runs(tmp_path)
-    assert first_again == first and snapshot(first) == before
-    assert (second / "inputs/ch001/context.json").exists()
-    assert list(second.glob("requests/**/call.json")) == []
-    assert read_json(second / "chapters.json") == {"ch001": "cached"}
-    cached_snapshot = snapshot(second)
+    assert (handoff / "inputs/ch001/context.json").exists()
+    assert list(handoff.glob("requests/**/call.json")) == []
+    assert read_json(handoff / "chapters.json") == {"ch001": "cached"}
 
-    rebuilt = FakeClient()
+    checkpoint = tmp_path / "checkpoints/notes/ch001.json"
+    assert read_json(checkpoint)["result"]["chapters"][0]["blocks"][0]["content"] == "Определение"
+
+    class RebuiltClient(FakeClient):
+        def complete(self, instructions, text, schema=None):
+            assert not checkpoint.exists()
+            reply = super().complete(instructions, text, schema)
+            reply["chapters"][0]["blocks"][0]["content"] = "Новое определение"
+            return reply
+
+    rebuilt = RebuiltClient()
     notes.generate_notes(tmp_path, tmp_path / "auth", client=rebuilt, rebuild=True)
     assert len(rebuilt.calls) == 1
-    assert len(runs(tmp_path)) == 3
-    assert snapshot(first) == before and snapshot(second) == cached_snapshot
-    assert len(list(runs(tmp_path)[-1].glob("requests/**/call.json"))) == 1
+    assert read_json(checkpoint)["result"]["chapters"][0]["blocks"][0]["content"] == "Новое определение"
+    assert len(list(handoff.glob("requests/**/call.json"))) == 1
+    assert read_json(handoff / "run.json")["rebuild"] is True
+
+    resumed = FakeClient()
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=resumed)
+    assert resumed.calls == []
+    assert read_json(handoff / "chapters.json") == {"ch001": "cached"}
+    assert list(handoff.glob("requests/**/call.json")) == []
+    assert read_json(handoff / "run.json")["rebuild"] is False
+    assert not (handoff / "runs").exists()
 
 
-def test_manual_and_import_runs_save_handoffs_without_requests(tmp_path):
+def test_existing_run_archives_survive_normal_runs_but_are_removed_by_rebuild(tmp_path):
+    prepare_job(tmp_path)
+    legacy = tmp_path / "handoff/runs"
+    write_json(legacy / "old-run/requests/ch001/response.json", {"legacy": True})
+    before = snapshot(legacy)
+
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=FakeClient())
+    assert snapshot(legacy) == before
+    assert [path.name for path in legacy.iterdir()] == ["old-run"]
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=FakeClient(), rebuild=True)
+    assert not legacy.exists()
+
+
+@pytest.mark.parametrize("failure", ["validation", "generation"])
+def test_rebuild_removes_all_stage_artifacts_before_validation_even_if_it_fails(
+        tmp_path, monkeypatch, failure):
+    prepare_job(tmp_path)
+    directories = ("checkpoints/notes", "checkpoints/notes_candidates", "checkpoints/notes_final",
+                   "handoff", "notes", "illustration-crops", "illustration-verification")
+    files = ("notes.json", "review.json", "outline.json")
+    stale = [tmp_path / name / "old.json" for name in directories]
+    stale.extend(tmp_path / name for name in files)
+    stale.extend(tmp_path / name for name in (
+        "handoff/runs/legacy/response.json", "handoff/operator.json",
+        "notes/main.tex", "notes/main.pdf", "notes/qa/page-001.png"))
+    for path in stale:
+        write_json(path, {"old": True})
+    source_files = [tmp_path / name for name in (
+        "illustrations/original.png", "native-frames/original.png",
+        "checkpoints/extraction.json", "checkpoints/anki.json", "anki/deck.apkg",
+        "review-resolutions.json")]
+    for path in source_files:
+        write_json(path, {})
+    source_files.extend((tmp_path / "evidence.json", tmp_path / "extraction-diagnostics.json"))
+    preserved = {path: path.read_bytes() for path in source_files}
+    original_check = notes.check_job
+    checked = []
+
+    def check_after_cleanup(job):
+        if not checked:
+            assert all(not (job / name).exists() for name in (*directories, *files))
+            assert all(path.read_bytes() == content for path, content in preserved.items())
+            checked.append(job)
+            if failure == "validation":
+                raise ValueError("Validation failed")
+        original_check(job)
+
+    def fail_generation(context):
+        assert all(not path.exists() for path in stale if path.name != "outline.json")
+        raise RuntimeError("Generation failed")
+
+    monkeypatch.setattr(notes, "check_job", check_after_cleanup)
+    client = FakeClient(fail_generation)
+    exception = ValueError if failure == "validation" else RuntimeError
+    with pytest.raises(exception, match="failed"):
+        notes.generate_notes(tmp_path, tmp_path / "auth", client=client, rebuild=True)
+
+    assert checked == [tmp_path]
+    assert len(client.calls) == (failure == "generation")
+    assert all(not path.exists() for path in stale if path.name != "outline.json")
+    assert all(path.read_bytes() == content for path, content in preserved.items())
+
+
+def test_rebuild_stops_when_checkpoint_cannot_be_removed(tmp_path, monkeypatch):
+    prepare_job(tmp_path)
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=FakeClient())
+    original = notes.shutil.rmtree
+
+    def fail_notes_checkpoint(path, *args, **kwargs):
+        if path == tmp_path / "checkpoints/notes":
+            raise PermissionError("Cannot remove notes checkpoint")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(notes.shutil, "rmtree", fail_notes_checkpoint)
+    client = FakeClient()
+    with pytest.raises(PermissionError, match="Cannot remove notes checkpoint"):
+        notes.generate_notes(tmp_path, tmp_path / "auth", client=client, rebuild=True)
+    assert client.calls == []
+
+
+def test_manual_and_import_replace_current_handoff_without_requests(tmp_path):
     prepare_job(tmp_path)
     handoff = notes.generate_notes(tmp_path, tmp_path / "auth", manual=True)
     assert handoff == tmp_path / "handoff"
-    [manual_run] = runs(tmp_path)
-    assert read_json(manual_run / "run.json")["mode"] == "manual"
-    assert read_json(manual_run / "run.json")["status"] == "handoff"
+    assert read_json(handoff / "run.json")["mode"] == "manual"
+    assert read_json(handoff / "run.json")["status"] == "handoff"
     context = read_json(handoff / "inputs/ch001/context.json")
-    assert read_json(manual_run / "inputs/ch001/context.json") == context
-    before = snapshot(manual_run)
     reply = tmp_path / "reply.json"
     write_json(reply, chapter_reply(context))
 
     assert notes.generate_notes(tmp_path, tmp_path / "auth", imported=reply).exists()
-    assert len(runs(tmp_path)) == 2
-    imported_run = runs(tmp_path)[-1]
-    assert read_json(imported_run / "run.json")["mode"] == "import"
-    assert read_json(imported_run / "run.json")["status"] == "completed"
-    assert snapshot(manual_run) == before
-    assert read_json(imported_run / "outline.json") == read_json(tmp_path / "outline.json")
-    assert (imported_run / "inputs/ch001/context.json").exists()
-    assert list((handoff / "runs").glob("*/requests/**/call.json")) == []
+    assert read_json(handoff / "run.json")["mode"] == "import"
+    assert read_json(handoff / "run.json")["status"] == "completed"
+    assert read_json(handoff / "outline.json") == read_json(tmp_path / "outline.json")
+    assert (handoff / "inputs/ch001/context.json").exists()
+    assert list(handoff.glob("requests/**/call.json")) == []
+    assert not (handoff / "runs").exists()
+
+
+def test_import_can_read_previous_current_response_before_diagnostics_are_replaced(tmp_path):
+    prepare_job(tmp_path)
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=FakeClient())
+    handoff = tmp_path / "handoff"
+    reply = handoff / "requests/ch001/attempt-01/response.json"
+    assert reply.is_file()
+    imported_notes = read_json(tmp_path / "notes.json")
+
+    assert notes.generate_notes(tmp_path, tmp_path / "auth", imported=reply).exists()
+
+    assert read_json(tmp_path / "notes.json") == imported_notes
+    assert read_json(handoff / "run.json")["mode"] == "import"
+    assert list(handoff.glob("requests/**/call.json")) == []
+    assert not (handoff / "runs").exists()
+
+
+def test_rebuild_deletes_import_reply_inside_previous_stage_outputs(tmp_path):
+    prepare_job(tmp_path)
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=FakeClient())
+    reply = tmp_path / "handoff/requests/ch001/attempt-01/response.json"
+    assert reply.is_file()
+
+    with pytest.raises(FileNotFoundError):
+        notes.generate_notes(tmp_path, tmp_path / "auth", imported=reply, rebuild=True)
+
+    assert not reply.exists()
+    assert not (tmp_path / "notes.json").exists()
+    assert not (tmp_path / "notes").exists()
 
 
 def test_each_failed_retry_survives_fallback_with_actual_glossary(tmp_path):
@@ -190,7 +306,7 @@ def test_each_failed_retry_survives_fallback_with_actual_glossary(tmp_path):
 
     client = FakeClient(fail_second)
     assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client) == tmp_path / "handoff"
-    [run] = runs(tmp_path)
+    run = tmp_path / "handoff"
     assert read_json(run / "run.json")["status"] == "handoff"
     attempts = sorted((run / "requests/ch002").iterdir())
     assert [path.name for path in attempts] == [f"attempt-{number:02d}" for number in range(1, 5)]
@@ -200,9 +316,8 @@ def test_each_failed_retry_survives_fallback_with_actual_glossary(tmp_path):
     context = json.loads(client.calls[-1]["text"])
     assert context["glossary"] == [{"term": "ch001", "definition": "Новое обозначение"}]
     assert context["topics"] == ["Метод ближайших соседей"]
-    for root in (tmp_path / "handoff", run):
-        assert read_json(root / "inputs/ch002/context.json") == context
-        assert read_json(root / "status.json")["status"] == "manual_required"
+    assert read_json(run / "inputs/ch002/context.json") == context
+    assert read_json(run / "status.json")["status"] == "manual_required"
 
 
 def test_runtime_split_retains_rejected_parent_and_final_child_handoff(tmp_path):
@@ -214,7 +329,7 @@ def test_runtime_split_retains_rejected_parent_and_final_child_handoff(tmp_path)
 
     client = FakeClient(reject_parent)
     assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client).exists()
-    [run] = runs(tmp_path)
+    run = tmp_path / "handoff"
     identifiers = [json.loads(call["text"])["chapter"]["id"] for call in client.calls]
     assert len(identifiers) == 3 and identifiers[0] == "ch001"
     assert [json.loads(call["text"])["topics"] for call in client.calls] == [
@@ -223,21 +338,20 @@ def test_runtime_split_retains_rejected_parent_and_final_child_handoff(tmp_path)
     assert read_json(run / "requests/ch001/attempt-01/status.json")["status"] == "failed"
     outline = read_json(run / "outline.json")
     assert [chapter["id"] for chapter in outline["chapters"]] == identifiers[1:]
-    for root in (tmp_path / "handoff", run):
-        assert {path.name for path in (root / "inputs").iterdir() if path.is_dir()} == set(identifiers[1:])
+    assert {path.name for path in (run / "inputs").iterdir() if path.is_dir()} == set(identifiers[1:])
 
 
 def test_pre_request_configuration_failure_still_saves_run_and_handoff(tmp_path, monkeypatch):
     prepare_job(tmp_path)
     monkeypatch.setenv("SHAD_HELPER_OPENAI_PROXY", "")
     assert notes.generate_notes(tmp_path, tmp_path / "auth") == tmp_path / "handoff"
-    [run] = runs(tmp_path)
+    run = tmp_path / "handoff"
     assert (run / "inputs/ch001/context.json").exists()
     assert read_json(run / "status.json")["status"] == "manual_required"
     assert list(run.glob("requests/**/call.json")) == []
 
 
-def test_archived_http_body_is_exact_network_payload_without_credentials(tmp_path):
+def test_recorded_http_body_is_exact_network_payload_without_credentials(tmp_path):
     prepare_job(tmp_path)
     requests = []
 
@@ -254,7 +368,7 @@ def test_archived_http_body_is_exact_network_payload_without_credentials(tmp_pat
     client = PlanClient(tmp_path / "auth", model="fake", proxy="http://private-user:private-pass@localhost:8080",
                         transport=httpx.MockTransport(handle), token_provider=lambda: "PRIVATE_ACCESS_TOKEN")
     assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client).exists()
-    [run] = runs(tmp_path)
+    run = tmp_path / "handoff"
     attempt = run / "requests/ch001/attempt-01"
     records = [read_json(path) for path in sorted(attempt.glob("http-*.request.json"))]
     assert len(records) == len(requests) == 2
@@ -293,7 +407,7 @@ def test_request_body_write_failure_stops_before_post(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="Archive disk full"):
         notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
     assert [request.method for request in requests] == ["GET"]
-    [run] = runs(tmp_path)
+    run = tmp_path / "handoff"
     assert read_json(run / "run.json")["status"] == "failed"
     assert (run / "inputs/ch001/context.json").exists()
     assert client.request_recorder is None

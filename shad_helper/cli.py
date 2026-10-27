@@ -33,11 +33,14 @@ def parser() -> argparse.ArgumentParser:
                          default=DEFAULT_VISION_MODEL,
                          help="Local video model: 35b (default), 9b, 4b, or off for audio only")
     notes = commands.add_parser("notes", help="Generate notes or export/import a ChatGPT handoff")
-    notes.add_argument("job", type=Path)
+    notes.add_argument("jobs", nargs="+", type=Path, metavar="JOB",
+                       help="Project directories to process sequentially, in order")
     mode = notes.add_mutually_exclusive_group()
     mode.add_argument("--manual", action="store_true", help="Export handoff without any network calls")
-    mode.add_argument("--import", dest="imported", type=Path, help="JSON response or chapter replies folder")
-    notes.add_argument("--rebuild", action="store_true", help="Invalidate synthesized note checkpoints")
+    mode.add_argument("--import", dest="imported", type=Path,
+                      help="JSON response or chapter replies folder for a single project")
+    notes.add_argument("--rebuild", action="store_true",
+                       help="Delete notes/render artifacts before starting, then regenerate notes and PDF")
     render = commands.add_parser("render", help="Compile editable LaTeX and create PDF QA images")
     render.add_argument("job", type=Path)
     review = commands.add_parser("review", help="Show review issues or record a verified correction")
@@ -45,9 +48,12 @@ def parser() -> argparse.ArgumentParser:
     review.add_argument("--resolve", help="Review issue ID")
     review.add_argument("--resolution", help="Describe the correction made to evidence or notes")
     anki = commands.add_parser("anki", help="Create an importable Anki deck from a finished PDF")
-    anki.add_argument("job", type=Path)
-    anki.add_argument("--pdf", type=Path, help="Input PDF (default: JOB/notes/main.pdf)")
-    anki.add_argument("--rebuild", action="store_true", help="Regenerate Anki notes from the PDF")
+    anki.add_argument("jobs", nargs="+", type=Path, metavar="JOB",
+                      help="Project directories to process sequentially, in order")
+    anki.add_argument("--pdf", type=Path,
+                      help="Input PDF for a single project (default: JOB/notes/main.pdf)")
+    anki.add_argument("--rebuild", action="store_true",
+                      help="Delete all Anki artifacts before generating a fresh deck")
     anki.add_argument("--anki-collection", type=Path,
                       help="Anki collection.anki2 to read positions from (default: unique local profile)")
     run = commands.add_parser("run", help="Run extract, notes, render, and Anki for each recording")
@@ -59,7 +65,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--vision-model", choices=(*VISION_MODELS, "off"),
                      default=DEFAULT_VISION_MODEL,
                      help="Local video model: 35b (default), 9b, 4b, or off for audio only")
-    run.add_argument("--rebuild", action="store_true", help="Regenerate notes and Anki responses")
+    run.add_argument("--rebuild", action="store_true",
+                     help="Delete notes/render and Anki artifacts before rebuilding each stage")
     run.add_argument("--anki-collection", type=Path,
                      help="Anki collection.anki2 to read positions from (default: unique local profile)")
     for command in (check, login, notes, anki, run):
@@ -75,7 +82,7 @@ def doctor(state_dir: Path = Path(".shad-helper/auth"), *, proxy: str | None = N
     packages.update({name: importlib.util.find_spec(name) is not None
                      for name in ("mlx", "mlx_whisper", "mlx_vlm", "numpy", "cv2", "PIL")})
     tools = {name: shutil.which(name) for name in ("ffmpeg", "ffprobe", "latexmk", "lualatex")}
-    openai = {"status": "not_checked", "models": [], "default_model": "gpt-6.1-sol",
+    openai = {"status": "not_checked", "models": [], "default_model": "gpt-6-astra",
               "default_model_available": None}
     configured_proxy = os.environ.get("SHAD_HELPER_OPENAI_PROXY") if proxy is None else proxy
     if not (Path(state_dir) / "credentials.json").is_file():
@@ -133,8 +140,46 @@ def main(argv: list[str] | None = None) -> int:
                           start=args.start, duration=args.duration, vision_model=args.vision_model))
         elif args.command == "notes":
             from .notes import generate_notes
-            print(generate_notes(args.job, args.state_dir, imported=args.imported,
-                                 manual=args.manual, rebuild=args.rebuild, proxy=args.openai_proxy))
+            batch = len(args.jobs) > 1
+            if batch and args.imported is not None:
+                raise ValueError("--import requires a single project directory")
+            destinations = set()
+            for job in args.jobs:
+                destination = job.resolve()
+                if destination in destinations:
+                    raise ValueError(f"Repeated project directory: {job}")
+                destinations.add(destination)
+            completed = 0
+            for number, job in enumerate(args.jobs, 1):
+                label = f"[{number}/{len(args.jobs)}] {job}"
+                stage = "notes"
+                try:
+                    if batch:
+                        print(f"{label}: {stage}", flush=True)
+                    result = generate_notes(job, args.state_dir, imported=args.imported,
+                                            manual=args.manual, rebuild=args.rebuild,
+                                            proxy=args.openai_proxy)
+                    if (not args.manual and (batch or args.rebuild)
+                            and result.resolve() != (job / "notes" / "main.tex").resolve()):
+                        raise RuntimeError(f"Notes require manual completion: {result}")
+                    if args.rebuild and not args.manual:
+                        from .rendering import render
+                        stage = "render"
+                        if batch:
+                            print(f"{label}: {stage}", flush=True)
+                        result = render(job, rebuild=True)
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError,
+                        ModuleNotFoundError) as exc:
+                    if not batch:
+                        raise
+                    print(f"{label}: {stage} failed: {exc}", file=sys.stderr, flush=True)
+                    continue
+                completed += 1
+                print(f"{label}: completed — {result}" if batch else result, flush=True)
+            if batch:
+                print(f"Notes: {completed} completed, {len(args.jobs) - completed} failed.",
+                      flush=True)
+            return 0 if completed == len(args.jobs) else 1
         elif args.command == "render":
             from .rendering import render
             print(render(args.job))
@@ -159,9 +204,38 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{sum(i['status'] == 'open' for i in issues)} unresolved issue(s)")
         elif args.command == "anki":
             from .anki import generate_anki
-            print(generate_anki(args.job, args.state_dir, pdf=args.pdf,
-                                rebuild=args.rebuild, proxy=args.openai_proxy,
-                                anki_collection=args.anki_collection))
+            from .jobs import read_json
+            if len(args.jobs) == 1:
+                print(generate_anki(args.jobs[0], args.state_dir, pdf=args.pdf,
+                                    rebuild=args.rebuild, proxy=args.openai_proxy,
+                                    anki_collection=args.anki_collection))
+                return 0
+            if args.pdf is not None:
+                raise ValueError("--pdf requires a single project directory")
+            destinations = set()
+            for job in args.jobs:
+                destination = job.resolve()
+                if destination in destinations:
+                    raise ValueError(f"Repeated project directory: {job}")
+                destinations.add(destination)
+            completed, next_position = 0, 1
+            for number, job in enumerate(args.jobs, 1):
+                label = f"[{number}/{len(args.jobs)}] {job}"
+                try:
+                    print(f"{label}: anki", flush=True)
+                    package = generate_anki(job, args.state_dir, pdf=None,
+                                            rebuild=args.rebuild, proxy=args.openai_proxy,
+                                            anki_collection=args.anki_collection,
+                                            minimum_position=next_position)
+                    next_position = read_json(job / "anki" / "report.json")["end_position"] + 1
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError,
+                        ModuleNotFoundError) as exc:
+                    print(f"{label}: anki failed: {exc}", file=sys.stderr, flush=True)
+                    continue
+                completed += 1
+                print(f"{label}: completed — {package}", flush=True)
+            print(f"Anki: {completed} completed, {len(args.jobs) - completed} failed.", flush=True)
+            return 0 if completed == len(args.jobs) else 1
         elif args.command == "run":
             from .pipeline import run_pipeline
             completed = run_pipeline(args.media, args.out, args.state_dir,

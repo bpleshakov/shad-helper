@@ -9,6 +9,7 @@ from shad_helper.anki_latex import normalize_latex
 
 EXPRESSIONS = [
     r"\hat\theta\xrightarrow{P}\theta",
+    r"x \gets y",
     r"\hat\theta_n\xrightarrow[n\to\infty]{P}\theta\xleftarrow[m\to\infty]{P}\hat\theta_m",
     r"\genfrac{[}{]}{0pt}{}{n}{k}+\tbinom{n}{k}+\cfrac[l]{1}{1+\cfrac[r]{1}{x}}",
     r"a_1+\dotsb+a_n,\quad a_1,\dotsc,a_n,\quad A_1\dotsm A_n,\quad\int\dotsi\int f,\quad\dotso",
@@ -93,6 +94,7 @@ def test_alignment_count_after_comment_precedes_source_anchor(tmp_path, environm
 @pytest.mark.parametrize("formula", [
     r"\input{secret}", r"\write18{echo unsafe}", r"\csname input\endcsname{secret}",
     r"\xrightarrowCustom{P}", r"\operatornameCustom{x}", r"\math@cr", r"\x@protect",
+    r"x \getsCustom y",
 ])
 def test_new_math_support_does_not_allow_unsafe_custom_or_internal_commands(formula):
     with pytest.raises(rendering.RenderError, match="Unsupported or unsafe"):

@@ -4,9 +4,7 @@ import json
 import math
 import shutil
 import time
-from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
 
 from .jobs import (
     check_job,
@@ -14,6 +12,7 @@ from .jobs import (
     evidence_index,
     fingerprint,
     read_json,
+    remove_artifacts,
     timestamp,
     validate_evidence,
     write_json,
@@ -432,6 +431,7 @@ def export_handoff(job: Path, evidence: dict, outline: dict, *, contexts: dict |
     validate_evidence(evidence)
     folder = job / "handoff"
     folder.mkdir(exist_ok=True)
+    write_json(folder / "outline.json", outline)
     inputs = folder / "inputs"
     if inputs.exists():
         shutil.rmtree(inputs)
@@ -458,18 +458,6 @@ def export_handoff(job: Path, evidence: dict, outline: dict, *, contexts: dict |
         "Save its JSON response as CHAPTER_ID.json in a replies directory.\n"
         f"Import using: shad-helper notes {job} --import replies/\n",
         encoding="utf-8")
-    return folder
-
-
-def _archive_handoff(job: Path, evidence: dict, outline: dict, run: Path,
-                     contexts: dict) -> Path:
-    folder = export_handoff(job, evidence, outline, contexts=contexts)
-    inputs = run / "inputs"
-    if inputs.exists():
-        shutil.rmtree(inputs)
-    shutil.copytree(folder / "inputs", inputs)
-    shutil.copyfile(folder / "README.txt", run / "README.txt")
-    write_json(run / "outline.json", outline)
     return folder
 
 
@@ -641,30 +629,32 @@ def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
                    manual: bool = False, client=None, rebuild: bool = False,
                    proxy: str | None = None) -> Path:
     job = Path(job).resolve()
+    if rebuild:
+        remove_artifacts(job, (
+            "checkpoints/notes", "checkpoints/notes_candidates", "checkpoints/notes_final",
+            "handoff", "notes", "notes.json", "review.json", "outline.json",
+            "illustration-crops", "illustration-verification",
+        ))
     check_job(job)
-    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid4().hex[:8]
-    run = job / "handoff" / "runs" / run_id
+    handoff = job / "handoff"
     info = {"mode": "manual" if manual else "import" if imported else "automatic",
             "status": "running", "rebuild": rebuild}
-    write_json(run / "run.json", info)
-    print(f"Notes inputs and requests: {run}", flush=True)
+    write_json(handoff / "run.json", info)
+    print(f"Notes inputs and requests: {handoff}", flush=True)
     try:
         result = _run_notes(job, state_dir, imported=imported, manual=manual,
-                            client=client, rebuild=rebuild, proxy=proxy, run=run)
+                            client=client, proxy=proxy)
         info["status"] = "handoff" if result == job / "handoff" else "completed"
         return result
     except BaseException:
         info["status"] = "failed"
         raise
     finally:
-        status_file = job / "handoff" / "status.json"
-        if info["status"] == "handoff" and status_file.exists():
-            shutil.copyfile(status_file, run / "status.json")
-        write_json(run / "run.json", info)
+        write_json(handoff / "run.json", info)
 
 
 def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
-               manual: bool, client, rebuild: bool, proxy: str | None, run: Path) -> Path:
+               manual: bool, client, proxy: str | None) -> Path:
     from .rendering import RenderError, write_project
     from .schemas import LectureNotes
 
@@ -684,9 +674,6 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
         for visual in evidence.get("visuals", []))
     if not speech and not visual_content and not illustration_index(evidence):
         raise ValueError("No speech or readable visual content was extracted; inspect the sources before generating notes.")
-    if rebuild:
-        for name in ("notes", "notes_candidates", "notes_final"):
-            shutil.rmtree(job / "checkpoints" / name, ignore_errors=True)
     resolutions_file = job / "review-resolutions.json"
     resolutions = read_json(resolutions_file) if resolutions_file.exists() else {}
     outline_file = job / "outline.json"
@@ -706,9 +693,21 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
         outline = _bounded_outline(evidence, outline, job=job)
     write_json(outline_file, outline)
     handoff = job / "handoff"
+    if imported:
+        imported = Path(imported)
+        complete_import = not imported.is_dir()
+        # Imported replies can be previous request diagnostics that cleanup replaces.
+        replies = ([read_json(imported)] if complete_import else
+                   [read_json(imported / f"{c['id']}.json") for c in outline["chapters"]])
+    for name in ("inputs", "requests", "verification", "figure-reconciliation"):
+        folder = handoff / name
+        if folder.exists():
+            shutil.rmtree(folder)
+    for name in ("chapters.json", "outline.json", "status.json", "README.txt"):
+        (handoff / name).unlink(missing_ok=True)
     contexts = {}
     if not imported:
-        handoff = _archive_handoff(job, evidence, outline, run, contexts)
+        handoff = export_handoff(job, evidence, outline, contexts=contexts)
     if manual:
         folder = handoff
         warnings = [f"{chapter['id']}: {reason}. No evidence was omitted."
@@ -724,12 +723,8 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
             (folder / "status.json").unlink(missing_ok=True)
         return folder
     if imported:
-        imported = Path(imported)
-        complete_import = not imported.is_dir()
-        if imported.is_dir():
-            replies = [read_json(imported / f"{c['id']}.json") for c in outline["chapters"]]
-        else:
-            notes = validate_notes(read_json(imported), evidence, resolutions, finalized=True)
+        if complete_import:
+            notes = validate_notes(replies[0], evidence, resolutions, finalized=True)
             imported_outline = {"title": notes["title"], "chapters": [
                 {key: c[key] for key in ("id", "title", "start", "end")}
                 for c in notes["chapters"]], "glossary": notes["glossary"]}
@@ -754,12 +749,12 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
             context = chapter_context(evidence, chapter)
             if illustration_index(context):
                 context["prior_illustrations"] = _prior_illustrations(parts, evidence)
-                part = _finalize_chapter(part, evidence, job, run / "verification" / chapter["id"],
+                part = _finalize_chapter(part, evidence, job, handoff / "verification" / chapter["id"],
                                          client, resolutions, available)
                 contexts[chapter["id"]] = _model_context(context, outline, outline["glossary"])
             parts.append(part)
         notes = _merge_chapters(parts, outline, evidence, resolutions)
-        _archive_handoff(job, evidence, outline, run, contexts)
+        export_handoff(job, evidence, outline, contexts=contexts)
     else:
         from .auth import PlanAccessError
         from .openai_client import DEFAULT_REASONING_EFFORT, PlanClient, ResponseError
@@ -785,20 +780,20 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                                          "cannot safely reduce this evidence. No evidence was omitted.")
                     outline["chapters"][position:position + 1] = split
                     write_json(outline_file, outline)
-                    _archive_handoff(job, evidence, outline, run, contexts)
+                    export_handoff(job, evidence, outline, contexts=contexts)
                     continue
                 text = _chapter_prompt(context, outline, glossary, list(topics.values()))
                 contexts[chapter["id"]] = json.loads(text)
-                for inputs in (handoff / "inputs", run / "inputs"):
-                    write_json(inputs / chapter["id"] / "context.json", contexts[chapter["id"]])
-                    _export_images(job, evidence, context, inputs / chapter["id"])
-                requests = run / "requests" / chapter["id"]
+                inputs = handoff / "inputs"
+                write_json(inputs / chapter["id"] / "context.json", contexts[chapter["id"]])
+                _export_images(job, evidence, context, inputs / chapter["id"])
+                requests = handoff / "requests" / chapter["id"]
                 illustrated = bool(_context_illustrations(context))
                 try:
                     stage = "notes_candidates" if illustrated else "notes"
                     part = checkpoint(job, f"{stage}/{chapter['id']}",
                         {"context": context, "prompt": text, "instructions": INSTRUCTIONS,
-                         "model": client.model, "rebuild": rebuild,
+                         "model": client.model,
                          "reasoning_effort": DEFAULT_REASONING_EFFORT,
                          "latex_validation": 1,
                          "illustration_policy": 1,
@@ -808,7 +803,7 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                             job=job, previous=parts))
                     if illustrated:
                         part = _finalize_chapter(part, evidence, job,
-                                                 run / "verification" / chapter["id"],
+                                                 handoff / "verification" / chapter["id"],
                                                  client, resolutions, parts)
                 except (PlanAccessError, ResponseError) as exc:
                     if getattr(exc, "code", None) != "context_length_exceeded":
@@ -820,10 +815,10 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                     print(f"Context limit reached; splitting notes chapter {chapter['id']}.", flush=True)
                     outline["chapters"][position:position + 1] = split
                     write_json(outline_file, outline)
-                    _archive_handoff(job, evidence, outline, run, contexts)
+                    export_handoff(job, evidence, outline, contexts=contexts)
                     continue
                 chapter_status[chapter["id"]] = "generated" if requests.exists() else "cached"
-                write_json(run / "chapters.json", chapter_status)
+                write_json(handoff / "chapters.json", chapter_status)
                 parts.append(part)
                 terms = {g["term"]: g for g in glossary}
                 terms.update({g["term"]: g for g in part["glossary"]})
@@ -836,16 +831,16 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                 position += 1
             notes = _merge_chapters(parts, outline, evidence, resolutions)
         except (PlanAccessError, ResponseError, ValueError, RenderError) as exc:
-            handoff = _archive_handoff(job, evidence, outline, run, contexts)
+            handoff = export_handoff(job, evidence, outline, contexts=contexts)
             write_json(handoff / "status.json", {"status": "manual_required", "reason": str(exc)})
             print(f"Automatic synthesis unavailable: {exc}\nManual handoff: {handoff}")
             return handoff
     from .illustration_verification import reconcile_illustrations
 
     notes, retry_needed = reconcile_illustrations(
-        notes, evidence, job, run / "figure-reconciliation", client)
+        notes, evidence, job, handoff / "figure-reconciliation", client)
     notes = validate_notes(notes, evidence, resolutions, finalized=True)
-    write_json(run / "figure-reconciliation" / "status.json", {"retry_needed": retry_needed})
+    write_json(handoff / "figure-reconciliation" / "status.json", {"retry_needed": retry_needed})
     (handoff / "status.json").unlink(missing_ok=True)
     write_json(outline_file, outline)
     write_json(job / "notes.json", notes)

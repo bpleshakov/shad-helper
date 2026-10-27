@@ -29,7 +29,7 @@ from .anki_sources import (
     write_sources_report,
 )
 from .auth import PlanAccessError
-from .jobs import fingerprint, read_json, write_json
+from .jobs import fingerprint, read_json, remove_artifacts, write_json
 from .openai_client import (
     DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORT,
@@ -198,9 +198,11 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
                   rebuild: bool = False, proxy: str | None = None,
                   anki_collection: Path | None = None, minimum_position: int = 1,
                   client=None) -> Path:
+    job = Path(job)
+    if rebuild:
+        remove_artifacts(job, ("checkpoints/anki.json", "anki", "diagnostics/anki"))
     if type(minimum_position) is not int or minimum_position < 1:
         raise ValueError("minimum_position must be a positive integer")
-    job = Path(job)
     source = Path(pdf) if pdf is not None else job / "notes" / "main.pdf"
     if not source.is_file():
         raise ValueError(f"Anki requires a finished PDF: {source}. Run render or use --pdf.")
@@ -233,7 +235,7 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
             # Freeze the source bytes so the request, provenance and crops always agree.
             frozen_pdf = staging / source.name
             frozen_pdf.write_bytes(data)
-            cached = read_json(cache_path) if cache_path.exists() and not rebuild else {}
+            cached = read_json(cache_path) if cache_path.exists() else {}
             if cached.get("fingerprint") == signature:
                 print("Reusing anki generation", flush=True)
                 response = validate_response(cached["result"], len(document))

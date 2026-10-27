@@ -36,8 +36,7 @@ class Client:
 
 
 def attempt(job):
-    [run] = (job / "handoff/runs").iterdir()
-    return run / "requests/ch001/attempt-01"
+    return job / "handoff/requests/ch001/attempt-01"
 
 
 def test_compile_failure_retains_response_without_retry_or_checkpoint(tmp_path, monkeypatch):
@@ -95,14 +94,17 @@ def test_real_cases_failure_then_correction_and_cache(tmp_path, monkeypatch, cha
     assert read_json(tmp_path / "checkpoints/notes/ch001.json")["result"]["chapters"][0][
         "blocks"][1]["content"] == client.content
     assert not (tmp_path / "handoff/status.json").exists()
-    [pdf] = list((tmp_path / "handoff/runs").glob("*/requests/ch001/attempt-01/latex-check/notes/main.pdf"))
+    pdf = attempt(tmp_path) / "latex-check/notes/main.pdf"
     assert pdf.read_bytes().startswith(b"%PDF")
     assert not (pdf.parent / "qa").exists()
-    assert (folder / "response.json").is_file()
+    assert read_json(folder / "response.json")["chapters"][0]["blocks"][1][
+        "content"] == client.content
 
     monkeypatch.setattr(rendering, "validate_chapter_latex", Mock(side_effect=AssertionError("Cached")))
     assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client).is_file()
     assert len(client.calls) == 2
+    assert not attempt(tmp_path).exists()
+    assert not (tmp_path / "handoff/runs").exists()
 
 
 @pytest.mark.skipif(not shutil.which("latexmk") or not shutil.which("lualatex"),

@@ -176,6 +176,7 @@ class NotesValidationTests(unittest.TestCase):
                 self.assertEqual(folder, job / "handoff")
                 self.assertTrue((folder / "inputs/ch001/prompt.txt").exists())
                 self.assertFalse(list(folder.rglob("*.pdf")))
+                self.assertEqual(read_json(folder / "run.json")["mode"], "manual")
                 write_json(folder / "status.json", {"status": "manual_required"})
                 with patch("shad_helper.notes.export_handoff", wraps=export_handoff) as export:
                     path = generate_notes(job, job / "auth", imported=response_file)
@@ -183,10 +184,8 @@ class NotesValidationTests(unittest.TestCase):
                 context = read_json(folder / "inputs/ch001/context.json")
                 self.assertEqual(context["chapter"]["title"], "Матрицы")
                 self.assertEqual(context["segments"], [data["segments"][0]])
-                runs = list((folder / "runs").iterdir())
-                self.assertEqual(len(runs), 2)
-                self.assertEqual({read_json(run / "run.json")["mode"] for run in runs},
-                                 {"manual", "import"})
+                self.assertFalse((folder / "runs").exists())
+                self.assertEqual(read_json(folder / "run.json")["mode"], "import")
                 self.assertTrue(path.exists())
                 self.assertTrue((job / "notes.json").exists())
                 self.assertTrue(read_json(job / "review.json")["ready"])

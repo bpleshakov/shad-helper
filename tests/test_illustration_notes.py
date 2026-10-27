@@ -88,10 +88,10 @@ def test_printed_illustrations_reach_notes_and_portable_assets(tmp_path):
     context, images = client.calls[0]
     assert context["required_illustration_ids"] == ["f0_ill01"]
     assert images == [("f0_ill01", source.read_bytes())]
-    [run] = (tmp_path / "handoff/runs").iterdir()
-    for root in (tmp_path / "handoff", run):
-        assert (root / "inputs/ch001/images/f0_ill01.png").read_bytes() == source.read_bytes()
-        assert read_json(root / "inputs/ch001/context.json") == context
+    root = tmp_path / "handoff"
+    assert (root / "inputs/ch001/images/f0_ill01.png").read_bytes() == source.read_bytes()
+    assert read_json(root / "inputs/ch001/context.json") == context
+    assert not (root / "runs").exists()
 
 
 def test_identical_crops_share_attachment_without_losing_coverage(tmp_path):
@@ -333,6 +333,47 @@ def test_unavailable_verification_falls_back_then_retries_cached_candidate(tmp_p
     assert len(client.calls) == 1 and client.verifications == 2
     notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
     assert client.verifications == 2
+
+
+def test_rebuild_refreshes_visual_caches_and_preserves_stage_inputs(tmp_path, monkeypatch):
+    evidence = prepare(tmp_path, source_kind="drawn")
+    outline = notes.default_outline(evidence)
+    outline["chapters"][0]["title"] = "Custom chapter"
+    write_json(tmp_path / "outline.json", outline)
+    write_json(tmp_path / "review-resolutions.json", {})
+    write_json(tmp_path / "checkpoints/anki.json", {"result": "previous deck"})
+    write_json(tmp_path / "checkpoints/extraction.json", {"result": "source"})
+    monkeypatch.setattr(rendering, "render_diagram_preview",
+                        lambda content, folder: tmp_path / "illustrations/f0_ill01.png")
+    client = Client(drawn=True)
+    legacy_run = tmp_path / "handoff/runs/legacy"
+    write_json(legacy_run / "run.json", {"mode": "automatic"})
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    preserved = [tmp_path / name for name in (
+        "evidence.json", "review-resolutions.json",
+        "illustrations/f0_ill01.png", "frame0.png", "checkpoints/anki.json",
+        "checkpoints/extraction.json")]
+    before = {path: path.read_bytes() for path in preserved}
+    stale = [tmp_path / folder / "stale.json" for folder in (
+        "checkpoints/notes", "checkpoints/notes_candidates", "checkpoints/notes_final",
+        "illustration-crops", "illustration-verification")]
+    for path in stale:
+        write_json(path, {"stale": True})
+
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    assert len(client.calls) == client.verifications == 1
+    assert all(path.exists() for path in stale)
+    assert read_json(tmp_path / "outline.json") == outline
+    assert legacy_run.exists()
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client, rebuild=True)
+    assert len(client.calls) == client.verifications == 2
+    assert all(not path.exists() for path in stale)
+    assert all(path.read_bytes() == content for path, content in before.items())
+    assert not (tmp_path / "handoff/runs").exists()
+    assert read_json(tmp_path / "outline.json") == notes.default_outline(evidence)
+
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    assert len(client.calls) == client.verifications == 2
 
 
 def test_import_runs_drawing_verification_and_missing_assets_preserve_previous_notes(tmp_path, monkeypatch):

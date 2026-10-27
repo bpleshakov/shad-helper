@@ -56,7 +56,7 @@ The chapter model receives labeled PNG attachments (`input_image`, high detail).
 Prior catalog images are attached only when already visible or byte-identical to
 current context; proposed reuse is checked separately using both source images.
 Identical hashes share one attachment; `images.json` records all its observation
-IDs and the relative PNG filename in handoffs and request archives.
+IDs and the relative PNG filename in handoffs and current request records.
 
 Before accepting a drawing, the pipeline compiles an isolated preview and compares
 it with the source in a separate model call. Only `pass` preserves TikZ; `fail`,
@@ -67,7 +67,7 @@ unrelated surrounding text, formulas, code, people and decoration. A failed matc
 tries retained alternative representatives from its group before creating another
 crop block. Excluded candidates skip reconstruction and consolidation checks.
 Imported drawings receive the same checks. Candidates, exact credential-free model
-requests, previews, verdicts, and accepted blocks are archived locally.
+requests, previews, verdicts, and accepted blocks are saved in the current handoff diagnostics.
 
 Candidate chapters use `checkpoints/notes_candidates/`; completed chapter compilation
 uses `checkpoints/notes_final/`. Verification caches bind source pixels, drawing code,
@@ -123,7 +123,7 @@ Existing time splitting and complete manual handoff handle oversized contexts.
 | Extract video | Local selection and vision worker started by `extract`, after ASR exits or is skipped | Original recording, selected frames, vision checkpoints | Frame images, recognized content, separate local diagnostics | Every selected frame has complete or incomplete extraction status |
 | Assemble evidence | Internal part of `extract` | Raw worker responses | Clean evidence, separate diagnostics, transcript copies, extraction timings | `extract` returns the path to `evidence.json` |
 | Prepare chapters | Internal part of `notes` | Evidence, optional saved outline | Saved outline and in-memory chapter contexts | A consecutive outline covers the extracted interval |
-| Synthesize or import | `notes`, optionally `--manual` or `--import` | Chapter contexts, schema, optional replies and resolutions | Handoff and run archive on every run; notes, review summary, and LaTeX project on success | A project path means notes were generated; a handoff path means replies are still required |
+| Synthesize or import | `notes`, optionally `--manual` or `--import` | Chapter contexts, schema, optional replies and resolutions | Current handoff and diagnostics replaced on every run; notes, review summary, and LaTeX project on success | A project path means notes were generated; a handoff path means replies are still required |
 | Review | `review`, optionally `--resolve` | Clean evidence, notes, review files and project | Resolution ledger, updated note issues and review metadata | A named note issue has an explicit correction recorded |
 | Render | `render` | Existing LaTeX project, manifest, current evidence | PDF, page previews, report and compiler files | PDF compilation and page preview generation both complete |
 
@@ -171,21 +171,19 @@ JOB/
 ├── transcript.vtt
 ├── extraction-timings.json
 ├── outline.json
-├── handoff/                                  # current inputs, saved on every notes run
+├── handoff/                                  # current inputs and diagnostics, replaced each notes run
 │   ├── README.txt
 │   ├── status.json                           # fallback or unresolved size warning
-│   ├── runs/<run ID>/                        # separate history, retained across rebuilds
-│   │   ├── run.json                         # mode and completion state
-│   │   ├── outline.json                     # this run's final chapter plan
-│   │   ├── inputs/                          # this run's handoff inputs
-│   │   ├── README.txt
-│   │   ├── chapters.json                    # generated/cached automatic chapters
-│   │   ├── status.json                      # fallback, when applicable
-│   │   └── requests/<chapter ID>/attempt-01/
-│   │       ├── call.json                    # application-level model call
-│   │       ├── status.json                  # attempt result
-│   │       ├── http-001.request.json        # method, URL, body filename
-│   │       └── http-002.body.json           # exact POST bytes; GET has no body
+│   ├── run.json                              # current mode and completion state
+│   ├── outline.json                          # current final chapter plan
+│   ├── chapters.json                         # generated/cached automatic chapters
+│   ├── verification/                         # current illustration checks
+│   ├── figure-reconciliation/                # current consolidation checks
+│   ├── requests/<chapter ID>/attempt-01/
+│   │   ├── call.json                         # application-level model call
+│   │   ├── status.json                       # attempt result
+│   │   ├── http-001.request.json             # method, URL, body filename
+│   │   └── http-002.body.json                # exact POST bytes; GET has no body
 │   └── inputs/
 │       ├── response-schema.json
 │       └── ch001/
@@ -1004,6 +1002,8 @@ On reuse, a saved outline whose first start or last end differs **exactly** from
 the current clip bounds is replaced by a default outline. Otherwise, the saved
 outline is validated. Internal gaps, duplicate IDs, and oversized chapters
 are errors rather than silently repaired.
+`notes --rebuild` deletes the saved outline before validation and starts with the
+default fifteen-minute plan, losing any custom titles, glossary seed, or intervals.
 
 Automatic and manual-export preparation can split this plan further. A
 successful combined-file import replaces it with the imported title, chapter
@@ -1148,14 +1148,14 @@ The instructions are identical to the manual `prompt.txt`. They contain no
 lecture data or embedded response schema. The output schema is supplied through
 the client's response-format field rather than duplicated in the user input.
 
-The current client default is model `gpt-6.1-sol` with reasoning effort
-`high`. Its response format is named `lecture_notes`. For the API's strict
+The current client default is model `gpt-6-astra` with reasoning effort
+`max`. Its response format is named `lecture_notes`. For the API's strict
 JSON Schema format, the client recursively removes schema defaults, requires
 every declared object property, and sets `additionalProperties: false`.
 Application-level provenance and review validators still run afterward.
 
 Exact outgoing model request bodies are saved before transmission under
-`handoff/runs/<run ID>/requests/<chapter ID>/attempt-NN/`. Streaming events and
+`handoff/requests/<chapter ID>/attempt-NN/`. Streaming events and
 raw note replies are not archived; incomplete streams are discarded. Only a
 successfully validated chapter result is checkpointed.
 
@@ -1178,7 +1178,7 @@ they do not claim those reconstructed inputs were sent to a model.
 For a chapter, send only its prompt, its context, and the shared response schema.
 Their responsibilities are distinct: instructions, lecture data, and response
 structure. The root `outline.json` remains the authoritative chapter plan and
-determines which replies must be imported. A copy is retained in each run archive,
+determines which replies must be imported. A current copy is saved as `handoff/outline.json`,
 but is not attached to the model. There is no chapter `transcript.txt`; it would repeat speech already
 included in context. Operator README and status files stay outside `inputs/` and
 are not model inputs.
@@ -1202,33 +1202,40 @@ A fallback status file has this complete shape:
 `reason` contains the actual exception message or chapter budget warnings;
 the displayed message is illustrative. Normal manual export within the budget
 does not need a status file. Successful synthesis or import removes a previous
-status file. Those paths also refresh model inputs and retain a separate run
-archive, so a current handoff exists after successful generation and import.
+status file. Those paths also refresh model inputs, so a current handoff exists
+after successful generation and import.
 
-Every export checks job and evidence compatibility, then deletes and rebuilds
+Every ordinary export checks job and evidence compatibility, then deletes and rebuilds
 the generator-owned `handoff/inputs/` subtree. This removes obsolete chapter
-folders and duplicate files from earlier exports. Operator files outside that
-subtree are preserved by the cleanup; `README.txt` is rewritten with current
+folders and duplicate files from earlier exports. Unrelated operator files are
+preserved by the cleanup; `README.txt` is rewritten with current
 instructions, while the calling workflow manages `status.json`. The current root
 `outline.json` determines the exported chapter IDs. Send one chapter's three
 inputs per request. An interrupted export can leave only part of the rebuilt
 input tree; rerun export before attaching it.
+With `notes --rebuild`, the entire `handoff/` is deleted before compatibility or
+input checks, including operator files and legacy `runs/` archives.
 
-### Per-run inputs and outbound request archive
+### Current inputs and outbound request diagnostics
 
-After the initial job compatibility check, each invocation creates
-`handoff/runs/<UTC timestamp plus unique suffix>/run.json` and prints its path.
+With `--rebuild`, stage cleanup precedes the initial job compatibility check.
+After that check, each invocation writes
+`handoff/run.json` and prints the handoff path. Once evidence and outline checks
+pass, it replaces the generated current handoff state. On ordinary invocations,
+imported replies are read before this current-diagnostics cleanup, so a prior
+saved response can be imported directly. A rebuild deletes the entire stage
+before reading replies; copy imports outside its deletion paths first.
 `mode` is `automatic`, `manual`, or `import`; `status` begins as `running` and
 ends as `completed`, `handoff`, or `failed`. A forcibly terminated process can
 leave `running`; a failure before valid inputs exist can leave only the run record.
-`rebuild` records the flag without affecting older run archives.
+`rebuild` records the flag.
 
-Each prepared run has its own `inputs/`, `README.txt`, and `outline.json`.
-The archived outline follows runtime splitting; rejected parent requests remain
-in the request history even when only leaf chapters remain in the handoff.
+The current `handoff/inputs/`, `README.txt`, and `outline.json` describe the latest
+preparation. The saved outline follows runtime splitting; rejected parent requests
+remain in the current diagnostics even when only leaf chapters remain in the handoff.
 During automatic generation, `chapters.json` maps completed chapter IDs to
-`generated` or `cached`. Manual and imported runs make no model requests, and
-cache hits are never logged as transmissions.
+`generated` or `cached`. Manual exports make no model requests, and cache hits
+are never logged as transmissions.
 
 Every generation attempt gets `requests/<chapter ID>/attempt-NN/call.json`
 containing `instructions`, the exact serialized context `text`, application
@@ -1245,10 +1252,13 @@ instructions, input, stream/store flags, and strict normalized response schema.
 Saving happens before the HTTP operation; a saved request records an attempt,
 not proof that OpenAI received it. A write failure prevents the HTTP operation.
 
-Archives omit HTTP authorization headers, tokens, proxy credentials, OAuth
+Request records omit HTTP authorization headers, tokens, proxy credentials, OAuth
 exchanges, and response streams. Raw extraction diagnostics remain outside both
-handoff inputs and model payloads. The current `handoff/inputs/` can be replaced;
-completed `handoff/runs/` archives survive exports, later runs, and `--rebuild`.
+handoff inputs and model payloads. Each new notes invocation replaces generated
+handoff inputs, requests, verification and figure-reconciliation diagnostics, and
+run/status records. Ordinary invocations leave unrelated operator files and
+existing `handoff/runs/` archives unchanged. A rebuild deletes all of `handoff/`
+before preparing new inputs; no new run archives are created.
 
 ### Manual reply inputs
 
@@ -1271,6 +1281,10 @@ Alternatively, `--import response.json` accepts one complete lecture object.
 Its chapters must satisfy outline coverage and duration rules, and its title,
 chapter metadata, and glossary become the saved outline. Both modes use the
 same note and evidence validation as automatic replies.
+With `--rebuild`, directory imports must match the freshly defaulted outline.
+A complete lecture JSON import can replace that default with its own valid
+chapter plan. Imports stored in `notes.json`, `handoff/`, or another cleared
+stage path must be copied elsewhere before invoking the rebuild.
 
 Reply files contain JSON only, without Markdown fences or commentary. Their
 root shape is the same as the normalized notes example below. Imported files
@@ -1443,12 +1457,11 @@ handling. The fingerprint input object contains:
 | `prompt` | Exact compact model-context JSON with lecture title, current accumulated glossary, and topic names |
 | `instructions` | Russian synthesis instructions |
 | `model` | Client's model identifier |
-| `rebuild` | Boolean for this invocation |
-| `reasoning_effort` | Current default effort, `high` |
+| `reasoning_effort` | Current default effort, `max` |
 | `schema` | Full Pydantic response schema |
 
 These inputs are hashed but are not individually saved alongside the
-checkpoint. The handoff/run archive stores the prepared model inputs separately;
+checkpoint. The current handoff stores the prepared model inputs separately;
 actual calls also retain their exact outbound API payload. A cached chapter result
 can be reused while later chapters run.
 Speech, visual content, prompt, model, outline context, glossary, topic names, or schema
@@ -1456,9 +1469,25 @@ changes can invalidate affected chapter reuse. Diagnostic-report changes cannot.
 resolution checks use the complete clean evidence fingerprint even when a
 single chapter checkpoint is reused.
 
-`--rebuild` removes the entire notes checkpoint directory after the job and
-usable-evidence checks, then generates again. Since the flag is also hashed,
-a later run without `--rebuild` does not match checkpoints created with it.
+`notes --rebuild` deletes these stage-owned paths before job compatibility checks,
+input validation, or model calls:
+
+- `notes/`, including editable TeX, figures/code, PDF, QA, source map, logs and auxiliaries;
+- `notes.json`, `review.json`, and `outline.json`;
+- the entire `handoff/`, including current diagnostics, operator files, and legacy run archives;
+- `checkpoints/notes/`, `checkpoints/notes_candidates/`, and `checkpoints/notes_final/`;
+- `illustration-crops/` and `illustration-verification/`.
+
+Deleting `checkpoints/notes/` also removes historical `notes/outline.json`
+checkpoints. The custom outline and manual edits to generated sources are lost.
+Removal errors stop the rebuild; a later input or generation failure does not
+restore deleted artifacts. Extraction outputs and checkpoints, original frames
+and illustrations, and explicit `review-resolutions.json` corrections remain
+unchanged. The flag is not hashed, so subsequent ordinary runs can reuse fresh
+checkpoints written at the same paths.
+The `notes --rebuild` command also renders the regenerated project with a clean
+LaTeX build and refreshes PDF QA and source maps. Manual export still produces
+only a handoff; an automatic handoff does not trigger rendering.
 Neither import mode nor manual export creates synthesized chapter checkpoints.
 
 ## Review state and resolutions
@@ -1658,6 +1687,17 @@ includes these records in `cards`; `anki/sources.md` presents them as Markdown.
 Every model attempt retains its original JSON response and validation status
 under `diagnostics/anki/<run>/attempt-XX/`. Failed validation does not publish
 the deck or save a successful checkpoint, and diagnostics remain local.
+`anki --rebuild` deletes all of `anki/`, `checkpoints/anki.json`, and
+`diagnostics/anki/` before any input validation, PDF read, collection access, or
+model request. This includes the prior package, all media and temporary build
+files, and `anki/identity.json`. The next successful export creates a new
+`job_uuid`, `deck_id`, and corresponding note GUIDs; importing it creates new
+deck/notes rather than updating the earlier import. Deletion is not rolled back
+after validation, generation, or packaging failure. Successful generation writes
+a fresh checkpoint at the same path, which can remain reusable if later packaging
+fails. Ordinary exports preserve the saved identity and keep the prior package
+on failure. Notes and extraction artifacts are unchanged. A custom `--pdf`
+within a cleared path must be copied elsewhere before the rebuild.
 
 `review` entries for marked blocks use the block ID. Entries for unresolved
 issues use the issue ID. An uncertain block and its generated issue can both
@@ -1666,9 +1706,11 @@ the renderer also derives its report's draft flag from the list.
 
 The writer appends diagram files and section files while traversing the
 chronological sections; consumers must use the manifest rather than assume a sorted file
-list. A regenerated project may leave obsolete files on disk. Only declared
+list. Ordinary regeneration may leave obsolete files on disk. Only declared
 files belong to the current compilation contract. Regeneration removes the
 obsolete generator-owned `review.tex` from earlier projects.
+`notes --rebuild` first deletes the entire project directory, so no prior sources
+or render artifacts survive that reset.
 
 The manifest has no separate Pydantic model. Version, path confinement,
 declared references, and source restrictions are checked during rendering.
@@ -1803,6 +1845,7 @@ latexmk -norc -lualatex -latexoption=-no-shell-escape \
 The environment sets `openin_any=p` and `openout_any=p`, and compilation
 has a 600-second timeout. Existing output paths are checked for confinement
 before invoking the compiler.
+The PDF render requested by `notes --rebuild` adds `-gg` for a clean compilation.
 
 ### notes/main.pdf
 
@@ -1814,7 +1857,9 @@ fragments retain compact timestamp footnotes. Open review
 flags produce the draft footer. A successful compiler exit and an existing PDF
 are required, followed by successful page preview generation.
 
-An older PDF can remain after a failed render. File existence alone is not
+An older PDF can remain after a failed ordinary render. `notes --rebuild` deletes
+the old project and PDF before synthesis, so its failure cannot leave the old PDF.
+File existence alone is not
 evidence that the current render succeeded. The report records the latest
 attempt once rendering has entered its report-writing phase.
 
@@ -1934,7 +1979,9 @@ Notes preparation writes its outline before generation or import completes.
 Automatic synthesis checkpoints chapters individually. Only after all chapter
 replies validate and merge does it write `notes.json`, `review.json`, and
 the project. These writes remain separate: a project-generation error can
-leave updated notes with an incomplete or older project.
+leave updated notes with an incomplete or, on an ordinary invocation, older project.
+With `--rebuild`, all old notes-stage outputs have already been deleted before
+compatibility or evidence validation begins.
 
 Automatic fallback returns a handoff path normally, so the CLI can exit
 successfully while manual replies are still needed. Check the returned path
@@ -1943,8 +1990,10 @@ and handoff status rather than treating exit code zero or an older
 speech and usable visual content, and outline errors before the synthesis loop
 fail directly instead.
 
-Neither re-extraction nor handoff export removes an old note project or PDF.
-Project generation does not purge obsolete TeX/code assets. Rendering compares
+Neither re-extraction nor ordinary handoff export removes an old note project or PDF.
+Ordinary project generation does not purge obsolete TeX/code assets. A notes
+rebuild removes the entire old project, even for manual export or failed input
+validation. Rendering compares
 evidence identity and validates declared files, but neither `notes.json` nor
 the render report stores a complete hash of all manually edited TeX and PDF
 bytes.
@@ -1960,7 +2009,8 @@ bytes.
 | Delete a selected frame image | Matching selection metadata | Missing PNG is retrieved from the original recording |
 | Run automatic notes again | Matching validated chapter checkpoints | Final merged notes, review summary and generated project |
 | Edit only the diagnostic report | Matching note checkpoints, resolutions, and project | No synthesis or render invalidation; report remains informational |
-| Use notes `--rebuild` | Extraction checkpoints | All automatic note checkpoints are removed |
+| Use notes `--rebuild` | Extraction artifacts/checkpoints and explicit review resolutions | All notes outputs, outline, handoff and notes/illustration caches deleted before validation; fresh notes/PDF generated |
+| Use anki `--rebuild` | Notes/PDF and extraction artifacts | Anki outputs, identity, checkpoint and diagnostics deleted before validation; new deck and note identities generated |
 | Export manual handoff | Existing extraction artifacts | Entire generated input subtree rebuilt for the current outline; final notes need replies/import |
 | Import replies | Extraction artifacts and compatible resolutions | Final notes, review summary and project; no model calls |
 | Render existing project | Compiler may use its working files | PDF, logs, report and previews; source edits are preserved |

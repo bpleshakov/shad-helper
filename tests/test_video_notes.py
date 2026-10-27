@@ -139,18 +139,27 @@ def test_visual_content_invalidates_notes_cache_but_diagnostics_do_not(tmp_path)
 @pytest.mark.parametrize("frames", [[], [visual(text="", formulas=[], diagrams=[])],
                                    [visual(status="incomplete", text="", formulas=[],
                                            unreadable=["Нечитаемый кадр"])]])
-def test_empty_visuals_do_not_bypass_missing_content_guard(tmp_path, frames):
+@pytest.mark.parametrize("rebuild", [False, True])
+def test_empty_visuals_do_not_bypass_missing_content_guard(tmp_path, frames, rebuild):
     prepare(tmp_path, evidence(speech=False, visuals=frames))
-    write_json(tmp_path / "checkpoints/notes/ch001.json", {"preserve": True})
-    write_json(tmp_path / "notes.json", {"preserve": "previous notes"})
+    inputs = {tmp_path / name: (tmp_path / name).read_bytes()
+              for name in ("evidence.json", "extraction-config.json")}
+    previous = {tmp_path / "checkpoints/notes/ch001.json": {"preserve": True},
+                tmp_path / "notes.json": {"preserve": "previous notes"}}
+    for path, value in previous.items():
+        write_json(path, value)
     with pytest.raises(ValueError, match="No speech or readable visual content"):
-        notes.generate_notes(tmp_path, tmp_path / "auth", manual=True, rebuild=True)
-    assert read_json(tmp_path / "checkpoints/notes/ch001.json") == {"preserve": True}
-    assert read_json(tmp_path / "notes.json") == {"preserve": "previous notes"}
-    runs = list((tmp_path / "handoff/runs").iterdir())
-    assert len(runs) == 1
-    assert read_json(runs[0] / "run.json") == {"mode": "manual", "status": "failed", "rebuild": True}
-    assert {path.name for path in runs[0].iterdir()} == {"run.json"}
+        notes.generate_notes(tmp_path, tmp_path / "auth", manual=True, rebuild=rebuild)
+    assert all(path.read_bytes() == value for path, value in inputs.items())
+    for path, value in previous.items():
+        if rebuild:
+            assert not path.exists()
+        else:
+            assert read_json(path) == value
+    run = tmp_path / "handoff"
+    assert read_json(run / "run.json") == {
+        "mode": "manual", "status": "failed", "rebuild": rebuild}
+    assert {path.name for path in run.iterdir()} == {"run.json"}
     assert not (tmp_path / "handoff/inputs").exists()
 
 

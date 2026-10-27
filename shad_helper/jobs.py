@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -135,6 +136,26 @@ def write_json(path: Path, value: Any) -> None:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def remove_artifacts(job: Path, names: tuple[str, ...]) -> None:
+    """Delete stage-owned outputs without following links outside the job."""
+    job = Path(job).resolve()
+    paths = [job / name for name in names]
+    for path in paths:
+        if not path.parent.resolve().is_relative_to(job):
+            raise ValueError(f"Artifact directory escapes the job: {path}")
+        if any(parent.is_symlink() for parent in path.parents
+               if parent != job and parent.is_relative_to(job)):
+            raise ValueError(f"Artifact directory has a symbolic-link parent: {path}")
+    # Interrupted atomic JSON writes belong to the same stage as their target.
+    paths += [temporary for path in paths if path.suffix == ".json"
+              for temporary in path.parent.glob(f".{path.name}.*.tmp")]
+    for path in paths:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
 
 
 def fingerprint(value: Any) -> str:

@@ -126,7 +126,7 @@ def test_manual_split_ids_are_persisted_and_import_does_not_split_again(tmp_path
     prepare_job(tmp_path, data)
     folder = notes.generate_notes(tmp_path, tmp_path / "auth", manual=True)
     outline = read_json(tmp_path / "outline.json")
-    assert not (folder / "outline.json").exists()
+    assert read_json(folder / "outline.json") == outline
     assert len(outline["chapters"]) > 1
     contexts = assert_coverage(outline, data)
     replies = tmp_path / "replies"

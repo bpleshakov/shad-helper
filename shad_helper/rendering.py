@@ -41,7 +41,7 @@ _MATH_COMMANDS = set(
     "in notin ni subset supset subseteq supseteq subsetneq supsetneq "
     "cup cap setminus union times cdot div pm mp ast star circ bullet oplus otimes colon "
     "le leq ge geq neq ne approx sim simeq equiv cong propto ll gg doteq "
-    "to mapsto rightarrow leftarrow leftrightarrow Rightarrow Leftarrow "
+    "to gets mapsto rightarrow leftarrow leftrightarrow Rightarrow Leftarrow "
     "Leftrightarrow longrightarrow longleftarrow longleftrightarrow longmapsto "
     "Longrightarrow Longleftarrow Longleftrightarrow hookrightarrow hookleftarrow "
     "xrightarrow xleftarrow relbar Relbar "
@@ -620,14 +620,15 @@ def _validate_project(root: Path, manifest: dict) -> None:
                 raise RenderError(f"Illustration image asset is not a PNG: {relative}")
 
 
-def _run_latex(root: Path) -> subprocess.CompletedProcess:
+def _run_latex(root: Path, *, rebuild: bool = False) -> subprocess.CompletedProcess:
     if not shutil.which("latexmk") or not shutil.which("lualatex"):
         raise RenderError("Rendering requires latexmk and LuaLaTeX (for example, MacTeX)")
     environment = os.environ.copy()
     environment.update({"openin_any": "p", "openout_any": "p"})
     with (root / "compiler-output.log").open("w", encoding="utf-8") as output:
         return subprocess.run(
-            ["latexmk", "-norc", "-lualatex", "-latexoption=-no-shell-escape",
+            ["latexmk", "-norc", *(["-gg"] if rebuild else []),
+             "-lualatex", "-latexoption=-no-shell-escape",
              "-interaction=nonstopmode", "-halt-on-error", "-file-line-error", "main.tex"],
             cwd=root, env=environment, stdout=output, stderr=subprocess.STDOUT,
             timeout=600, check=False,
@@ -763,7 +764,7 @@ def _qa(pdf: Path) -> int:
         return document.page_count
 
 
-def render(job: Path) -> Path:
+def render(job: Path, *, rebuild: bool = False) -> Path:
     """Compile existing sources without replacing manual TeX corrections."""
     check_job(job)
     root = job.resolve() / "notes"
@@ -783,7 +784,7 @@ def render(job: Path) -> Path:
         _confined(root, "source-map.json").unlink(missing_ok=True)
         for extension in ("pdf", "log", "aux", "out", "toc", "fls", "fdb_latexmk", "synctex.gz"):
             _confined(root, f"main.{extension}")
-        completed = _run_latex(root)
+        completed = _run_latex(root, rebuild=True) if rebuild else _run_latex(root)
         log = log_path.read_text(encoding="utf-8", errors="replace")
         if (root / "main.log").is_file():
             log += "\n" + (root / "main.log").read_text(encoding="utf-8", errors="replace")

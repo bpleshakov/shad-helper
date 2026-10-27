@@ -47,8 +47,10 @@ Video uses `{"schema_version": 4, "pipeline": "audio_video", "vision_model": "35
 with the selected preset. Supported v3/v4 jobs can switch presets or disable
 vision while reusing matching audio/selection work. A fatal vision error returns
 an error while preserving completed speech evidence for inspection and resumption.
-Legacy jobs and nonempty unrecognized directories require a new output directory;
-reject them before any rebuild, review, or rendering writes.
+Legacy jobs and nonempty unrecognized directories require a new output directory.
+Extraction, review, rendering, and ordinary notes generation check compatibility
+before writing. Explicit stage rebuilds clear their generated files before these
+checks, even when the subsequent input validation fails.
 
 ## Notes and rendering
 
@@ -83,12 +85,23 @@ reject them before any rebuild, review, or rendering writes.
   `response-schema.json`. Keep them under `handoff/inputs/`, with operator README
   and fallback status outside it. Do not duplicate the outline or transcript in model inputs.
   Initial manual topic lists are empty; use consistent broad names across replies.
-- Save the handoff on every notes run, including cache hits and imports. Retain
-  separate `handoff/runs/<run ID>/` archives with the run's outline and actual
-  chapter contexts, including accumulated glossary and topic names. Save each attempt's exact
+- Save the current handoff on every notes run, including cache hits and imports.
+  Replace generated inputs and diagnostics directly under `handoff/`, without
+  creating run archives. Include the outline and actual chapter contexts with
+  accumulated glossary and topic names. Save each attempt's exact
   outbound API JSON before transmission; keep retries and split-parent requests.
-  Exclude credentials and OAuth exchanges; never send after an archive write fails.
-- Preserve note-generated issues and explicit resolutions. Review operates on
+  Exclude credentials and OAuth exchanges; never send after a request-record write fails.
+- Make `notes --rebuild` a full stage reset before compatibility checks, input
+  validation, or model calls: delete `notes/`, `notes.json`, `review.json`,
+  `outline.json`, `handoff/` including legacy archives, `checkpoints/notes/`,
+  `checkpoints/notes_candidates/`, `checkpoints/notes_final/`, `illustration-crops/`,
+  and `illustration-verification/`. Preserve extraction inputs/checkpoints and
+  `review-resolutions.json`. Recreate the default outline and fresh notes/PDF;
+  failure must not restore old outputs. Imports inside cleared paths require an
+  external copy beforehand. Directory imports follow the new default outline;
+  a complete lecture JSON import can restore a custom chapter plan.
+- Preserve note-generated issues on ordinary runs and keep explicit resolutions
+  through rebuilds. Review operates on
   notes only. Bind resolution records and the rendered project to the complete
   clean evidence fingerprint; diagnostic-only changes leave them valid.
 - Retain confined TeX/code references, disabled shell escape, review-driven draft
@@ -96,11 +109,20 @@ reject them before any rebuild, review, or rendering writes.
 - Compile with LuaLaTeX, retain logs, and render PDF previews. Diagrams use inline
   TikZ/PGFPlots; external images are unsupported.
 
+`anki --rebuild` likewise deletes `anki/`, `checkpoints/anki.json`, and
+`diagnostics/anki/` before input validation or generation. This includes the deck
+identity, so a successful rebuild produces a new deck and note GUIDs. A failed
+rebuild leaves the previous package deleted. A custom PDF inside a cleared path
+must be copied elsewhere before rebuilding. Ordinary exports retain their stable
+identity and preserve the prior package on failure; notes and extraction artifacts
+are unaffected by the Anki reset.
+
 ## Verification
 
 Cover media routing, intervals, overlap ownership, resume, checkpoint invalidation,
 silence, diagnostic isolation, distinct manual inputs, manual round trips,
-chapter budgets, citations, review persistence, and legacy-file preservation.
+chapter budgets, citations, review persistence, ordinary legacy-file preservation,
+and full stage cleanup before failed or successful rebuilds.
 Use generated audio and multistream video with mocked Whisper, and real
 LuaLaTeX/PyMuPDF for PDF checks.
 Assess real speech accuracy separately on a representative Russian recording.

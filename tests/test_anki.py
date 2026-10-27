@@ -553,11 +553,12 @@ def test_standalone_pdf_job_can_be_repeated_offline_and_rebuilt(tmp_path, client
     monkeypatch.setattr(anki, "PlanClient", Mock(side_effect=AssertionError("Unexpected auth")))
 
     assert anki.generate_anki(job, tmp_path / "missing-auth", pdf=source) == package
+    assert read_json(job / "anki" / "identity.json") == identity
     assert anki.generate_anki(job, tmp_path / "auth", pdf=source,
                               client=client, rebuild=True) == package
 
     assert client.complete.call_count == 2
-    assert read_json(job / "anki" / "identity.json") == identity
+    assert read_json(job / "anki" / "identity.json") != identity
     assert {path.name for path in job.iterdir()} == {"anki", "checkpoints", "diagnostics"}
 
 
@@ -576,8 +577,91 @@ def test_cache_repackages_without_model_or_auth_and_keeps_identity(job, client, 
     client.complete.assert_called_once()
 
 
+def test_rebuild_deletes_checkpoint_before_generation_and_replaces_it(job, client, response):
+    anki.generate_anki(job, job / "auth", client=client)
+    cache_path = job / "checkpoints/anki.json"
+    assert cache_path.exists()
+    fresh = copy.deepcopy(response)
+    fresh["notes"][0]["back"] = "Freshly generated answer"
+
+    def generate(*args, **kwargs):
+        assert not cache_path.exists()
+        return fresh
+
+    client.complete.reset_mock()
+    client.complete.side_effect = generate
+    anki.generate_anki(job, job / "auth", client=client, rebuild=True)
+    assert read_json(cache_path)["result"]["notes"][0]["back"] == "Freshly generated answer"
+    client.complete.assert_called_once()
+
+    client.complete.reset_mock()
+    anki.generate_anki(job, job / "auth", client=client)
+    client.complete.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["missing_pdf", "invalid_pdf", "minimum_position", "collection"])
+def test_rebuild_clears_all_anki_artifacts_before_checks(job, client, collection_reader, failure):
+    for name in ("checkpoints/anki.json", "anki/identity.json", "anki/deck.apkg",
+                 "anki/notes.json", "anki/report.json", "anki/sources.md", "anki/media/old.png",
+                 "anki/figures/old.png", "anki/.build-stale/partial", "diagnostics/anki/old/status.json"):
+        path = job / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"previous Anki artifact")
+    preserved = {"evidence.json": (job / "evidence.json").read_bytes(),
+                 "checkpoints/notes/ch001.json": b"notes checkpoint",
+                 "diagnostics/vision/frame.json": b"vision diagnostic"}
+    for name, contents in preserved.items():
+        path = job / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+    artifact_roots = [job / name for name in ("checkpoints/anki.json", "anki", "diagnostics/anki")]
+    source = job / "notes/main.pdf"
+    if failure == "missing_pdf":
+        source.unlink()
+    else:
+        if failure == "invalid_pdf":
+            source.write_bytes(b"not a PDF")
+        preserved["notes/main.pdf"] = source.read_bytes()
+
+    def unavailable_collection(_):
+        assert all(not path.exists() for path in artifact_roots)
+        raise ValueError("Collection unavailable")
+
+    collection_reader.side_effect = unavailable_collection
+    with pytest.raises(ValueError):
+        anki.generate_anki(job, job / "auth", client=client, rebuild=True,
+                           minimum_position=0 if failure == "minimum_position" else 1)
+
+    assert all(not path.exists() for path in artifact_roots)
+    assert {name: (job / name).read_bytes() for name in preserved} == preserved
+    assert collection_reader.call_count == (failure == "collection")
+    client.complete.assert_not_called()
+
+
+def test_rebuild_stops_if_old_anki_checkpoint_cannot_be_deleted(
+        job, client, monkeypatch, collection_reader):
+    anki.generate_anki(job, job / "auth", client=client)
+    cache_path = job / "checkpoints/anki.json"
+    before = cache_path.read_bytes()
+    unlink = Path.unlink
+
+    def fail_checkpoint(path, *args, **kwargs):
+        if path == cache_path:
+            raise PermissionError("Cannot delete Anki checkpoint")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_checkpoint)
+    client.complete.reset_mock()
+    collection_reader.reset_mock()
+    with pytest.raises(PermissionError, match="Cannot delete Anki checkpoint"):
+        anki.generate_anki(job, job / "auth", client=client, rebuild=True)
+    client.complete.assert_not_called()
+    collection_reader.assert_not_called()
+    assert cache_path.read_bytes() == before
+
+
 @pytest.mark.parametrize("change", ["rebuild", "pdf", "model", "prompt"])
-def test_generation_restarts_when_required_but_reuses_job_identity(
+def test_generation_restarts_when_required_and_only_rebuild_resets_identity(
         job, client, monkeypatch, change):
     anki.generate_anki(job, job / "auth", client=client)
     identity = read_json(job / "anki" / "identity.json")
@@ -592,7 +676,7 @@ def test_generation_restarts_when_required_but_reuses_job_identity(
     anki.generate_anki(job, job / "auth", client=client, rebuild=change == "rebuild")
 
     assert client.complete.call_count == 2
-    assert read_json(job / "anki" / "identity.json") == identity
+    assert (read_json(job / "anki" / "identity.json") == identity) is (change != "rebuild")
     report = read_json(job / "anki" / "report.json")
     assert (report["pdf_sha256"] != previous_hash) is (change == "pdf")
 
@@ -636,12 +720,14 @@ def test_bad_source_fails_before_model_and_does_not_publish(job, client, monkeyp
     "invalid_json", "response_error", "package_error", "latex_error", "collection_refresh_error",
     "sources_error",
 ])
-def test_failed_regeneration_keeps_previous_published_artifacts(
-        job, client, monkeypatch, no_retry_wait, collection_reader, failure):
+@pytest.mark.parametrize("rebuild", [False, True])
+def test_failed_regeneration_preserves_previous_artifacts_only_without_rebuild(
+        job, client, monkeypatch, no_retry_wait, collection_reader, failure, rebuild):
     anki.generate_anki(job, job / "auth", client=client)
     previous = {path.name: path.read_bytes() for path in (job / "anki").iterdir()
                 if path.is_file()}
     client.complete.reset_mock()
+    client.model = "another-available-model"
     if failure == "invalid_json":
         client.complete.return_value = {"title": "Invalid", "notes": []}
         expected_calls = 4
@@ -663,11 +749,20 @@ def test_failed_regeneration_keeps_previous_published_artifacts(
         expected_calls = 1
 
     with pytest.raises((ValueError, RuntimeError, OSError)):
-        anki.generate_anki(job, job / "auth", client=client, rebuild=True)
+        anki.generate_anki(job, job / "auth", client=client, rebuild=rebuild)
 
     assert client.complete.call_count == expected_calls
-    assert {path.name: path.read_bytes() for path in (job / "anki").iterdir()
-            if path.is_file()} == previous
+    assert (job / "checkpoints/anki.json").exists() is (
+        not rebuild or failure not in {"invalid_json", "response_error"})
+    if rebuild:
+        assert all(not (job / "anki" / name).exists()
+                   for name in ("notes.json", "report.json", "sources.md", "deck.apkg"))
+        identity = job / "anki/identity.json"
+        if identity.exists():
+            assert identity.read_bytes() != previous["identity.json"]
+    else:
+        assert {path.name: path.read_bytes() for path in (job / "anki").iterdir()
+                if path.is_file()} == previous
     assert not list((job / "anki").glob(".build-*"))
     assert [call.args[0] for call in no_retry_wait.call_args_list] == (
         [5, 10, 20] if expected_calls == 4 else [])

@@ -9,6 +9,7 @@ from shad_helper.jobs import (
     checkpoint,
     evidence_index,
     read_json,
+    remove_artifacts,
     validate_audio_evidence,
     validate_evidence,
     write_json,
@@ -25,6 +26,40 @@ def video_evidence():
 
 
 class CheckpointTests(unittest.TestCase):
+    def test_artifact_cleanup_removes_outputs_and_links_without_touching_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job = root / "job"
+            write_json(job / "checkpoints/notes/ch001.json", {})
+            write_json(job / "checkpoints/asr/ch001.json", {"source": True})
+            (job / ".notes.json.123.tmp").write_text("interrupted output")
+            write_json(root / "outside/keep.json", {"source": True})
+            (job / "notes").symlink_to(root / "outside", target_is_directory=True)
+            (job / "handoff").symlink_to(root / "missing", target_is_directory=True)
+
+            remove_artifacts(job, ("checkpoints/notes", "notes", "handoff", "notes.json"))
+
+            self.assertFalse((job / "checkpoints/notes").exists())
+            self.assertFalse((job / "notes").is_symlink())
+            self.assertFalse((job / "handoff").is_symlink())
+            self.assertFalse((job / ".notes.json.123.tmp").exists())
+            self.assertEqual(read_json(job / "checkpoints/asr/ch001.json"), {"source": True})
+            self.assertEqual(read_json(root / "outside/keep.json"), {"source": True})
+
+    def test_artifact_cleanup_rejects_escaping_parent_before_any_deletion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job = root / "job"
+            write_json(job / "notes.json", {"keep": True})
+            write_json(root / "outside/notes/ch001.json", {"keep": True})
+            (job / "checkpoints").symlink_to(root / "outside", target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "escapes the job"):
+                remove_artifacts(job, ("notes.json", "checkpoints/notes"))
+
+            self.assertEqual(read_json(job / "notes.json"), {"keep": True})
+            self.assertEqual(read_json(root / "outside/notes/ch001.json"), {"keep": True})
+
     def test_resume_and_input_invalidation(self):
         with tempfile.TemporaryDirectory() as temporary:
             job = Path(temporary)

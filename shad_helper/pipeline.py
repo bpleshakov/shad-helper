@@ -56,7 +56,7 @@ def run_pipeline(media: list[Path], out: Path, state_dir: Path, *, language: str
                 raise RuntimeError(f"Notes require manual completion: {result}")
             stage = "render"
             print(f"{label}: {stage}", flush=True)
-            pdf = render(job)
+            pdf = render(job, rebuild=True) if rebuild else render(job)
             stage = "anki"
             print(f"{label}: {stage}", flush=True)
             package = generate_anki(job, state_dir, pdf=pdf, rebuild=rebuild, proxy=proxy,

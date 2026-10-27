@@ -503,6 +503,7 @@ class RenderingTests(unittest.TestCase):
 
         def compiler(arguments, *, cwd, env, stdout, **kwargs):
             self.assertIn("-norc", arguments)
+            self.assertNotIn("-gg", arguments)
             self.assertIn("-latexoption=-no-shell-escape", arguments)
             self.assertEqual(env["openin_any"], "p")
             (cwd / "main.pdf").write_bytes(b"mocked compiler output")
@@ -517,6 +518,43 @@ class RenderingTests(unittest.TestCase):
         self.assertTrue(report["draft"])
         self.assertEqual(len(report["overfull"]), 1)
         self.assertEqual(len(report["missing_glyphs"]), 1)
+
+    def test_rebuild_forces_clean_compilation_of_unchanged_sources(self):
+        root, _ = self.project()
+        original = (root / "main.tex").read_bytes()
+        for extension in ("pdf", "aux", "fdb_latexmk"):
+            (root / f"main.{extension}").write_bytes(b"cached output")
+
+        def compiler(arguments, *, cwd, stdout, **kwargs):
+            self.assertIn("-gg", arguments)
+            self.assertIn("-norc", arguments)
+            self.assertIn("-latexoption=-no-shell-escape", arguments)
+            self.assertEqual(cwd, root.resolve())
+            (cwd / "main.pdf").write_bytes(b"rebuilt output")
+            return subprocess.CompletedProcess(arguments, 0)
+
+        with patch.object(rendering.shutil, "which", return_value="/bin/test"), \
+                patch.object(rendering.subprocess, "run", side_effect=compiler) as run, \
+                patch.object(rendering, "_qa", return_value=1), \
+                patch("shad_helper.pdf_sources.write_source_map"):
+            self.assertEqual(rendering.render(self.job, rebuild=True), root / "main.pdf")
+
+        run.assert_called_once()
+        self.assertEqual((root / "main.tex").read_bytes(), original)
+        self.assertEqual((root / "main.pdf").read_bytes(), b"rebuilt output")
+
+    def test_rebuild_rejects_symlinked_compiler_artifact_before_running_latex(self):
+        root, _ = self.project()
+        outside = self.job / "outside.aux"
+        outside.write_text("keep")
+        (root / "main.aux").symlink_to(outside)
+
+        with patch.object(rendering.subprocess, "run") as compiler, \
+                self.assertRaisesRegex(rendering.RenderError, "symbolic links"):
+            rendering.render(self.job, rebuild=True)
+
+        compiler.assert_not_called()
+        self.assertEqual(outside.read_text(), "keep")
 
     def test_manual_evidence_reference_is_rejected(self):
         root, manifest = self.project()

@@ -61,8 +61,10 @@ never used in its place. The final summary reports completed/failed jobs, and th
 command exits with status 1 if any job failed.
 
 The extraction options `--start`, `--duration`, `--language`, and `--vision-model`
-apply to every input. `--rebuild` regenerates notes and Anki model responses;
-otherwise existing stage checkpoints are reused. Rerunning the full pipeline
+apply to every input. `--rebuild` clears each notes/Anki stage's generated files,
+caches, and diagnostics before that stage starts, including the Anki deck identity,
+then regenerates them and compiles the PDF from scratch. Otherwise existing stage
+checkpoints are reused. Rerunning the full pipeline
 regenerates the editable TeX sources, so use the individual commands to retain
 manual TeX corrections. `--anki-collection` selects the local Anki profile, and
 `--openai-proxy` and the global `--state-dir` work as for individual commands.
@@ -139,7 +141,7 @@ an unsuccessful frame remains explicitly `incomplete` and is retried on rerun.
 
 Version 3 audio and version 4/5 video jobs can be reused, including enabling or
 disabling vision in an existing supported job. Older formats require a **new
-output directory** and are rejected before changing their files. Re-extraction
+output directory**; extraction rejects them before changing their files. Re-extraction
 preserves existing notes/PDFs, but changed evidence requires regenerating notes
 before rendering. A fatal vision error preserves the completed transcript and
 audio evidence and returns an error; rerun the extraction to complete video.
@@ -161,7 +163,17 @@ Every app-owned OpenAI request requires an explicit HTTP/HTTPS proxy:
 export SHAD_HELPER_OPENAI_PROXY=http://127.0.0.1:7890
 UV_CACHE_DIR=.cache/uv uv run shad-helper login
 UV_CACHE_DIR=.cache/uv uv run shad-helper notes jobs/audio-lecture
+# Process several projects sequentially:
+UV_CACHE_DIR=.cache/uv uv run shad-helper notes jobs/lecture-1 jobs/lecture-2
+# Regenerate every project's notes and illustrations, then rebuild its PDF:
+UV_CACHE_DIR=.cache/uv uv run shad-helper notes jobs/lecture-1 jobs/lecture-2 --rebuild
 ```
+
+Multiple projects run in the supplied order. A failed project or an automatic
+generation that requires manual completion is reported; later projects still run.
+The batch prints a summary and exits with status 1 if any project failed.
+Repeated destinations, including symlink aliases, are rejected before work starts.
+`--manual` exports a handoff for each project; `--import` requires one project.
 
 Alternatively, pass `--openai-proxy URL` before the command or after
 `doctor`/`login`/`notes`/`anki`/`run`. The flag overrides the environment variable.
@@ -175,13 +187,14 @@ keep localhost direct for the OAuth callback. This app's protected credentials
 live in `.shad-helper/auth`. Change the location with `--state-dir PATH` before
 the command name.
 
-Automatic synthesis checks account availability of `gpt-6.1-sol` and requests
-`high` reasoning effort through the authorized ChatGPT-plan integration.
+Automatic synthesis checks account availability of `gpt-6-astra` and requests
+`max` reasoning effort through the authorized ChatGPT-plan integration.
 Each failed chapter request or invalid reply gets three retries after the initial
 attempt, waiting 5, 10, and 20 seconds. Completed chapters remain cached.
 Unavailable access or failure after all four attempts exports a manual handoff.
 
 The app uses `outline.json`, or creates consecutive fifteen-minute chapters.
+`notes --rebuild` deletes the saved outline and starts from the default plan.
 Each request contains one chapter, neighboring speech and visual context, a
 shared glossary, and the broad topic names used in preceding replies. Speech
 inputs contain only `id`, `start`, `end`, and `text`.
@@ -294,8 +307,24 @@ Transcription warnings are informational: inspect or correct them before notes
 when needed. They are ignored by note generation rather than carried into review.
 
 Outputs are `notes.json`, `review.json`, and editable `notes/` LaTeX sources.
-`notes` regenerates the project; `--rebuild` invalidates synthesis checkpoints.
-Keep manual TeX edits for the subsequent `render` step.
+`notes` regenerates the project. `--rebuild` first deletes `notes/`, `notes.json`,
+`review.json`, `outline.json`, the entire `handoff/` including old run archives,
+`checkpoints/notes/`, `checkpoints/notes_candidates/`, `checkpoints/notes_final/`,
+`illustration-crops/`, and `illustration-verification/`. This happens before job
+compatibility or input validation and before model calls. Manual TeX edits, the
+old PDF, and custom outline changes in these paths are removed. A failed rebuild
+does not restore any deleted files.
+Extraction artifacts and checkpoints, original illustrations, and the explicit
+`review-resolutions.json` correction ledger remain unchanged. Successful synthesis
+creates fresh checkpoints and forces PDF compilation, QA, and source maps; each
+project's PDF finishes before the next project starts. Later normal runs can reuse
+the fresh checkpoints.
+With `--import --rebuild`, imported notes are rendered after import. Copy replies
+outside the cleared paths first: an import from `JOB/notes.json` or `JOB/handoff/`
+would be deleted before it is read. Directory imports use the freshly defaulted
+outline; a complete lecture JSON import can restore its custom chapter plan.
+`--manual --rebuild` performs the same cleanup and exports a fresh handoff.
+Keep manual TeX edits for subsequent ordinary `render` commands.
 
 Automatic generation compiles each chapter locally with the final notes preamble
 before saving its synthesis checkpoint. This requires `latexmk` and LuaLaTeX.
@@ -307,25 +336,30 @@ are regenerated once; successfully checked chapters are reused on later runs.
 
 Every `notes` run saves a handoff, including successful automatic generation,
 cache reuse, and imports. `handoff/inputs/` contains the current chapter prompts,
-contexts, and response schema. Each run also gets a separate archive under
-`handoff/runs/<run ID>/`, whose path is printed when the command starts:
+contexts, and response schema. Current diagnostics are saved directly under
+`handoff/`, whose path is printed when the command starts:
 
-- `inputs/`, `README.txt`, and `outline.json`: the run's handoff and chapter plan;
+- `inputs/`, `README.txt`, and `outline.json`: the current handoff and chapter plan;
   automatic contexts include the actual glossary and topic names accumulated before each chapter.
 - `run.json` and `chapters.json`: run mode/result and generated versus cached chapters.
 - `requests/<chapter ID>/attempt-01/call.json`: instructions, exact context string,
   application response schema, and model for each generation attempt.
 - `http-*.request.json` and `http-*.body.json` within each attempt: request method/URL
   and exact outgoing JSON bytes, including model settings and the API-normalized schema.
+- `verification/` and `figure-reconciliation/`: current illustration checks and
+  consolidation diagnostics.
 
 Requests are saved before transmission, including retries and failed parent
 requests that lead to chapter splitting. If saving fails, the request is not sent.
 Manual export makes no model calls. Cached reconstruction/consolidation verdicts
 are reused, but imported drawings and new consolidation decisions require visual
-verification. Earlier
-run archives survive later runs and `--rebuild`. Authentication headers, tokens,
-proxy credentials, and OAuth exchanges are excluded. A run that fails before
-inputs can be prepared still has a failed `run.json` record.
+verification. Each ordinary `notes` invocation replaces the generated handoff inputs
+and current diagnostics while retaining existing `handoff/runs/` archives and
+unrelated operator files. `--rebuild` removes the entire handoff directory first.
+No new run archives are created. Authentication
+headers, tokens, proxy credentials, and OAuth exchanges are excluded. Failures
+after the job compatibility check receive a failed `run.json`; cleanup or
+compatibility failures can leave no current handoff record.
 
 ## Manual ChatGPT workflow
 
@@ -358,8 +392,8 @@ be imported with `--import response.json`. Automatic and manual responses use
 the same schema and evidence validation. Imports undergo the same illustration
 verification as automatic notes; unavailable verification preserves source crops
 and flags them for review. Inputs, candidates, comparison requests, previews and
-accepted results remain in local archives. Transient verification failures retry
-on rerun without regenerating cached candidate chapters.
+accepted results are saved in the current handoff diagnostics. Transient
+verification failures retry on rerun without regenerating cached candidate chapters.
 
 ## Review and render PDF
 
@@ -425,14 +459,23 @@ After checking and rendering the notes, run:
 
 ```sh
 UV_CACHE_DIR=.cache/uv uv run shad-helper anki jobs/audio-lecture
+# Process several projects sequentially:
+UV_CACHE_DIR=.cache/uv uv run shad-helper anki jobs/lecture-1 jobs/lecture-2 jobs/lecture-3
 # Use a separately edited PDF:
 UV_CACHE_DIR=.cache/uv uv run shad-helper anki jobs/audio-lecture --pdf notes.pdf
 # Select a profile when more than one Anki collection exists:
 UV_CACHE_DIR=.cache/uv uv run shad-helper anki jobs/audio-lecture --anki-collection '/path/to/collection.anki2'
 ```
 
+With multiple project directories, `anki` processes them one at a time in the
+supplied order, saving each deck in its own `JOB/anki/` directory. It continues
+after a project fails, prints a completion summary, and exits with status 1 if
+any project failed. Options apply to every project; `--pdf` requires a single
+project. Repeated destinations, including symlink aliases, are rejected before
+generation starts.
+
 The default input is `JOB/notes/main.pdf`. The command sends the complete PDF to
-`gpt-6.1-sol` with high reasoning through the existing ChatGPT sign-in and explicit
+`gpt-6-astra` with max reasoning through the existing ChatGPT sign-in and explicit
 OpenAI proxy. It includes text and page images. For generated lecture PDFs it also
 sends a catalog of the saved note blocks and their PDF page ranges to identify
 sources. Figures reference their original figure block IDs: screenshots reuse
@@ -491,9 +534,9 @@ Later notes increment this position by one. Anki need not be running, but its
 collection must be readable; missing or ambiguous profiles require
 `--anki-collection`, and export never silently falls back to position 1.
 Positions reflect the collection at export time: with separate `anki` commands,
-import each deck before exporting the next one. `run` keeps position ranges
-separate across decks in the same batch. Regenerate packages if new cards were
-added in between export and import.
+import each deck before exporting the next one. `run` and multi-project `anki`
+keep position ranges separate across decks in the same batch. Regenerate packages
+if new cards were added in between export and import.
 In Anki's deck options, choose **New card gather order: Ascending position** and **New card sort
 order: Order gathered**. Sibling burying and daily limits may postpone cards;
 reviews continue to use Anki's scheduling. See the
@@ -519,12 +562,21 @@ then run `render JOB` and `anki JOB`.
 `JOB/anki/report.json` records the same per-card sources, note positions, model
 additions, warnings, and image coordinates. `JOB/anki/media/` contains figures and
 compiled formulas. The deck, JSON sidecars, and `sources.md` are published together;
-a failed export keeps the previous versions.
+a failed ordinary export keeps the previous versions.
 Successful generation is cached against the PDF bytes, block catalog, model, prompt and schema;
 a cached export needs no model request. Use `anki JOB --rebuild` to regenerate only this
-stage. Reimporting the same output creates no duplicates and preserves existing
+stage: before PDF, collection, or other input validation, it deletes the entire
+`JOB/anki/`, `JOB/checkpoints/anki.json`, and `JOB/diagnostics/anki/`. This removes
+the prior package, media, diagnostics, and saved deck identity. A rebuilt export
+gets a new deck identity and note GUIDs, so importing it creates a new deck and
+notes rather than updating the previous import. Failure cannot restore the old
+package. Validated generation writes a fresh checkpoint; a later packaging failure
+can leave that checkpoint reusable. Keep a custom `--pdf` outside these cleared
+paths, copying it beforehand if necessary. Notes, their PDF, and extraction
+artifacts remain unchanged.
+Reimporting the same output creates no duplicates and preserves existing
 positions, review progress and local template edits. It does not reposition cards
-already imported into Anki. Changing the PDF creates new note
+already imported into Anki. Without `--rebuild`, changing the PDF creates new note
 identities in the same job's deck; remove obsolete imported notes manually.
 
 Anki export tests include real imports into disposable collections, covering

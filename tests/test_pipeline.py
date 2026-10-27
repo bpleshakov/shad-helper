@@ -27,7 +27,7 @@ def stages(monkeypatch):
     calls = Mock()
     calls.extract.side_effect = lambda source, job, **kwargs: job / "evidence.json"
     calls.generate_notes.side_effect = lambda job, state, **kwargs: job / "notes" / "main.tex"
-    calls.render.side_effect = lambda job: job / "notes" / "main.pdf"
+    calls.render.side_effect = lambda job, **kwargs: job / "notes" / "main.pdf"
 
     def export(job, state, *, minimum_position, **kwargs):
         write_json(job / "anki" / "report.json", {
@@ -52,7 +52,7 @@ def test_runs_all_stages_for_each_file_and_forwards_options(media, stages, tmp_p
         expected.extend([
             call.extract(source, job, language="en", start=10, duration=30, vision_model="off"),
             call.generate_notes(job, state, rebuild=True, proxy="http://localhost:8080"),
-            call.render(job),
+            call.render(job, rebuild=True),
             call.generate_anki(job, state, pdf=job / "notes" / "main.pdf", rebuild=True,
                                proxy="http://localhost:8080", anki_collection=collection,
                                minimum_position=1 if index == 0 else 103),

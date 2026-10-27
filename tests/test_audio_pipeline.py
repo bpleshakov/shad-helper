@@ -107,15 +107,19 @@ def test_asr_input_changes_invalidate_checkpoint(tmp_path, monkeypatch, changed)
     assert transcribe.call_count == 2
 
 
-@pytest.mark.parametrize("operation", ["extract", "notes", "render", "resolve", "review"])
+@pytest.mark.parametrize("operation", [
+    "extract", "notes", "notes_rebuild", "render", "resolve", "review",
+])
 @pytest.mark.parametrize("with_config", [False, True])
 @pytest.mark.parametrize("version", [1, 2])
-def test_legacy_jobs_are_rejected_without_changes(tmp_path, operation, with_config, version, capsys):
+def test_legacy_jobs_are_rejected_with_cleanup_only_on_rebuild(
+        tmp_path, operation, with_config, version, capsys):
     data = ({"schema_version": 1, "video": {"duration": 120}, "segments": [],
              "visuals": [], "sources": [], "issues": []} if version == 1 else
             {**audio_evidence(), "schema_version": 2, "issues": [], "models": {"asr": "fake"}})
     write_json(tmp_path / "evidence.json", data)
     write_json(tmp_path / "checkpoints/notes/ch001.json", {"preserve": True})
+    write_json(tmp_path / "notes.json", {"preserve": "previous notes"})
     if with_config:
         write_json(tmp_path / "extraction-config.json",
                    {"vision_mode": "pages"} if version == 1 else
@@ -129,12 +133,16 @@ def test_legacy_jobs_are_rejected_without_changes(tmp_path, operation, with_conf
         with pytest.raises(ValueError, match="new output directory"):
             if operation == "extract":
                 extraction.extract(tmp_path / "lecture.wav", tmp_path)
-            elif operation == "notes":
-                notes.generate_notes(tmp_path, tmp_path / "auth", rebuild=True)
+            elif operation in ("notes", "notes_rebuild"):
+                notes.generate_notes(tmp_path, tmp_path / "auth",
+                                     rebuild=operation == "notes_rebuild")
             elif operation == "render":
                 rendering.render(tmp_path)
             else:
                 notes.resolve_issue(tmp_path, "issue1", "Checked")
+    if operation == "notes_rebuild":
+        before.pop(Path("checkpoints/notes/ch001.json"))
+        before.pop(Path("notes.json"))
     assert {path.relative_to(tmp_path): path.read_bytes()
             for path in tmp_path.rglob("*") if path.is_file()} == before
 
@@ -153,19 +161,31 @@ def test_unmarked_partial_job_is_not_overwritten(tmp_path):
 
 
 @pytest.mark.parametrize("manual", [False, True])
-def test_silent_extraction_cannot_generate_notes_or_clear_checkpoints(tmp_path, manual):
+@pytest.mark.parametrize("rebuild", [False, True])
+def test_silent_extraction_guard_clears_prior_outputs_only_on_rebuild(tmp_path, manual, rebuild):
     data = audio_evidence()
     data["segments"] = []
     write_json(tmp_path / "evidence.json", data)
-    write_json(tmp_path / "checkpoints/notes/ch001.json", {"preserve": True})
+    write_json(tmp_path / "extraction-config.json", AUDIO_CONFIG)
+    inputs = {tmp_path / name: (tmp_path / name).read_bytes()
+              for name in ("evidence.json", "extraction-config.json")}
+    previous = {tmp_path / "checkpoints/notes/ch001.json": {"preserve": True},
+                tmp_path / "notes.json": {"preserve": "previous notes"}}
+    for path, value in previous.items():
+        write_json(path, value)
     with pytest.raises(ValueError, match="No speech"):
-        notes.generate_notes(tmp_path, tmp_path / "auth", manual=manual, rebuild=True)
-    assert read_json(tmp_path / "checkpoints/notes/ch001.json") == {"preserve": True}
+        notes.generate_notes(tmp_path, tmp_path / "auth", manual=manual, rebuild=rebuild)
+    assert all(path.read_bytes() == value for path, value in inputs.items())
+    for path, value in previous.items():
+        if rebuild:
+            assert not path.exists()
+        else:
+            assert read_json(path) == value
     assert not (tmp_path / "outline.json").exists()
-    [run] = (tmp_path / "handoff/runs").iterdir()
+    run = tmp_path / "handoff"
     assert read_json(run / "run.json")["status"] == "failed"
     assert not (run / "inputs").exists()
-    assert not (tmp_path / "handoff/inputs").exists()
+    assert not (run / "runs").exists()
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
