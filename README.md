@@ -250,6 +250,16 @@ add commands from separately loaded packages; use `\operatorname{...}` for custo
 names. The existing file-access, shell-command, and macro-definition restrictions
 remain in effect. Commands must still be used in a valid LaTeX context.
 
+The shared allowlist also covers the public formula commands defined by core
+LaTeX's [`fontmath.ltx` (`fontdef.dtx`)](https://github.com/latex3/latex2e/blob/develop/base/fontdef.dtx),
+including `\sqcup`, `\sqcap`, the standard symbols, delimiters, and accents. TeX's
+eight math atom commands (`\mathord`, `\mathop`, `\mathbin`, `\mathrel`,
+`\mathopen`, `\mathclose`, `\mathpunct`, and `\mathinner`) are supported too.
+Neither `\mathbin` nor `\sqcup` requires an extra package. This does not enable
+all TeX primitives or LaTeX declarations; the same safety restrictions apply.
+The legacy symbols `\arrowvert`, `\Arrowvert`, and `\bracevert` are safe and render
+with Anki's preamble, but Notes' `unicode-math` package explicitly rejects them.
+
 Lecture blocks cite speech or visual evidence IDs. Questionable phrases or whole inline formulas are listed in
 `uncertain_fragments` with their exact text and supporting evidence IDs. The PDF
 colors only these fragments and adds one short `hh:mm:ss` footnote per affected
