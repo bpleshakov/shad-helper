@@ -111,7 +111,7 @@ class IllustrationCoverage(StrictModel):
     block_id: Identifier | Literal[""] = ""
     exclusion_reason: Literal[
         "", "decoration", "lecturer_or_clothing", "code_or_interface",
-        "text_or_formulas", "no_instructional_visual",
+        "text_or_formulas", "no_instructional_visual", "unresolved",
     ] = ""
 
     @model_validator(mode="after")

@@ -1,74 +1,96 @@
-# Illustration crop verification and repair
+# Illustration source selection, verification and publication
 
-## Scope and execution plan
+Notes generation sees candidate crops and up to four native context frames for
+ambiguous candidates. It chooses complete, readable representatives of each
+instructional drawing and preserves independently meaningful stages. Ordinary
+construction steps and scrolling fragments may share a representative; coverage
+still records every observation. Captions and adjacent prose explain the figure's
+specific teaching role. Automatic and manual handoffs use the same images.
 
-This change applies during notes finalization, after the notes model selects an
-illustration and before screenshot acceptance or TikZ reconstruction verification.
-Automatic notes and imported handoffs use the same finalization path. Candidate
-extraction and missing-illustration detection are outside its scope.
+## Source selection and bounded recovery
 
-Implementation order:
+Before refining an uncached crop, visually rank its native frame and up to six
+saved frames within 30 seconds, sampled near, midway and farther away on each
+side. Prefer a complete, sharp direct screen capture to a filmed projection of
+the same content. Projector lag can change parameters or drawing stages: similarity
+and temporal proximity do not establish identity. Selection uses existing frames;
+it does not extract new video frames or invent unseen content.
 
-1. Add independent verification of actual crop pixels and cheap warning checks.
-   Verify that bad crops cannot become successful managed refinements, while
-   heuristic warnings alone cannot reject a correct crop.
-2. Add at most two repairs after the initial proposal. Verify correction feedback,
-   nearby-frame provenance, same-stage checks, and the attempt limit.
-3. Integrate with screenshot/TikZ acceptance and existing caches. Verify stale
-   imported crops cannot bypass the check and failures preserve source evidence.
-4. Run focused illustration tests, then the project regression suite and lint.
+The original remains a fallback. An unavailable ranking may still publish an
+independently verified original, but records retry state instead of caching the
+ranking as complete. The initial crop proposal has at most two repairs. A repair
+uses concrete defects to recrop or try another ranked frame. Every alternate
+must independently preserve the exact figure, model/data condition and meaningful
+stage. Never crop away mathematical content to hide a lecturer.
 
-## Verification
+For printed figures clipped by a scrolling viewport, bounded recovery can align
+nearby frames by a vertical translation. The overlap must match informative pixels;
+static views, ambiguous alignment and changed content are rejected. The assembly
+keeps original pixels without scaling, drawing or blending. It is only a candidate:
+crop selection and independent verification still inspect both contributing frames.
 
-The verifier receives the unmarked native frame, a copy with the proposed box
-marked, the actual cropped PNG, and the intended figure caption/description.
-When another frame is used, it also receives the original native frame. It does
-not receive the crop selector's justification or earlier verdicts.
+## Independent verification and reconstruction
 
-It judges figure identity (including the intended drawing stage), completeness
-of integral labels/axes/legends/panels, readability/occlusion, and substantial
-unrelated content. Acceptance requires an explicit pass on every criterion.
-Failures and uncertainty include concrete defects and a repair recommendation.
+The verifier receives the unmarked native frame, a copy with proposed bounds,
+the actual cropped PNG, and the intended caption/description. An alternate also
+includes the original native frame. It does not receive the selector's reasoning.
+Checks cover identity, completeness, readability and cleanliness. Pixel checks
+for blank/thin content and suspicious boundaries remain advisory.
+The caption defines the intended panels. A complete named subset does not require
+every neighboring panel of the same notebook grid. Incidental mouse cursors are
+allowed if they obscure no instructional content. Tiny architecture details need
+to be legible when the explanation relies on them; an overview can use readable
+blocks and arrows to show sequence or branching.
 
-Cheap checks flag nearly uniform images, thin fragments, contact with the native
-frame edge, and varying content at crop boundaries that may indicate cut strokes
-or text. They are advisory signals for the verifier, not OCR, correctness proofs,
-or independent rejection rules. Every proposed crop receives visual verification.
+The purpose is explicit and part of the cache key:
 
-## Bounded repair
+- Screenshot publication requires complete, readable content without unrelated
+  interface elements, people, hands, fingers or held objects. An equivalent,
+  clearly better direct capture should replace an inferior projected view.
+- A reconstruction source may contain harmless surrounding clutter if all required
+  mathematical geometry, relationships and labels remain observable. Occluded or
+  missing mathematical content still fails.
 
-There are at most three proposals per finalization attempt: the initial crop and
-two repairs. A repair receives the previous crop and specific verification defects
-to expand or relocate its box. Source-frame clipping or occlusion can instead
-trigger selection of an existing nearby native frame.
+TikZ is rendered and compared independently to its verified source. A failed
+comparison or compilation gets one correction using the concrete defect, followed
+by another render and comparison. Only a pass accepts the reconstruction. A
+screenshot fallback must pass the stricter screenshot crop check separately;
+a crop accepted only for reconstruction cannot be reused directly for publication.
 
-Only the nearest available earlier and later distinct frames within 30 seconds
-are candidates, ordered by distance from the original timestamp. Recovery does
-not rerun vision or extract additional video frames. Temporal proximity is not
-proof of identity: the verifier must establish the same figure, model/data
-condition, and meaningful drawing stage against the original frame.
+## Publication, coverage and duplicates
 
-If no safe repair succeeds, preserve the original screenshot and an open review
-issue. Do not accept a TikZ reconstruction against an unverified source, reuse an
-incoming stale crop ID, or discard an explicitly selected figure. Transport and
-invalid-response failures retain the existing retry behavior. Exhausted semantic
-failures remain reviewable without requesting an unlimited retry loop.
+A verified screenshot or reconstruction can be published. All chapters are
+finalized together so later complete figures can rescue earlier observations.
+Transient verification failures trigger one automatic retry from the original
+candidates, reusing completed checks. After bounded recovery fails, original
+assets and candidate diagnostics retain `unresolved` coverage with an open issue
+for every affected observation. No manual-recovery messages are inserted into
+the notes. A native-frame finding of no instructional visual permits an explicit
+exclusion. An unresolved or excluded observation does not count as a recovered figure.
 
-## Assets, cache, and diagnostics
+Failed coverage matches try a bounded set of retained alternatives before
+creating another illustration, and recheck those alternatives after source repair.
+Earlier failures get another chance to reuse newly recovered complete figures.
+Final reconciliation also retrieves up to three
+plausible earlier figures by source identity, topic, description and time, including
+nonconsecutive figures and different topic wording. Only visual equivalence or
+containment can merge them; meaningful stages remain separate. References and
+coverage are remapped to the retained representative.
 
-Original frames, extracted observations, IDs, and source crops stay intact.
-Successful derivative records include original and selected frame provenance,
-actual crop hash, box, and the independent verification result. Cache inputs
-include target context, relevant frame hashes, prompts/schemas, model, and policy.
-Previously generated assets remain resolvable, but old refinement successes do
-not bypass the new verification policy during finalization.
+## Provenance and evaluation
 
-Attempt archives retain requests/responses, source and selected frames, proposed
-crops, marked boxes, heuristic warnings, and verification decisions. Only a
-verified proposal is published as a successful managed refinement.
+Original frames, observations and managed assets stay intact. Derivatives bind
+source hashes, selected frame, bounds, purpose and independent verification.
+Cache inputs include relevant frames, prompts/schemas, model and policy. Archives
+retain source selection, proposals, repairs, rendered reconstructions and verdicts.
+Scroll assemblies also bind both native source hashes, viewport and translation;
+their source pixels are reconstructed and checked when resolving a derivative.
+The relaxed crop policy can reuse a previous policy's independently verified pass
+only when all nonprompt inputs match. Failed decisions are checked again.
 
-Regression tests cover wrong neighboring figures, clipped labels, bounded repair,
-alternate-frame stage mismatch, verifier failure, cache invalidation, advisory
-warnings, stale imported crops, and exact preservation of original pixels/assets.
-Mocked model tests validate control flow and acceptance rules; they do not measure
-real model detection accuracy on lecture images.
+Regression tests exercise publication decisions, bounded repair, stage mismatch,
+cache invalidation, unresolved references and portable rendering. Mocked judgments
+test control flow; they do not establish real model accuracy. Use the
+[label benchmark](illustration-benchmark.md) to freeze human ratings and compare
+later outputs. Changed images require review; removed bad images do not count as
+fixes, and missing good figures and missing-illustration lectures remain separate.

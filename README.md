@@ -143,8 +143,11 @@ Version 3 audio and version 4/5 video jobs can be reused, including enabling or
 disabling vision in an existing supported job. Older formats require a **new
 output directory**; extraction rejects them before changing their files. Re-extraction
 preserves existing notes/PDFs, but changed evidence requires regenerating notes
-before rendering. A fatal vision error preserves the completed transcript and
-audio evidence and returns an error; rerun the extraction to complete video.
+before rendering. Extraction records completion in `extraction-status.json` and
+publishes `evidence.json` only after the required stages finish. A failed rerun
+preserves the previous complete evidence and saves partial speech evidence in
+`evidence.partial.json`. Notes reject incomplete extraction and video jobs whose
+evidence lacks the visual stage; resume extraction or explicitly select vision off.
 Silent extraction keeps inspectable artifacts; notes require speech, useful
 visual content, or an illustration candidate. Re-extract version 4 jobs to obtain
 version 5 crops; existing transcription and frame selection are reused.
@@ -270,8 +273,11 @@ be flagged rather than invented. Notebook visuals
 contribute theory, formulas and explanatory comments, not executable code.
 Drawings become editable TikZ/PGFPlots and undergo a separate visual comparison
 between the rendered drawing and its source crop. Only an explicit pass accepts
-the reconstruction. Uncertain, failed, uncompilable, or unverifiable drawings use
-the source crop and create a review issue; slide illustrations use crops directly.
+the reconstruction. A failed reconstruction gets one correction using the verified
+source and concrete visual/compiler defect, then a fresh render and comparison.
+A source may contain harmless surrounding clutter when its required mathematical
+content is fully visible. Screenshot publication has stricter cleanliness checks;
+a failed reconstruction must pass those checks separately before using its crop.
 Completed drawings and meaningful intermediate stages are preserved. The notes
 model first checks candidate pixels: logos, decoration, lecturer/clothing, code/UI,
 and handwriting or formulas without a figure are excluded with an explicit reason.
@@ -285,10 +291,14 @@ Failed matches try already retained alternatives before adding another screensho
 An automatic fallback is excluded only when native-frame inspection explicitly
 finds no meaningful figure content, such as plot headings with only a thin edge.
 The observation stays in the evidence, with an exclusion decision and a review
-issue. Partial drawings with meaningful content, uncertain crops and unavailable
-inspection still retain their screenshot fallback.
-Transient comparison failures are retried. A final comparison of neighboring
-figures within each topic also consolidates independently generated duplicates,
+issue. All chapter candidates are finalized together, so complete figures from
+later chapters can rescue earlier observations. Repaired crops are compared again
+against accepted alternatives before adding a screenshot. Unavailable verification
+is retried automatically from the original candidates. If bounded recovery still
+fails, source assets and diagnostics retain `unresolved` coverage and an open
+issue; the notes contain no manual-recovery placeholders or dangling figure references.
+A final comparison retrieves up to three plausible earlier figures by source, topic and description, including
+nonconsecutive figures and differently worded topics. It consolidates verified duplicates,
 preferring a complete view over an unfinished drawing or partially visible plot.
 Distinct teaching stages remain separate; uncertain matches retain both figures.
 Selected figures are cropped again from their native frames: include the complete
@@ -298,15 +308,25 @@ During notes finalization, each proposed crop undergoes cheap checks for blank o
 thin content and suspicious boundaries, followed by an independent visual check
 of the actual crop against the native frame and intended figure. The checks cover
 identity and drawing stage, completeness, readability, and unrelated content;
-heuristic warnings alone never reject a crop. Failed crops get at most two repair
-attempts, including the nearest saved frame on either side within 30 seconds when
-the original frame is clipped or occluded. An alternate frame must preserve the
-same figure and stage. Only visually verified crops are reused as successful
-refinements or accepted as sources for LaTeX verification. Unresolved crops retain
-their original screenshot and a review issue. See [crop verification](docs/illustration-crops.md)
+heuristic warnings alone never reject a crop. Before cropping, a bounded visual
+selection ranks the original and up to six saved frames spanning 30 seconds on
+either side. Prefer sharp direct capture to a filmed projection of the same
+state; projector lag must not change the selected parameters or drawing stage.
+Completeness is checked against the intended caption: complete named panels do
+not require neighboring panels of a scrolling notebook. A harmless mouse cursor
+does not invalidate a readable screenshot. For figures taller than the viewport,
+matching scroll views can be joined using their original pixels and independently
+verified against both source frames before publication.
+Failed crops get at most two repairs. Every alternate is independently verified.
+Hands, fingers and held objects are excluded from published screenshots without
+cropping away the figure. The notes model also receives up to four native context
+frames for ambiguous candidates and selects complete representatives before
+reconstructing their meaningful stages. See [crop verification](docs/illustration-crops.md)
 for the repair limits, saved diagnostics, and validation plan.
 Refined crops are separate managed assets; original frames and evidence stay intact.
 Actual illustrations are never discarded to satisfy the editorial page target.
+Use the [label benchmark](docs/illustration-benchmark.md) to freeze reviewed outputs
+and compare later runs without treating removed or changed bad images as fixes.
 Ordinary source citations create no footnotes; only marked uncertainty does.
 The PDF has a compact title followed by topical sections, and no review
 appendix. Review issues remain available in the JSON files and through `review`.

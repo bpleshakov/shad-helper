@@ -334,6 +334,41 @@ needs_tex = pytest.mark.skipif(not shutil.which("latexmk") or not shutil.which("
 
 
 @needs_tex
+def test_unresolved_figure_stays_in_diagnostics_without_recovery_text_or_bad_pixels(
+        illustrated_job, monkeypatch):
+    from shad_helper import illustration_verification
+    from shad_helper import notes as notes_module
+
+    job, evidence, notes = illustrated_job
+    chapter = notes["chapters"][0]
+    chapter["blocks"][0]["evidence_ids"].append("frame_1_ill01")
+    chapter["illustration_coverage"] = [
+        {"illustration_id": "frame_1_ill01", "block_id": "ch001_b1"}]
+    chapter["blocks"].insert(0, {"id": "explanation", "kind": "text", "content": "Связь на графике.",
+                                 "evidence_ids": ["frame_1"], "figure_refs": ["ch001_b1"]})
+    original = (job / "illustrations/frame_1_ill01.png").read_bytes()
+    monkeypatch.setattr(illustration_verification, "refine_crop",
+                        lambda *args: ("", False, "Подпись закрыта рукой.", False))
+    accepted, retry = illustration_verification.finalize_illustrations(
+        notes, evidence, job, job / "verification", None)
+    accepted = notes_module.validate_notes(accepted, evidence, finalized=True)
+    assert not retry and accepted["chapters"][0]["blocks"][0]["figure_refs"] == []
+    assert accepted["chapters"][0]["illustration_coverage"] == [
+        {"illustration_id": "frame_1_ill01", "block_id": "", "exclusion_reason": "unresolved"}]
+    assert any(issue["status"] == "open" and "frame_1_ill01" in issue["evidence_ids"]
+               for issue in accepted["issues"])
+    rendering.write_project(job, accepted)
+    pdf = rendering.render(job)
+    with pymupdf.open(pdf) as document:
+        text = unicodedata.normalize("NFKC", "\n".join(page.get_text() for page in document))
+        assert "требует восстановления" not in text
+        assert "Связь на графике." in text
+        assert not any(page.get_images() for page in document)
+    assert (job / "illustrations/frame_1_ill01.png").read_bytes() == original
+    assert read_json(job / "notes/project.json")["image_files"] == []
+
+
+@needs_tex
 @pytest.mark.parametrize("refined", [False, True])
 def test_cropped_screenshot_pdf_is_portable_and_keeps_manual_edits(
         illustrated_job, refined_crop, refined):

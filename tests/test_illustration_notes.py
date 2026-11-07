@@ -6,7 +6,7 @@ from PIL import Image
 
 from shad_helper import notes, rendering
 from shad_helper.illustrations import materialize_illustrations
-from shad_helper.jobs import read_json, write_json
+from shad_helper.jobs import read_json, sha256_file, write_json
 
 
 @pytest.fixture(autouse=True)
@@ -313,8 +313,10 @@ def test_more_than_24_unique_images_stay_in_one_chapter(tmp_path, duration, coun
     assert read_json(tmp_path / "outline.json") == outline
 
 
-def test_unavailable_verification_falls_back_then_retries_cached_candidate(tmp_path, monkeypatch):
-    prepare(tmp_path, source_kind="drawn")
+@pytest.mark.parametrize("imported", [False, True])
+def test_unavailable_verification_retries_automatically_without_regenerating_notes(
+        tmp_path, monkeypatch, imported):
+    evidence = prepare(tmp_path, source_kind="drawn")
     def preview(content, folder):
         folder.mkdir(parents=True, exist_ok=True)
         target = folder / "preview.png"
@@ -322,17 +324,95 @@ def test_unavailable_verification_falls_back_then_retries_cached_candidate(tmp_p
         return target
     monkeypatch.setattr(rendering, "render_diagram_preview", preview)
     client = Client(drawn=True, fail_once=True)
-    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    kwargs = {}
+    if imported:
+        context = notes.chapter_context(evidence, notes.default_outline(evidence)["chapters"][0])
+        write_json(tmp_path / "reply.json", chapter_reply(context, drawn=True))
+        kwargs["imported"] = tmp_path / "reply.json"
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client, **kwargs)
     first = read_json(tmp_path / "notes.json")
-    assert first["chapters"][0]["blocks"][0]["kind"] == "screenshot"
-    assert first["issues"] and not read_json(tmp_path / "review.json")["ready"]
-    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
-    second = read_json(tmp_path / "notes.json")
-    assert second["chapters"][0]["blocks"][0]["kind"] == "diagram"
-    assert not second["issues"]
-    assert len(client.calls) == 1 and client.verifications == 2
-    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    assert first["chapters"][0]["blocks"][0]["kind"] == "diagram"
+    assert not first["issues"] and read_json(tmp_path / "review.json")["ready"]
+    assert read_json(tmp_path / "handoff/verification/status.json") == {
+        "attempts": 2, "retry_needed": False}
+    assert len(client.calls) == (0 if imported else 1) and client.verifications == 2
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client, **kwargs)
     assert client.verifications == 2
+    assert read_json(tmp_path / "handoff/verification/status.json")["attempts"] == 1
+
+
+def test_verifier_outage_has_bounded_automatic_retry(tmp_path, monkeypatch):
+    prepare(tmp_path, source_kind="drawn")
+    monkeypatch.setattr(rendering, "render_diagram_preview",
+                        lambda content, folder: tmp_path / "illustrations/f0_ill01.png")
+
+    class Unavailable(Client):
+        def complete(self, instructions, text, schema=None, *, images=None):
+            if "verdict" in schema.get("properties", {}):
+                self.verifications += 1
+                raise RuntimeError("Verifier unavailable")
+            return super().complete(instructions, text, schema, images=images)
+
+    client = Unavailable(drawn=True)
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    assert len(client.calls) == 1 and client.verifications == 2
+    assert read_json(tmp_path / "handoff/verification/status.json") == {
+        "attempts": 2, "retry_needed": True}
+
+
+def test_automatic_finalization_can_reuse_a_complete_figure_from_a_later_chapter(
+        tmp_path, monkeypatch):
+    evidence = prepare(tmp_path, times=(10, 130), duration=240)
+    write_json(tmp_path / "outline.json", notes.default_outline(evidence, chunk_seconds=120))
+    monkeypatch.setattr("shad_helper.illustration_verification.refine_crop",
+                        lambda job, evidence, block, *args: (
+                            "", False, "Рисунок обрезан." if block["illustration_id"] == "f0_ill01"
+                            else "", False))
+
+    class Referenced(Client):
+        def complete(self, instructions, text, schema=None, *, images=None):
+            reply = super().complete(instructions, text, schema, images=images)
+            if "chapters" in reply:
+                chapter = reply["chapters"][0]
+                figure = chapter["blocks"][0]
+                chapter["blocks"].append({"id": chapter["id"] + "_explanation", "kind": "text",
+                                           "content": "Связи показаны на рисунке.",
+                                           "evidence_ids": [figure["illustration_id"]],
+                                           "figure_refs": [figure["id"]]})
+            return reply
+
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=Referenced())
+    result = notes.validate_notes(read_json(tmp_path / "notes.json"), evidence, finalized=True)
+    first, second = result["chapters"]
+    target = next(block["id"] for block in second["blocks"] if block.get("illustration_id"))
+    assert all(not block.get("illustration_id") for block in first["blocks"])
+    assert first["illustration_coverage"][0]["block_id"] == target
+    assert first["blocks"][0]["figure_refs"] == [target]
+    assert all(block["kind"] != "uncertain" for chapter in result["chapters"]
+               for block in chapter["blocks"])
+
+
+def test_reconciliation_retries_original_figures_once(tmp_path, monkeypatch):
+    from copy import deepcopy
+
+    prepare(tmp_path, times=(10, 20))
+    seen = []
+
+    def reconcile(candidate, *args):
+        result = deepcopy(candidate)
+        chapter = result["chapters"][0]
+        seen.append(len(chapter["blocks"]))
+        if len(seen) == 1:
+            chapter["blocks"].pop()
+            chapter["illustration_coverage"][1]["block_id"] = chapter["blocks"][0]["id"]
+        return result, True
+
+    monkeypatch.setattr("shad_helper.illustration_verification.reconcile_illustrations", reconcile)
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=Client())
+    assert seen == [2, 2]
+    assert len(read_json(tmp_path / "notes.json")["chapters"][0]["blocks"]) == 2
+    assert read_json(tmp_path / "handoff/figure-reconciliation/status.json") == {
+        "attempts": 2, "retry_needed": True}
 
 
 def test_rebuild_refreshes_visual_caches_and_preserves_stage_inputs(tmp_path, monkeypatch):
@@ -356,7 +436,7 @@ def test_rebuild_refreshes_visual_caches_and_preserves_stage_inputs(tmp_path, mo
     before = {path: path.read_bytes() for path in preserved}
     stale = [tmp_path / folder / "stale.json" for folder in (
         "checkpoints/notes", "checkpoints/notes_candidates", "checkpoints/notes_final",
-        "illustration-crops", "illustration-verification")]
+        "illustration-crops", "illustration-verification", "illustration-stitches")]
     for path in stale:
         write_json(path, {"stale": True})
 
@@ -410,3 +490,198 @@ def test_crop_content_change_invalidates_candidate_cache(tmp_path):
     prepare(tmp_path, identical=True)
     notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
     assert len(client.calls) == 2
+
+
+def add_native_frames(job, evidence):
+    evidence["media"]["sha256"] = "a" * 64
+    folder = job / "frames"
+    folder.mkdir(exist_ok=True)
+    paths = []
+    for number, visual in enumerate(evidence["visuals"]):
+        path = folder / f"{visual['id']}_{'a' * 12}.png"
+        Image.new("RGB", (160, 100), (20 + number, 80, 140)).save(path)
+        paths.append(path)
+    write_json(job / "evidence.json", evidence)
+    return paths
+
+
+def test_native_context_is_bounded_without_dropping_candidate_images(tmp_path):
+    evidence = prepare(tmp_path, times=(10, 20, 30, 40, 50, 60))
+    add_native_frames(tmp_path, evidence)
+    context = notes.chapter_context(evidence, notes.default_outline(evidence)["chapters"][0])
+    images = notes._chapter_images(tmp_path, evidence, context)
+    assert [label for label, _ in images[:6]] == [f"f{i}_ill01" for i in range(6)]
+    assert [label for label, _ in images[6:]] == [
+        f"SOURCE_FRAME f{i} (context only)" for i in range(4)]
+
+
+@pytest.mark.parametrize("kind,box,expected", [
+    ("drawn", [0.2, 0.2, 0.6, 0.6], True),
+    ("unknown", [0.2, 0.2, 0.6, 0.6], True),
+    ("printed", [0, 0, 1, 1], True),
+    ("printed", [0.1, 0.3, 0.6, 0.4], True),
+    ("printed", [0.2, 0.2, 0.6, 0.6], False),
+])
+def test_native_context_only_for_ambiguous_candidates(tmp_path, kind, box, expected):
+    evidence = prepare(tmp_path, source_kind=kind)
+    evidence["visuals"][0]["illustrations"][0]["box"] = box
+    add_native_frames(tmp_path, evidence)
+    context = notes.chapter_context(evidence, notes.default_outline(evidence)["chapters"][0])
+    assert len(notes._chapter_images(tmp_path, evidence, context)) == 1 + expected
+
+
+def test_native_context_attachments_match_manual_export_and_bind_actual_pixels(tmp_path):
+    evidence = prepare(tmp_path)
+    [frame] = add_native_frames(tmp_path, evidence)
+    client = Client()
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    [(_, images)] = client.calls
+    records = read_json(tmp_path / "handoff/inputs/ch001/images.json")
+    assert records[1] == {
+        "illustration_ids": [], "visual_id": "f0", "role": "source_frame",
+        "label": "SOURCE_FRAME f0 (context only)", "file": "images/source-frame-f0.png",
+        "sha256": sha256_file(frame)}
+    assert images[1] == (records[1]["label"], frame.read_bytes())
+    notes.generate_notes(tmp_path, tmp_path / "auth", manual=True)
+    manual_records = read_json(tmp_path / "handoff/inputs/ch001/images.json")
+    assert manual_records == records
+    exported = tmp_path / "handoff/inputs/ch001" / records[1]["file"]
+    assert exported.read_bytes() == frame.read_bytes()
+
+
+def test_native_frame_pixel_change_invalidates_notes_candidate_cache(tmp_path):
+    evidence = prepare(tmp_path)
+    [frame] = add_native_frames(tmp_path, evidence)
+    client = Client()
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    assert len(client.calls) == 1
+    evidence_bytes = (tmp_path / "evidence.json").read_bytes()
+    Image.new("RGB", (160, 100), "green").save(frame)
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    assert len(client.calls) == 2
+    assert (tmp_path / "evidence.json").read_bytes() == evidence_bytes
+    assert client.calls[1][1][1][1] == frame.read_bytes()
+
+
+def test_missing_native_frames_keep_portable_crop_attachments(tmp_path):
+    evidence = prepare(tmp_path, source_kind="drawn")
+    [frame] = add_native_frames(tmp_path, evidence)
+    frame.unlink()
+    context = notes.chapter_context(evidence, notes.default_outline(evidence)["chapters"][0])
+    assert [label for label, _ in notes._chapter_images(tmp_path, evidence, context)] == ["f0_ill01"]
+
+
+def test_native_context_counts_toward_the_existing_image_budget(tmp_path, monkeypatch):
+    from shad_helper import openai_client
+
+    evidence = prepare(tmp_path)
+    [frame] = add_native_frames(tmp_path, evidence)
+    outline = notes.default_outline(evidence)
+    context = notes.chapter_context(evidence, outline["chapters"][0])
+    crop = tmp_path / "illustrations/f0_ill01.png"
+    limit = 4 * ((crop.stat().st_size + 2) // 3)
+    monkeypatch.setattr(openai_client, "MAX_IMAGE_ENCODED_BYTES", limit)
+    assert "image attachments" in notes._chapter_budget_error(
+        context, outline, [], job=tmp_path, evidence=evidence)
+    frame.unlink()
+    assert notes._chapter_budget_error(context, outline, [], job=tmp_path, evidence=evidence) is None
+
+
+def test_notes_entry_rejects_audio_only_evidence_for_video_job(tmp_path):
+    evidence = prepare(tmp_path)
+    evidence.pop("visuals")
+    evidence["schema_version"] = 3
+    evidence["segments"] = [{"id": "speech", "start": 0, "end": 120, "text": "Определение"}]
+    write_json(tmp_path / "evidence.json", evidence)
+    write_json(tmp_path / "extraction-config.json", {
+        "schema_version": 5, "pipeline": "audio_video", "vision_model": "35b"})
+    client = Client()
+    with pytest.raises(ValueError, match="Visual extraction is missing"):
+        notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    assert client.calls == []
+    assert not (tmp_path / "notes.json").exists()
+
+
+@pytest.mark.parametrize("missing", ["issue", "open_issue", "matching_id", None])
+def test_unresolved_coverage_retains_internal_issue_without_publishing_recovery_text(tmp_path, missing):
+    evidence = prepare(tmp_path, times=(10, 20))
+    context = notes.chapter_context(evidence, notes.default_outline(evidence)["chapters"][0])
+    reply = chapter_reply(context)
+    chapter = reply["chapters"][0]
+    chapter["illustration_coverage"][0].update(block_id="", exclusion_reason="unresolved")
+    chapter["illustration_coverage"][1]["exclusion_reason"] = ""
+    chapter["blocks"].pop(0)
+    reference = "f1_ill01" if missing == "matching_id" else "f0_ill01"
+    if missing != "issue":
+        reply["issues"] = [{"id": "pending_issue", "description": "Рисунок не восстановлен.",
+                            "evidence_ids": [reference],
+                            "status": "resolved" if missing == "open_issue" else "open",
+                            "resolution": "Проверено" if missing == "open_issue" else ""}]
+    if missing is None:
+        notes._validate_illustration_coverage(reply, evidence, [])
+        validated = notes.validate_notes(reply, evidence)
+        assert validated["chapters"][0]["illustration_coverage"][0]["exclusion_reason"] == "unresolved"
+        assert all(block["kind"] != "uncertain" for block in validated["chapters"][0]["blocks"])
+    else:
+        with pytest.raises(ValueError, match="requires an open review issue"):
+            notes._validate_illustration_coverage(reply, evidence, [])
+
+
+@pytest.mark.parametrize("complete_import,forward", [(True, True), (True, False), (False, False)])
+def test_import_unpublishes_shared_figure_without_dangling_chapter_references(
+        tmp_path, monkeypatch, complete_import, forward):
+    evidence = prepare(tmp_path, times=(10, 130), duration=240)
+    outline = notes.default_outline(evidence, chunk_seconds=120)
+    write_json(tmp_path / "outline.json", outline)
+    replies = [chapter_reply(notes.chapter_context(evidence, chapter))
+               for chapter in outline["chapters"]]
+    target_index, alias_index = (1, 0) if forward else (0, 1)
+    target = replies[target_index]["chapters"][0]["blocks"][0]["id"]
+    alias = replies[alias_index]["chapters"][0]
+    alias_id = alias["illustration_coverage"][0]["illustration_id"]
+    alias["blocks"] = [{"id": "explanation", "kind": "text", "content": "См. рисунок.",
+                         "evidence_ids": [alias_id], "figure_refs": [target]}]
+    alias["illustration_coverage"][0]["block_id"] = target
+    imported = tmp_path / ("final.json" if complete_import else "replies")
+    if complete_import:
+        write_json(imported, {**replies[0], "chapters": [
+            reply["chapters"][0] for reply in replies]})
+    else:
+        for reply in replies:
+            write_json(imported / (reply["chapters"][0]["id"] + ".json"), reply)
+    original = {path: path.read_bytes() for path in (tmp_path / "illustrations").glob("*.png")}
+    monkeypatch.setattr("shad_helper.illustration_verification.refine_crop",
+                        lambda *args, **kwargs: ("", False, "Рисунок закрыт рукой.", False))
+    compiled = []
+    monkeypatch.setattr(rendering, "validate_chapter_latex",
+                        lambda part, *args, **kwargs: compiled.append(part))
+    assert notes.generate_notes(tmp_path, tmp_path / "auth", imported=imported,
+                                client=Client()).exists()
+    result = notes.validate_notes(read_json(tmp_path / "notes.json"), evidence, finalized=True)
+    assert len(compiled) == 2
+    assert all(not block["figure_refs"] for chapter in result["chapters"]
+               for block in chapter["blocks"])
+    assert all(coverage["exclusion_reason"] == "unresolved" for chapter in result["chapters"]
+               for coverage in chapter["illustration_coverage"])
+    assert all(block["kind"] != "uncertain" for chapter in result["chapters"]
+               for block in chapter["blocks"])
+    assert result["issues"] and all(issue["status"] == "open" for issue in result["issues"])
+    assert not read_json(tmp_path / "review.json")["ready"]
+    assert all(path.read_bytes() == data for path, data in original.items())
+
+
+def test_imported_reply_directory_still_rejects_forward_figure_references(tmp_path):
+    evidence = prepare(tmp_path, times=(10, 130), duration=240)
+    outline = notes.default_outline(evidence, chunk_seconds=120)
+    write_json(tmp_path / "outline.json", outline)
+    replies = [chapter_reply(notes.chapter_context(evidence, chapter))
+               for chapter in outline["chapters"]]
+    first = replies[0]["chapters"][0]
+    first["blocks"] = []
+    first["illustration_coverage"][0]["block_id"] = replies[1]["chapters"][0]["blocks"][0]["id"]
+    for reply in replies:
+        write_json(tmp_path / "replies" / (reply["chapters"][0]["id"] + ".json"), reply)
+    with pytest.raises(ValueError, match="current or prior"):
+        notes.generate_notes(tmp_path, tmp_path / "auth", imported=tmp_path / "replies",
+                             client=Client())

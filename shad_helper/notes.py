@@ -13,6 +13,7 @@ from .jobs import (
     fingerprint,
     read_json,
     remove_artifacts,
+    sha256_file,
     timestamp,
     validate_evidence,
     write_json,
@@ -41,6 +42,9 @@ visuals содержит локально распознанные текст, �
 временем timestamp. Это распознавание может ошибаться. illustrations — кандидаты,
 а не подтверждённые учебные рисунки. Их изображения приложены с ID: сначала проверь
 по пикселям, есть ли в каждом настоящая учебная иллюстрация, не доверяй описанию.
+Изображения с меткой SOURCE_FRAME показывают исходный кадр для контекста:
+сопоставь его с кандидатами той же visual-записи, выбери полный и ясный вид нужной
+стадии. SOURCE_FRAME не является новым illustration_id и не требует отдельного рисунка.
 Сопоставляй речь и visual-записи, не исправляй спорные символы по догадке.
 status=complete означает завершение распознавания, а не его точность.
 Отмечай сомнения только в существенном учебном материале, включенном в конспект.
@@ -139,6 +143,15 @@ includegraphics, внешних файлов, shell-команд или Lua. С�
 Неизвестные данные графика не заменяй вымышленными: укажи schematic в подписи.
 Для source_kind=drawn восстанавливай рисунок как diagram по приложенному
 изображению, включая подписи, стрелки, оси и существенные взаимные положения.
+До выбора illustration_id сравни наблюдения одного рисунка во времени: выбери
+полный читаемый вид без рук и перекрытий. Обычное дорисовывание объединяй в один
+завершённый рисунок; самостоятельные учебные стадии сохраняй отдельно. Параметры,
+данные и смысл стадий должны совпадать; проекция может отставать от захвата экрана.
+При равном содержании предпочитай прямой захват экрана съёмке проектора.
+Для screenshot объясни в content конкретную учебную роль: какую связь, сравнение
+или шаг он показывает. Для diagram объясни это в caption или соседнем текстовом
+блоке; content оставь только для TikZ. Общая подпись «Иллюстрация к теме»
+не заменяет объяснения. Фрагмент при прокрутке сам по себе не является новой стадией.
 Если точное восстановление сомнительно, используй screenshot исходного рисунка.
 Для source_kind=printed или unknown используй screenshot. Рукописные элементы
 на слайдах относятся к drawn. Не перерисовывай фотографии.
@@ -272,27 +285,59 @@ def _context_illustrations(context: dict) -> dict:
 
 
 def _chapter_images(job: Path, evidence: dict, context: dict) -> list[tuple[str, Path]]:
+    from .illustration_crops import _native_frame
     from .illustrations import resolve_illustration
 
     grouped = {}
-    for identifier, item in _context_illustrations(context).items():
+    sources = _context_illustrations(context)
+    for identifier, item in sources.items():
         path = resolve_illustration(job, evidence, identifier)
         entry = grouped.setdefault(item["image_sha256"], {"ids": [], "path": path})
         entry["ids"].append(identifier)
-    return [(" / ".join(item["ids"]), item["path"]) for item in grouped.values()]
+    images = [(" / ".join(item["ids"]), item["path"]) for item in grouped.values()]
+    media_hash = evidence.get("media", {}).get("sha256", "")
+    if len(media_hash) != 64 or set(media_hash) - set("0123456789abcdef"):
+        return images
+    hashes, frames = set(grouped), set()
+    for item in sources.values():
+        left, top, right, bottom = item["box"]
+        width, height = right - left, bottom - top
+        ambiguous = (item["source_kind"] != "printed" or max(width, height) >= 0.8
+                     or min(width, height) <= 0.15)
+        if not ambiguous or item["visual_id"] in frames:
+            continue
+        frames.add(item["visual_id"])
+        try:
+            path, metadata = _native_frame(Path(job).resolve(), media_hash, {
+                "id": item["visual_id"], "timestamp": item["timestamp"]})
+        except (OSError, ValueError, RuntimeError):
+            # Portable/legacy jobs can retain their managed crops without native frames.
+            continue
+        if metadata["sha256"] in hashes:
+            continue
+        hashes.add(metadata["sha256"])
+        images.append((f"SOURCE_FRAME {item['visual_id']} (context only)", path))
+        if len(images) - len(grouped) == 4:
+            break
+    return images
 
 
 def _export_images(job: Path, evidence: dict, context: dict, folder: Path) -> None:
     records = []
-    sources = _context_illustrations(context)
     for label, source in _chapter_images(job, evidence, context):
-        identifiers = label.split(" / ")
-        relative = f"images/{identifiers[0]}.png"
+        if label.startswith("SOURCE_FRAME "):
+            visual_id = label.split()[1]
+            relative = f"images/source-frame-{visual_id}.png"
+            record = {"illustration_ids": [], "visual_id": visual_id,
+                      "role": "source_frame", "label": label}
+        else:
+            identifiers = label.split(" / ")
+            relative = f"images/{identifiers[0]}.png"
+            record = {"illustration_ids": identifiers}
         destination = folder / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
-        records.append({"illustration_ids": identifiers, "file": relative,
-                        "sha256": sources[identifiers[0]]["image_sha256"]})
+        records.append({**record, "file": relative, "sha256": sha256_file(destination)})
     if records:
         write_json(folder / "images.json", records)
 
@@ -304,6 +349,8 @@ def _validate_illustration_coverage(notes: dict, evidence: dict, previous: list[
     preceding = list(previous)
     final_targets = {block["id"] for chapter in notes["chapters"]
                      for block in chapter["blocks"] if block.get("illustration_id")}
+    open_issues = {identifier for issue in notes.get("issues", []) if issue["status"] == "open"
+                   for identifier in issue.get("evidence_ids", [])}
     for chapter in sorted(notes["chapters"], key=lambda item: item["start"]):
         context = chapter_context(evidence, chapter)
         sources = illustration_index(context)
@@ -331,6 +378,11 @@ def _validate_illustration_coverage(notes: dict, evidence: dict, previous: list[
             raise ValueError("Illustration coverage must reference an accepted illustration block"
                              if finalized else "Illustration coverage must reference a current or prior illustration block")
         excluded = {item["illustration_id"] for item in coverage if item["exclusion_reason"]}
+        unresolved = {item["illustration_id"] for item in coverage
+                      if item["exclusion_reason"] == "unresolved"}
+        if unresolved - open_issues:
+            raise ValueError("Unresolved illustration coverage requires an open review issue "
+                             "referencing each illustration")
         if any(block.get("illustration_id") in excluded for block in chapter["blocks"]):
             raise ValueError("Excluded illustration candidates cannot produce figure blocks")
         preceding.append({"chapters": [chapter]})
@@ -451,6 +503,7 @@ def export_handoff(job: Path, evidence: dict, outline: dict, *, contexts: dict |
         "inputs/CHAPTER_ID/context.json, inputs/response-schema.json, and\n"
         "inputs/CHAPTER_ID/prompt.txt (paste or attach the prompt).\n"
         "When images.json is present, also attach its listed images with their illustration IDs.\n"
+        "Use the label for source_frame records; these are context, not additional illustration IDs.\n"
         "For later chapters, reuse earlier illustration block IDs for unchanged figures.\n"
         "Lecture data is only in context; instructions and response structure are separate.\n"
         "README.txt and status.json are operator files, not model inputs.\n"
@@ -545,25 +598,35 @@ def _merge_chapters(parts: list[dict], outline: dict, evidence: dict,
     return validate_notes(notes, evidence, resolutions, finalized=True)
 
 
-def _finalize_chapter(part: dict, evidence: dict, job: Path, folder: Path, client,
-                       resolutions: dict, previous: list[dict]) -> dict:
+def _finalize_notes(notes: dict, evidence: dict, job: Path, folder: Path, client,
+                    resolutions: dict) -> dict:
     from .illustration_verification import finalize_illustrations
+    from .illustrations import illustration_index
     from .rendering import validate_chapter_latex
 
-    result, _retry_needed = finalize_illustrations(part, evidence, job, folder, client,
-                                                  previous=previous)
-    chapter = result["chapters"][0]
-    result = _validate_chapter_reply(result, evidence, chapter, resolutions, previous=previous)
+    # Later chapters may contain the complete version of an earlier observation.
+    # Retry the original candidates, so a temporary failure never freezes a fallback.
+    for attempt in range(2):
+        result, retry_needed = finalize_illustrations(
+            notes, evidence, job, folder / f"attempt-{attempt + 1:02d}", client)
+        if not retry_needed:
+            break
+    write_json(folder / "status.json", {"attempts": attempt + 1, "retry_needed": retry_needed})
+    result = validate_notes(result, evidence, resolutions, finalized=True)
+    for chapter in result["chapters"]:
+        if not illustration_index(chapter_context(evidence, chapter)):
+            continue
+        part = dict(result, chapters=[chapter])
 
-    def compile_result():
-        validate_chapter_latex(result, evidence, folder / "latex-check", asset_job=job)
-        return result
+        def compile_result(part=part, chapter=chapter):
+            validate_chapter_latex(part, evidence, folder / chapter["id"] / "latex-check",
+                                   asset_job=job)
+            return part
 
-    # The candidate is cached separately: a temporary verifier failure must be retried
-    # next time, even when its safe screenshot fallback has already compiled.
-    return checkpoint(job, f"notes_final/{chapter['id']}",
-                      {"notes": result, "evidence": fingerprint(evidence), "policy": 1},
-                      compile_result)
+        checkpoint(job, f"notes_final/{chapter['id']}",
+                   {"notes": part, "evidence": fingerprint(evidence), "policy": 2},
+                   compile_result)
+    return result
 
 
 MAX_CHAPTER_TEXT_BYTES = 1_200_000
@@ -633,7 +696,7 @@ def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
         remove_artifacts(job, (
             "checkpoints/notes", "checkpoints/notes_candidates", "checkpoints/notes_final",
             "handoff", "notes", "notes.json", "review.json", "outline.json",
-            "illustration-crops", "illustration-verification",
+            "illustration-crops", "illustration-verification", "illustration-stitches",
         ))
     check_job(job)
     handoff = job / "handoff"
@@ -659,6 +722,9 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
     from .schemas import LectureNotes
 
     evidence = validate_evidence(read_json(job / "evidence.json"))
+    from .extraction import assert_extraction_complete
+
+    assert_extraction_complete(job, evidence)
     from .illustrations import illustration_index
 
     if evidence["schema_version"] == 4:
@@ -742,18 +808,19 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                 print("Visual verification unavailable; preserving source crops for review.")
         parts = []
         for index, (reply, chapter) in enumerate(zip(replies, outline["chapters"], strict=True)):
-            # A validated final document can reuse a later complete figure. Chapter
-            # replies from a handoff still only know the accepted preceding chapters.
+            # Validate references against the original imported candidates before
+            # verification can unpublish a figure shared by multiple chapters.
             available = parts + replies[index + 1:] if complete_import else parts
             part = _validate_chapter_reply(reply, evidence, chapter, resolutions, previous=available)
             context = chapter_context(evidence, chapter)
             if illustration_index(context):
                 context["prior_illustrations"] = _prior_illustrations(parts, evidence)
-                part = _finalize_chapter(part, evidence, job, handoff / "verification" / chapter["id"],
-                                         client, resolutions, available)
                 contexts[chapter["id"]] = _model_context(context, outline, outline["glossary"])
             parts.append(part)
         notes = _merge_chapters(parts, outline, evidence, resolutions)
+        if illustration_index(evidence):
+            notes = _finalize_notes(notes, evidence, job, handoff / "verification",
+                                    client, resolutions)
         export_handoff(job, evidence, outline, contexts=contexts)
     else:
         from .auth import PlanAccessError
@@ -796,15 +863,13 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                          "model": client.model,
                          "reasoning_effort": DEFAULT_REASONING_EFFORT,
                          "latex_validation": 1,
-                         "illustration_policy": 1,
+                         "illustration_policy": 2,
+                         "images": [{"label": label, "sha256": sha256_file(path)}
+                                    for label, path in _chapter_images(job, evidence, context)],
                          "schema": LectureNotes.model_json_schema()},
                         lambda requests=requests, text=text, chapter=chapter: _generate_chapter(
                             client, text, evidence, chapter, resolutions, requests,
                             job=job, previous=parts))
-                    if illustrated:
-                        part = _finalize_chapter(part, evidence, job,
-                                                 handoff / "verification" / chapter["id"],
-                                                 client, resolutions, parts)
                 except (PlanAccessError, ResponseError) as exc:
                     if getattr(exc, "code", None) != "context_length_exceeded":
                         raise
@@ -830,6 +895,9 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                             topics.setdefault(topic.casefold(), topic)
                 position += 1
             notes = _merge_chapters(parts, outline, evidence, resolutions)
+            if illustration_index(evidence):
+                notes = _finalize_notes(notes, evidence, job, handoff / "verification",
+                                        client, resolutions)
         except (PlanAccessError, ResponseError, ValueError, RenderError) as exc:
             handoff = export_handoff(job, evidence, outline, contexts=contexts)
             write_json(handoff / "status.json", {"status": "manual_required", "reason": str(exc)})
@@ -837,10 +905,15 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
             return handoff
     from .illustration_verification import reconcile_illustrations
 
-    notes, retry_needed = reconcile_illustrations(
-        notes, evidence, job, handoff / "figure-reconciliation", client)
+    candidates = notes
+    for attempt in range(2):
+        notes, retry_needed = reconcile_illustrations(
+            candidates, evidence, job, handoff / "figure-reconciliation", client)
+        if not retry_needed:
+            break
     notes = validate_notes(notes, evidence, resolutions, finalized=True)
-    write_json(handoff / "figure-reconciliation" / "status.json", {"retry_needed": retry_needed})
+    write_json(handoff / "figure-reconciliation" / "status.json", {
+        "attempts": attempt + 1, "retry_needed": retry_needed})
     (handoff / "status.json").unlink(missing_ok=True)
     write_json(outline_file, outline)
     write_json(job / "notes.json", notes)

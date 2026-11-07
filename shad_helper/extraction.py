@@ -27,6 +27,26 @@ from .vision_config import DEFAULT_VISION_MODEL, VISION_MODELS
 ASR_MODEL = "mlx-community/whisper-large-v3-mlx"
 
 
+def assert_extraction_complete(job: Path, evidence: dict) -> None:
+    """Reject partial video inputs while allowing legacy jobs and transcript edits."""
+    job = Path(job)
+    config_path, status_path = job / "extraction-config.json", job / "extraction-status.json"
+    config = read_json(config_path) if config_path.exists() else None
+    if status_path.exists():
+        status = read_json(status_path)
+        if status.get("state") != "complete":
+            raise ValueError("Extraction is incomplete; resume extraction before generating notes.")
+        if (status.get("config_fingerprint") != fingerprint(config)
+                or status.get("media") != {key: evidence.get("media", {}).get(key)
+                                          for key in ("sha256", "clip_start", "clip_end")}):
+            raise ValueError("Evidence does not match the completed extraction; resume extraction.")
+        # The recorded evidence fingerprint describes the published snapshot. Do not
+        # enforce it here: correcting transcript text in evidence.json is supported.
+    if config and config.get("pipeline") == "audio_video" and "visuals" not in evidence:
+        raise ValueError("Visual extraction is missing from evidence; resume extraction "
+                         "before generating notes, or explicitly extract with vision off.")
+
+
 def probe(media: Path) -> dict:
     import json
 
@@ -213,6 +233,10 @@ def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
     media_hash = sha256_file(media)
     out.mkdir(parents=True, exist_ok=True)
     write_json(out / "extraction-config.json", config)
+    extraction_status = {"schema_version": 1, "state": "running",
+                         "config_fingerprint": fingerprint(config),
+                         "media": {"sha256": media_hash, "clip_start": start, "clip_end": end}}
+    write_json(out / "extraction-status.json", extraction_status)
     started = time.monotonic()
     asr_start, asr_end = max(start, audio_start), min(end, audio_end)
     chunks = (_audio_chunks(media, out, asr_start, asr_end, media_hash, audio_start)
@@ -230,7 +254,7 @@ def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
                 "media": {"path": str(media), "sha256": media_hash, **metadata,
                           "clip_start": start, "clip_end": end},
                 "segments": segments}
-    write_json(out / "evidence.json", evidence)
+    write_json(out / "evidence.partial.json", evidence)
     diagnostics = {
         "schema_version": 1, "evidence_fingerprint": fingerprint(evidence),
         "models": {"asr": asr_model},
@@ -278,13 +302,20 @@ def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
             diagnostics["visuals"] = [{key: value for key, value in item.items() if key != "content"}
                                       for item in visual_result["items"]]
             diagnostics["evidence_fingerprint"] = fingerprint(evidence)
-            write_json(out / "evidence.json", evidence)
         except Exception as error:
             diagnostics["vision"] = {"status": "failed", "error": str(error)}
+            write_json(out / "extraction-status.json", {**extraction_status, "state": "failed",
+                                                       "error": str(error)})
             raise
         finally:
             timings.update(vision_seconds=time.monotonic() - vision_started,
                            total_seconds=time.monotonic() - total_started)
             write_json(out / "extraction-diagnostics.json", diagnostics)
             write_json(out / "extraction-timings.json", timings)
+    # Publish only after all required stages finish. A failed rerun leaves the
+    # previous completed evidence intact and its new transcript separately inspectable.
+    write_json(out / "evidence.json", evidence)
+    write_json(out / "extraction-status.json", {
+        **extraction_status, "state": "complete", "evidence_fingerprint": fingerprint(evidence)})
+    (out / "evidence.partial.json").unlink(missing_ok=True)
     return out / "evidence.json"

@@ -29,6 +29,7 @@ def test_accepts_complete_consistent_pass_without_mutation():
 
 @pytest.mark.parametrize("status,defect,repair", [
     ("fail", "wrong_figure", "recrop"),
+    ("fail", "inferior_source", "recrop"),
     ("fail", "wrong_stage", "none"),
     ("uncertain", "occluded", "nearby_frame"),
 ])

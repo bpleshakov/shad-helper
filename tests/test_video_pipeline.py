@@ -83,7 +83,8 @@ def pipeline(tmp_path, monkeypatch):
 
     def vision(out, request):
         assert read_json(out / "transcript.json")[0]["text"] == "Теорема"
-        assert read_json(out / "evidence.json")["schema_version"] == 3
+        assert read_json(out / "evidence.partial.json")["schema_version"] == 3
+        assert read_json(out / "extraction-status.json")["state"] == "running"
         order.append("vision")
         return vision_worker.run({"job": str(out), **request})
 
@@ -253,11 +254,12 @@ def test_illustration_crops_persist_and_legacy_jobs_upgrade_without_retranscript
                 assert image.size == (148, 156)
 
 
-def test_fatal_vision_error_preserves_audio_evidence_and_can_resume(pipeline):
+def test_fatal_vision_error_preserves_partial_transcript_and_can_resume(pipeline):
     pipeline.loader.side_effect = RuntimeError("model unavailable")
     with pytest.raises(RuntimeError, match="model unavailable"):
         run(pipeline)
-    evidence = read_json(pipeline.job / "evidence.json")
+    assert not (pipeline.job / "evidence.json").exists()
+    evidence = read_json(pipeline.job / "evidence.partial.json")
     assert evidence["schema_version"] == 3
     assert evidence["segments"][0]["text"] == "Теорема"
     assert (pipeline.job / "transcript.srt").exists()
@@ -265,11 +267,73 @@ def test_fatal_vision_error_preserves_audio_evidence_and_can_resume(pipeline):
     assert diagnostics["vision"] == {"status": "failed", "error": "model unavailable"}
     assert diagnostics["evidence_fingerprint"] == fingerprint(evidence)
     assert "vision_seconds" in read_json(pipeline.job / "extraction-timings.json")
+    assert read_json(pipeline.job / "extraction-status.json")["state"] == "failed"
+    with pytest.raises(ValueError, match="Extraction is incomplete"):
+        extraction.assert_extraction_complete(pipeline.job, evidence)
     check_job(pipeline.job)
     pipeline.loader.side_effect = None
-    assert run(pipeline)["schema_version"] == 5
+    resumed = run(pipeline)
+    assert resumed["schema_version"] == 5
+    extraction.assert_extraction_complete(pipeline.job, resumed)
+    assert not (pipeline.job / "evidence.partial.json").exists()
     assert pipeline.transcribe.call_count == 1
     assert pipeline.scan.call_count == 1
+
+
+def test_failed_video_rerun_keeps_completed_evidence_but_blocks_notes(pipeline):
+    completed = run(pipeline)
+    before = (pipeline.job / "evidence.json").read_bytes()
+    pipeline.vision.side_effect = RuntimeError("interrupted rerun")
+    with pytest.raises(RuntimeError, match="interrupted rerun"):
+        run(pipeline, vision_model="9b")
+    assert (pipeline.job / "evidence.json").read_bytes() == before
+    assert read_json(pipeline.job / "evidence.partial.json")["segments"] == completed["segments"]
+    with pytest.raises(ValueError, match="Extraction is incomplete"):
+        extraction.assert_extraction_complete(pipeline.job, completed)
+
+
+def test_interrupted_asr_rerun_cannot_look_complete(pipeline):
+    completed = run(pipeline)
+    before = (pipeline.job / "evidence.json").read_bytes()
+    pipeline.transcribe.side_effect = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        run(pipeline, language="en")
+    assert (pipeline.job / "evidence.json").read_bytes() == before
+    with pytest.raises(ValueError, match="Extraction is incomplete"):
+        extraction.assert_extraction_complete(pipeline.job, completed)
+
+
+def test_completed_evidence_allows_transcript_corrections_but_not_stale_identity(pipeline):
+    evidence = run(pipeline)
+    status = read_json(pipeline.job / "extraction-status.json")
+    assert status["evidence_fingerprint"] == fingerprint(evidence)
+    evidence["segments"][0]["text"] = "Исправленная теорема"
+    extraction.assert_extraction_complete(pipeline.job, evidence)
+    evidence["media"]["clip_end"] += 1
+    with pytest.raises(ValueError, match="does not match"):
+        extraction.assert_extraction_complete(pipeline.job, evidence)
+
+
+def test_legacy_audio_only_video_job_requires_visual_extraction(pipeline):
+    evidence = run(pipeline)
+    (pipeline.job / "extraction-status.json").unlink()
+    extraction.assert_extraction_complete(pipeline.job, evidence)
+    evidence.pop("visuals")
+    evidence["schema_version"] = 3
+    with pytest.raises(ValueError, match="Visual extraction is missing"):
+        extraction.assert_extraction_complete(pipeline.job, evidence)
+    disabled = run(pipeline, vision_model="off")
+    extraction.assert_extraction_complete(pipeline.job, disabled)
+    (pipeline.job / "extraction-status.json").unlink()
+    (pipeline.job / "extraction-config.json").unlink()
+    extraction.assert_extraction_complete(pipeline.job, disabled)
+
+
+def test_changed_config_requires_new_completed_extraction(pipeline):
+    evidence = run(pipeline)
+    write_json(pipeline.job / "extraction-config.json", AUDIO_CONFIG)
+    with pytest.raises(ValueError, match="does not match"):
+        extraction.assert_extraction_complete(pipeline.job, evidence)
 
 
 @pytest.mark.parametrize("start,duration,clip_end", [(0, None, 120), (90, 15, 105)])

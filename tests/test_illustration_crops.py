@@ -1,4 +1,5 @@
 import json
+import random
 import shutil
 from copy import deepcopy
 from unittest.mock import Mock
@@ -7,7 +8,7 @@ import httpx
 import pymupdf
 import pytest
 
-from shad_helper import crop_validation, illustration_crops
+from shad_helper import crop_validation, illustration_crops, illustration_stitching
 from shad_helper.illustration_crops import refine_crop, resolve_crop
 from shad_helper.jobs import fingerprint, read_json, sha256_file, write_json
 from shad_helper.openai_client import PlanClient
@@ -48,6 +49,9 @@ def client(box=(30, 25, 90, 60)):
     def complete(instructions, text, schema, **kwargs):
         if schema == crop_validation.CROP_VERIFICATION_SCHEMA:
             return verdict()
+        if schema == illustration_crops.SOURCE_SELECTION_SCHEMA:
+            return {"ranked_frame_ids": [item["visual_id"] for item in json.loads(text)["frames"]],
+                    "reason": "Сопоставлены состояния и читаемость рисунков."}
         return model.complete.return_value
 
     model.complete.side_effect = complete
@@ -389,7 +393,8 @@ def test_nearby_frame_recovery_verifies_original_identity_and_records_provenance
     first = ([model.complete.return_value, verdict("completeness", repair="nearby_frame")]
              if initial == "cropped" else [{"status": "uncertain", "box": [0, 0, 0, 0],
                                             "reason": "График обрезан краем кадра."}])
-    model.complete.side_effect = [*first,
+    model.complete.side_effect = [
+        {"ranked_frame_ids": ["v01", "v02"], "reason": "Одинаковый рисунок."}, *first,
         {"status": "cropped", "box": [10, 10, 135, 85], "reason": "В соседнем кадре рисунок полный."},
         verdict()]
     crop_id, retry, reason, unusable = run(example, model)
@@ -424,10 +429,11 @@ def test_nearby_wrong_stage_is_rejected_even_when_crop_is_complete(example):
     add_frame(example, "v02", 8)
     model = client()
     model.complete.side_effect = [
+        {"ranked_frame_ids": ["v01", "v02"], "reason": "Одинаковый рисунок."},
         model.complete.return_value, verdict("readability", "occluded", "nearby_frame"),
         model.complete.return_value, verdict("identity", "wrong_stage", "none")]
     assert run(example, model)[0:2] == ("", False)
-    assert model.complete.call_count == 4
+    assert model.complete.call_count == 5
     assert not list((example[0] / "illustration-crops").glob("*/crop.json"))
 
 
@@ -524,3 +530,396 @@ def test_legacy_crop_assets_remain_resolvable_but_are_not_reused_as_verified(exa
     model = client()
     assert run(example, model)[0] == current_id
     assert model.complete.call_count == 2
+
+
+def test_nearby_pool_covers_interval_instead_of_only_nearest_frames(example):
+    job, evidence, _, _, _ = example
+    evidence["visuals"][0]["timestamp"] = 50
+    for index, timestamp in enumerate([20, 25, 35, 45, 48, 49, 51, 54, 65, 75, 80]):
+        add_frame(example, f"v{timestamp}", timestamp, shade=index + 50)
+    reference = illustration_crops._native_frame(job, "a" * 64, evidence["visuals"][0])[1]
+    nearby = illustration_crops._nearby_frames(job, evidence, "a" * 64, reference)
+    assert [item[1]["timestamp"] for item in nearby] == [49, 51, 35, 65, 25, 75]
+    assert len(nearby) == illustration_crops.MAX_NEARBY_FRAMES
+
+
+def test_ranks_clean_farther_frame_before_committing_to_original_crop(example):
+    job, _, _, original, _ = example
+    add_frame(example, "occluded_near", 5, shade=100)
+    clean = add_frame(example, "clean_far", 20, shade=200)
+    model = client()
+    model.complete.side_effect = [
+        {"ranked_frame_ids": ["clean_far", "v01"],
+         "reason": "Чистый прямой захват той же стадии вместо бледной проекции."},
+        model.complete.return_value, verdict()]
+    crop_id, retry, reason, unusable = run(example, model)
+    assert crop_id and not retry and not reason and not unusable
+    record = read_json(job / "illustration-crops" / crop_id / "crop.json")
+    assert record["frame"]["visual_id"] == "clean_far"
+    assert record["frame"]["sha256"] == sha256_file(clean)
+    ranking = model.complete.call_args_list[0]
+    assert ranking.args[2] == illustration_crops.SOURCE_SELECTION_SCHEMA
+    assert len(ranking.kwargs["images"]) == 4  # original, two alternatives, source crop
+    verify = model.complete.call_args_list[-1]
+    assert dict(verify.kwargs["images"])["ORIGINAL_FRAME"].read_bytes() == original.read_bytes()
+    assert "бледной проекции" not in verify.args[1]  # independent verification
+    assert run(example, model)[0] == crop_id  # ranking and pixels share cache identity
+    assert model.complete.call_count == 3
+
+
+def test_ranked_alternative_still_requires_independent_stage_verification(example):
+    add_frame(example, "later_stage", 20)
+    model = client()
+    model.complete.side_effect = [
+        {"ranked_frame_ids": ["later_stage"], "reason": "Чистый рисунок."},
+        model.complete.return_value, verdict("identity", "wrong_stage", "none"),
+        model.complete.return_value, verdict()]
+    crop_id, retry, reason, unusable = run(example, model)
+    assert crop_id and not retry and not reason and not unusable
+    record = read_json(example[0] / "illustration-crops" / crop_id / "crop.json")
+    assert record["frame"]["visual_id"] == "v01"
+    assert model.complete.call_count == 5
+
+
+def test_selected_panel_scope_reaches_ranking_crop_and_independent_verifier(example):
+    job, evidence, block, _, _ = example
+    evidence["visuals"][0]["illustrations"][0]["description"] = "Большая сетка гистограмм"
+    block.update(caption="Доход и давность покупки", content="Две нижние панели Income и Recency.")
+    add_frame(example, "scrolled", 8)
+    model = client()
+    model.complete.side_effect = [
+        {"ranked_frame_ids": ["scrolled"], "reason": "Те же панели видны полностью."},
+        model.complete.return_value, verdict()]
+
+    crop_id, retry, reason, unusable = run(example, model)
+
+    assert crop_id and not retry and not reason and not unusable
+    expected = {key: block[key] for key in ("caption", "content")}
+    for call in model.complete.call_args_list:
+        context = json.loads(call.args[1])
+        assert context["figure"] == expected
+        assert context["description"] == "Большая сетка гистограмм"
+    record = read_json(job / "illustration-crops" / crop_id / "crop.json")
+    assert record["frame"]["visual_id"] == "scrolled"
+    assert record["inputs"]["figure"] == expected
+
+
+def test_crop_policy_version_invalidates_verified_crop(example, monkeypatch):
+    model = client()
+    previous = run(example, model)[0]
+    monkeypatch.setattr(illustration_crops, "CROP_POLICY_VERSION",
+                        illustration_crops.CROP_POLICY_VERSION + 1)
+
+    current = run(example, model)[0]
+
+    assert previous and current and current != previous
+    assert model.complete.call_count == 4
+    assert resolve_crop(example[0], example[1], "v01_ill01", previous).is_file()
+
+
+def test_relaxed_policy_reuses_independently_verified_previous_policy_crop(example, monkeypatch):
+    with monkeypatch.context() as old:
+        old.setattr(illustration_crops, "CROP_POLICY_VERSION", 3)
+        old.setattr(illustration_crops, "CROP_INSTRUCTIONS", "Previous stricter cropping instructions")
+        old.setattr(illustration_crops, "SOURCE_SELECTION_INSTRUCTIONS", "Previous stricter selection")
+        old.setattr(crop_validation, "CROP_VERIFICATION_INSTRUCTIONS", "Previous stricter verification")
+        previous = run(example)[0]
+    model = client()
+
+    assert run(example, model) == (previous, False, "", False)
+
+    model.complete.assert_not_called()
+    record = read_json(example[0] / "archive/attempt-02/crop.json")
+    assert record["inputs"]["policy"] == 3  # retain the actual verification provenance
+    assert record["verification"]["result"]["verdict"] == "pass"
+
+
+@pytest.mark.parametrize("changed", ["purpose", "caption", "content", "model", "frames", "schema"])
+def test_previous_policy_crop_reuse_requires_same_task_and_evidence(example, monkeypatch, changed):
+    with monkeypatch.context() as old:
+        old.setattr(illustration_crops, "CROP_POLICY_VERSION", 3)
+        previous = run(example)[0]
+    model = client()
+    if changed == "purpose":
+        example[2]["kind"] = "diagram"
+    elif changed in ("caption", "content"):
+        example[2][changed] = "Другая учебная иллюстрация"
+    elif changed == "model":
+        model.model = "another-model"
+    elif changed == "frames":
+        add_frame(example, "another-frame", 8)
+    else:
+        monkeypatch.setattr(illustration_crops, "CROP_SCHEMA",
+                            {**illustration_crops.CROP_SCHEMA, "description": "Updated schema"})
+
+    current = run(example, model)[0]
+
+    assert current and current != previous
+    assert model.complete.called
+
+
+@pytest.mark.parametrize("damage", ["failed_verification", "incomplete_selection", "changed_pixels"])
+def test_previous_policy_crop_reuse_rejects_invalid_or_incomplete_artifacts(example, monkeypatch, damage):
+    with monkeypatch.context() as old:
+        old.setattr(illustration_crops, "CROP_POLICY_VERSION", 3)
+        previous = run(example)[0]
+    cache = example[0] / "illustration-crops" / previous
+    record = read_json(cache / "crop.json")
+    if damage == "failed_verification":
+        record["verification"]["result"] = verdict("identity", "wrong_stage", "none")
+    elif damage == "incomplete_selection":
+        record["source_selection_complete"] = False
+    else:
+        image = pymupdf.Pixmap(cache / "crop.png")
+        image.set_pixel(0, 0, (0, 0, 0))
+        image.save(cache / "crop.png")
+    write_json(cache / "crop.json", record)
+    model = client()
+
+    current = run(example, model)[0]
+
+    assert current and current != previous
+    assert model.complete.called
+
+
+@pytest.mark.parametrize("identifiers", [["unknown"], ["v02", "v02"], [None], "v02"])
+def test_invalid_frame_ranking_falls_back_to_independent_original_check(example, identifiers):
+    add_frame(example, "v02", 8)
+    model = client()
+    model.complete.side_effect = [{"ranked_frame_ids": identifiers, "reason": "Выбор."},
+                                  model.complete.return_value, verdict()]
+    original = example[4].read_bytes()
+    crop_id, retry, reason, unusable = run(example, model)
+    assert crop_id and retry and not reason and not unusable
+    assert example[4].read_bytes() == original
+    record = read_json(example[0] / "illustration-crops" / crop_id / "crop.json")
+    assert record["frame"]["visual_id"] == "v01"
+    assert not record["source_selection_complete"]
+
+
+def test_reconstruction_clutter_pass_is_not_reused_for_screenshot(example):
+    job, evidence, block, _, source = example
+    model = client()
+    proposal = model.complete.return_value
+
+    def complete(instructions, text, schema, **kwargs):
+        context = json.loads(text)
+        if schema == illustration_crops.CROP_SCHEMA:
+            return proposal
+        if context["purpose"] == "reconstruction":
+            return verdict()  # hand beside the figure; all mathematical content visible
+        return verdict("cleanliness", "unrelated_content", "none")
+
+    model.complete.side_effect = complete
+    block["kind"] = "diagram"
+    crop_id = run(example, model)[0]
+    assert crop_id
+    record = read_json(job / "illustration-crops" / crop_id / "crop.json")
+    assert record["inputs"]["purpose"] == "reconstruction"
+    block["kind"] = "screenshot"
+    assert run(example, model)[0:2] == ("", False)
+    assert model.complete.call_count == 4
+    assert resolve_crop(job, evidence, "v01_ill01") == source
+    assert resolve_crop(job, evidence, "v01_ill01", crop_id).is_file()
+
+
+def test_inferior_projection_recrops_same_frame_and_verifies_new_pixels(example):
+    model = client()
+    model.complete.side_effect = [
+        model.complete.return_value, verdict("readability", "inferior_source", "recrop"),
+        {"status": "cropped", "box": [5, 10, 60, 70], "reason": "Прямой захват той же фигуры."},
+        verdict()]
+    crop_id = run(example, model)[0]
+    assert crop_id
+    record = read_json(example[0] / "illustration-crops" / crop_id / "crop.json")
+    assert record["box"] == [5, 10, 60, 70]
+    assert json.loads(model.complete.call_args_list[2].args[1])["repair_feedback"]["defects"] == [
+        "inferior_source"]
+
+
+def test_unusable_alternate_does_not_authorize_excluding_original_observation(example):
+    add_frame(example, "v02", 8)
+    model = client()
+    model.complete.side_effect = [
+        {"ranked_frame_ids": ["v02"], "reason": "Возможный чистый кадр."},
+        {"status": "unusable", "box": [0, 0, 0, 0], "reason": "Здесь графика нет."},
+        {"status": "uncertain", "box": [0, 0, 0, 0], "reason": "Рисунок закрыт рукой."}]
+    crop_id, retry, reason, unusable = run(example, model)
+    assert not crop_id and not retry and reason and not unusable
+    assert read_json(example[0] / "archive/attempt-01/status.json")["status"] == "uncertain"
+
+
+def test_ranking_outage_preserves_verified_original_and_reruns_ranking_later(example):
+    add_frame(example, "v02", 8)
+    model = client()
+    model.complete.side_effect = [RuntimeError("ranking offline"),
+                                  model.complete.return_value, verdict()]
+    crop_id, retry, reason, unusable = run(example, model)
+    assert crop_id and retry and not reason and not unusable
+    assert read_json(example[0] / "archive/attempt-01/source-selection/error.json")[
+        "message"] == "ranking offline"
+    recovery = client()
+    assert run(example, recovery) == (crop_id, False, "", False)
+    assert recovery.complete.call_count == 3  # did not reuse incomplete ranking success
+    record = read_json(example[0] / "illustration-crops" / crop_id / "crop.json")
+    assert record["source_selection_complete"]
+
+
+def test_original_gets_last_attempt_after_repeated_recrops_of_ranked_alternate(example):
+    add_frame(example, "v02", 8)
+    model = client()
+    model.complete.side_effect = [
+        {"ranked_frame_ids": ["v02"], "reason": "Более чёткий кадр."},
+        model.complete.return_value, verdict("completeness", repair="recrop"),
+        model.complete.return_value, verdict("completeness", repair="recrop"),
+        model.complete.return_value, verdict()]
+    crop_id, retry, reason, unusable = run(example, model)
+    assert crop_id and not retry and not reason and not unusable
+    record = read_json(example[0] / "illustration-crops" / crop_id / "crop.json")
+    assert record["frame"]["visual_id"] == "v01"
+    assert model.complete.call_count == 7
+    assert read_json(example[0] / "archive/attempt-01/status.json")["repairs"] == 2
+
+
+@pytest.fixture
+def scroll_example(example):
+    _, evidence, _, frame, source = example
+    page = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 256, 280), False)
+    rng = random.Random(41)
+    colors = {(x, y): tuple(rng.randrange(30, 220) for _ in range(3))
+              for x in range(22) for y in range(22)}
+    for y in range(page.height):
+        for x in range(page.width):
+            page.set_pixel(x, y, colors[x // 12, y // 13])
+    for identifier, offset, timestamp in [("v01", 0, 3), ("v02", 40, 43)]:
+        pixels = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, offset, 256, offset + 220), False)
+        pixels.copy(page, pixels.irect)
+        pixels.set_origin(0, 0)
+        pixels.save(frame.with_name(f"{identifier}_{'a' * 12}.png"))
+        if identifier == "v02":
+            evidence["visuals"].append({"id": identifier, "timestamp": timestamp,
+                                       "status": "complete", "illustrations": []})
+    observation = evidence["visuals"][0]["illustrations"][0]
+    observation["box"] = [0.125, 0.2, 1, 0.95]
+    source_pixels = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(32, 44, 256, 209), False)
+    source_pixels.copy(pymupdf.Pixmap(frame), source_pixels.irect)
+    source_pixels.save(source)
+    observation["image_sha256"] = sha256_file(source)
+    write_json(source.parent / "manifest.json", {"version": 1, "assets": {
+        "v01_ill01": {"path": "illustrations/v01_ill01.png", "sha256": sha256_file(source)}}})
+    return example
+
+
+def scroll_client(accepted=True):
+    model = client()
+
+    def complete(instructions, text, schema, **kwargs):
+        context = json.loads(text)
+        if schema == crop_validation.CROP_VERIFICATION_SCHEMA:
+            return verdict() if accepted else verdict("identity", "wrong_stage", "none")
+        if "stitch" in context["frame"]:
+            width, height = context["frame_size"]
+            return {"status": "cropped", "box": [0, 0, width, height], "reason": "Полный график."}
+        return {"status": "uncertain", "box": [0, 0, 0, 0], "reason": "Подписи за границей кадра."}
+
+    model.complete.side_effect = complete
+    return model
+
+
+def test_scroll_recovery_verifies_both_native_sources_and_reuses_success(scroll_example, monkeypatch):
+    job, evidence, _, _, source = scroll_example
+    original = {path: path.read_bytes() for path in [source, *(job / "frames").glob("*.png")]}
+    model = scroll_client()
+
+    crop_id, retry, reason, unusable = run(scroll_example, model)
+
+    assert crop_id and not retry and not reason and not unusable
+    assert model.complete.call_count == 3  # exhausted native view, assembled crop, independent check
+    record = read_json(job / "illustration-crops" / crop_id / "crop.json")
+    assert record["version"] == 3 and fingerprint(record["inputs"]) == crop_id
+    assert record["inputs"]["stitched_frames"] == [record["frame"]]
+    assert record["frame"]["size"] == [224, 260]
+    for call in model.complete.call_args_list[1:]:
+        images = dict(call.kwargs["images"])
+        assert images["SOURCE_FRAME_1"].read_bytes() == original[job / "frames/v01_aaaaaaaaaaaa.png"]
+        assert images["SOURCE_FRAME_2"].read_bytes() == original[job / "frames/v02_aaaaaaaaaaaa.png"]
+        assert illustration_crops.STITCH_INSTRUCTIONS in call.args[0]
+    assert "repair_feedback" not in json.loads(model.complete.call_args_list[-1].args[1])
+    assert all(path.read_bytes() == saved for path, saved in original.items())
+    assert resolve_crop(job, evidence, "v01_ill01", crop_id).is_file()
+    generator = Mock(side_effect=AssertionError("Successful source must be reused before native calls"))
+    monkeypatch.setattr(illustration_stitching, "stitched_sources", generator)
+    cached_client = scroll_client()
+    assert run(scroll_example, cached_client) == (crop_id, False, "", False)
+    cached_client.complete.assert_not_called()
+    generator.assert_not_called()
+
+
+def test_scroll_recovery_does_not_publish_a_mixed_stage_verdict(scroll_example):
+    model = scroll_client(accepted=False)
+
+    crop_id, retry, reason, unusable = run(scroll_example, model)
+
+    assert not crop_id and not retry and reason and not unusable
+    assert model.complete.call_count == 3
+    assert not list((scroll_example[0] / "illustration-crops").glob("*/crop.json"))
+
+
+@pytest.mark.parametrize("failure", ["transport", "unusable"])
+def test_scroll_recovery_skips_transient_errors_and_nonfigures(scroll_example, monkeypatch, failure):
+    generator = Mock(side_effect=AssertionError("Recovery must not run"))
+    monkeypatch.setattr(illustration_stitching, "stitched_sources", generator)
+    model = client()
+    model.complete.side_effect = (RuntimeError("offline") if failure == "transport" else None)
+    model.complete.return_value = {"status": "unusable", "box": [0, 0, 0, 0], "reason": "Только код."}
+
+    crop_id, retry, _, unusable = run(scroll_example, model)
+
+    assert not crop_id and retry == (failure == "transport") and unusable == (failure == "unusable")
+    generator.assert_not_called()
+
+
+def test_scroll_recovery_bounds_independent_candidate_attempts(scroll_example, monkeypatch):
+    original = illustration_stitching.stitched_sources
+    monkeypatch.setattr(illustration_stitching, "stitched_sources",
+                        lambda *args: original(*args) * 3)
+    model = scroll_client(accepted=False)
+
+    assert not run(scroll_example, model)[0]
+
+    assert model.complete.call_count == 5  # one native call and two proposal/verification pairs
+
+
+@pytest.mark.parametrize("changed", ["source", "assembly", "crop"])
+def test_scroll_crop_resolver_rechecks_native_and_assembled_pixels(scroll_example, changed):
+    job, evidence, _, _, _ = scroll_example
+    crop_id = run(scroll_example, scroll_client())[0]
+    cache = job / "illustration-crops" / crop_id
+    path = {"source": job / "frames/v02_aaaaaaaaaaaa.png",
+            "assembly": cache / "verification/frame.png", "crop": cache / "crop.png"}[changed]
+    pixels = pymupdf.Pixmap(path)
+    pixels.set_pixel(10, 10, (0, 0, 0))
+    pixels.save(path)
+    if changed == "crop":
+        record = read_json(cache / "crop.json")
+        record["image_sha256"] = record["verification"]["image_sha256"] = sha256_file(path)
+        write_json(cache / "crop.json", record)  # matching hashes cannot authorize invented pixels
+
+    with pytest.raises(ValueError):
+        resolve_crop(job, evidence, "v01_ill01", crop_id)
+
+
+@pytest.mark.parametrize("changed", ["caption", "instructions"])
+def test_scroll_success_cache_requires_same_task_and_policy(scroll_example, monkeypatch, changed):
+    previous = run(scroll_example, scroll_client())[0]
+    if changed == "caption":
+        scroll_example[2]["caption"] = "Другая группа панелей"
+    else:
+        monkeypatch.setattr(illustration_crops, "STITCH_INSTRUCTIONS",
+                            illustration_crops.STITCH_INSTRUCTIONS + "\nCheck a revised rule.")
+    model = scroll_client()
+
+    current = run(scroll_example, model)[0]
+
+    assert current and current != previous
+    assert model.complete.call_count == 3
