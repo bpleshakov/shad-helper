@@ -1,4 +1,4 @@
-"""App-owned Sign in with ChatGPT credentials; no API-key or Codex fallback."""
+"""App-owned Sign in with ChatGPT credentials and safe OpenAI HTTP errors."""
 
 import base64
 import fcntl
@@ -40,7 +40,7 @@ class PlanAccessError(RuntimeError):
         self.request_id = request_id
 
 
-def http_error(response):
+def http_error(response, *, api_key=False):
     """Keep status/code/request ID without printing credentials or raw bodies."""
     try:
         body = response.json()
@@ -49,9 +49,11 @@ def http_error(response):
     error = body.get("error", {}) if isinstance(body, dict) else {}
     code = error.get("code") if isinstance(error, dict) else error
     request_id = response.headers.get("x-request-id") or response.headers.get("openai-request-id")
-    message = f"ChatGPT plan request failed (HTTP {response.status_code}"
+    source = "OpenAI API" if api_key else "ChatGPT plan"
+    message = f"{source} request failed (HTTP {response.status_code}"
     message += f", {code}" if code else ""
-    message += "). Check account eligibility or ChatGPT Settings → Usage."
+    message += ("). Check the API key and OpenAI API billing/limits." if api_key
+                else "). Check account eligibility or ChatGPT Settings → Usage.")
     return PlanAccessError(message, code=code, status=response.status_code, request_id=request_id)
 
 

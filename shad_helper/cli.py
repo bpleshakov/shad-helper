@@ -76,6 +76,8 @@ def parser() -> argparse.ArgumentParser:
 
 
 def doctor(state_dir: Path = Path(".shad-helper/auth"), *, proxy: str | None = None) -> bool:
+    from .openai_config import API_KEY_FILE
+
     packages = {name: importlib.util.find_spec(name) is not None for name in (
         "httpx", "jwt", "pydantic", "pymupdf")}
     # find_spec on a dotted name imports its parent, so check MLX top-level only.
@@ -85,8 +87,10 @@ def doctor(state_dir: Path = Path(".shad-helper/auth"), *, proxy: str | None = N
     openai = {"status": "not_checked", "models": [], "default_model": "gpt-6-astra",
               "default_model_available": None}
     configured_proxy = os.environ.get("SHAD_HELPER_OPENAI_PROXY") if proxy is None else proxy
-    if not (Path(state_dir) / "credentials.json").is_file():
-        openai["message"] = "Run shad-helper login to authorize ChatGPT plan access."
+    if not (os.environ.get("OPENAI_API_KEY") or API_KEY_FILE.is_file()
+            or (Path(state_dir) / "credentials.json").is_file()):
+        openai["message"] = "Set OPENAI_API_KEY in the environment or config/openai.env, " \
+                            "or run shad-helper login to authorize ChatGPT plan access."
     elif not configured_proxy:
         openai["message"] = "Configure --openai-proxy or SHAD_HELPER_OPENAI_PROXY to check models."
     elif not packages["httpx"] or not packages["jwt"]:
@@ -104,11 +108,11 @@ def doctor(state_dir: Path = Path(".shad-helper/auth"), *, proxy: str | None = N
         except ModuleNotFoundError:
             openai["message"] = "Install HTTP/auth dependencies with uv sync before checking models."
         except ValueError:
-            openai.update(status="error", message="Invalid OpenAI proxy configuration; use "
-                          "--openai-proxy or SHAD_HELPER_OPENAI_PROXY with an HTTP/HTTPS proxy URL.")
+            openai.update(status="error", message="Invalid OpenAI configuration; check "
+                          "config/openai.env and the --openai-proxy or SHAD_HELPER_OPENAI_PROXY URL.")
         except (OSError, RuntimeError):
-            openai.update(status="error", message="Could not check the ChatGPT account model catalog. "
-                          "Verify proxy connectivity and account access; run shad-helper login "
+            openai.update(status="error", message="Could not check the OpenAI model catalog. "
+                          "Verify proxy connectivity, API key and account access; run shad-helper login "
                           "if needed, then retry.")
     print(json.dumps({"python": sys.version.split()[0], "platform": platform.platform(),
                       "architecture": platform.machine(), "packages": packages,
@@ -119,6 +123,13 @@ def doctor(state_dir: Path = Path(".shad-helper/auth"), *, proxy: str | None = N
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    from .openai_usage import command_usage
+
+    with command_usage(args.command):
+        return _run(args)
+
+
+def _run(args) -> int:
     # Keep downloads and model caches in this workspace, not the user's global caches.
     cache = Path(".cache/huggingface").resolve()
     os.environ.setdefault("HF_HOME", str(cache))

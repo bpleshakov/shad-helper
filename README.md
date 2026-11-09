@@ -32,13 +32,13 @@ before the vision worker loads, so their model memory is not held together.
 Once tools and weights are installed, extraction works
 offline; use `HF_HUB_OFFLINE=1` to disable Hugging Face network access.
 
-With app-owned credentials and a configured OpenAI proxy, `doctor` also lists
+With an API key or app-owned login credentials and a configured OpenAI proxy, `doctor` also lists
 account-available models and reports default-model availability. It does not
 start login or generate notes. Local checks determine its exit status.
 
 ## Run the complete pipeline
 
-After installing dependencies, signing in, and configuring the OpenAI proxy, run:
+After installing dependencies, configuring an API key or signing in, and setting the OpenAI proxy, run:
 
 ```sh
 UV_CACHE_DIR=.cache/uv uv run shad-helper run lecture.mp4 --out jobs
@@ -158,7 +158,57 @@ A transcription smoke check processes thirty seconds and may download Whisper:
 UV_CACHE_DIR=.cache/uv uv run shad-helper doctor --smoke short-lecture.wav
 ```
 
-## Generate notes with your ChatGPT plan
+## Generate notes with an API key or your ChatGPT plan
+
+Set `OPENAI_API_KEY` in the process environment or in `config/openai.env`, relative
+to the working directory:
+
+```dotenv
+OPENAI_API_KEY=your-api-key
+```
+
+The process environment takes precedence. The file supports plain or quoted values,
+comments, and an optional `export` prefix; it is read without executing shell code.
+The key file is ignored by Git. The key is never written to request archives or logs.
+
+All OpenAI generation requests (`notes`, `anki`, and `run`, including illustration
+verification) prefer the API key. When OpenAI reports `credit_balance_exhausted`
+or the legacy `insufficient_quota` error, the client retries the same request with
+the app's saved ChatGPT login and keeps using login for that client's remaining
+requests. A new client tries the API key again, allowing topped-up credits to be used.
+There is no dollar-balance check or $5 threshold. Other errors, including ordinary
+rate limits, invalid keys, and network failures, do not switch authentication.
+See the [OpenAI error-code reference](https://developers.openai.com/api/docs/guides/error-codes).
+
+Run `shad-helper login` once to prepare the fallback. If no key is configured,
+requests use login as before. Fallback never opens a browser automatically; without
+saved login credentials it asks you to run `login`. Set an explicitly empty
+`OPENAI_API_KEY` to use login even when the file contains a key.
+
+Every CLI command prints a spending summary to the console (stderr) when it ends,
+including failures and keyboard interrupts. For example:
+
+```text
+OpenAI spending [notes]: estimated API cost $0.026400; API requests: 2; ChatGPT-plan requests: 0.
+```
+
+The total includes all generation attempts across the command's projects and stages,
+including retries and replies that fail validation. Reused local artifacts and
+model-list requests add no API generation cost. ChatGPT-plan requests are counted separately
+as subscription usage, without attributing an API-key dollar charge to them.
+`doctor` keeps its JSON on stdout; its summary goes to stderr like other commands.
+
+No admin key is needed or used. Estimates use each response's token usage and
+the published `gpt-6-astra` rates checked on 2026-11-08, including cached input,
+30-minute/12-hour cache writes, reasoning output, long-context rates, and the
+reported Standard/Flex/Fast processing tier. Standard rates are assumed if the
+response omits its tier. These are public-rate estimates, not reconciled billing
+totals; account-specific prices and future rate changes can differ. See
+[model pricing](https://developers.openai.com/api/docs/models/gpt-6-astra) and
+[cache accounting](https://developers.openai.com/api/docs/guides/prompt-caching).
+Missing or malformed usage, interrupted streams, unsupported models, and unsupported
+tiers produce an explicitly unknown total with a known subtotal, rather than a zero
+charge. Each command starts a fresh total; no billing queries are made.
 
 Every app-owned OpenAI request requires an explicit HTTP/HTTPS proxy:
 
@@ -190,8 +240,8 @@ keep localhost direct for the OAuth callback. This app's protected credentials
 live in `.shad-helper/auth`. Change the location with `--state-dir PATH` before
 the command name.
 
-Automatic synthesis checks account availability of `gpt-6-astra` and requests
-`max` reasoning effort through the authorized ChatGPT-plan integration.
+Automatic synthesis checks availability of `gpt-6-astra` for the selected credentials
+and uses the existing reasoning configuration through the OpenAI Responses API.
 Each failed chapter request or invalid reply gets three retries after the initial
 attempt, waiting 5, 10, and 20 seconds. Completed chapters remain cached.
 Unavailable access or failure after all four attempts exports a manual handoff.
@@ -505,7 +555,7 @@ project. Repeated destinations, including symlink aliases, are rejected before
 generation starts.
 
 The default input is `JOB/notes/main.pdf`. The command sends the complete PDF to
-`gpt-6-astra` with max reasoning through the existing ChatGPT sign-in and explicit
+`gpt-6-astra` using the API key or ChatGPT login described above and the explicit
 OpenAI proxy. It includes text and page images. For generated lecture PDFs it also
 sends a catalog of the saved note blocks and their PDF page ranges to identify
 sources. Figures reference their original figure block IDs: screenshots reuse

@@ -11,6 +11,11 @@ from shad_helper import cli
 from shad_helper.cli import main
 
 
+def zero_spending(command):
+    return (f"OpenAI spending [{command}]: estimated API cost $0.000000; "
+            "API requests: 0; ChatGPT-plan requests: 0.\n")
+
+
 @pytest.fixture(autouse=True)
 def isolated_environment(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
@@ -137,7 +142,7 @@ def test_anki_batch_runs_in_order_and_forwards_options(anki_batch, tmp_path, pos
     ]
     output = capsys.readouterr()
     assert "3 completed, 0 failed" in output.out
-    assert output.err == ""
+    assert output.err == zero_spending("anki")
 
 
 def test_anki_batch_continues_after_failure_without_using_stale_report(anki_batch, capsys):
@@ -219,7 +224,7 @@ def test_login_forwards_proxy_flag_or_none(monkeypatch, tmp_path, capsys, proxy,
     assert main(arguments) == 0
 
     login.assert_called_once_with(state_dir, proxy=proxy)
-    assert capsys.readouterr().err == ""
+    assert capsys.readouterr().err == zero_spending("login")
 
 
 @pytest.fixture
@@ -251,6 +256,26 @@ def test_doctor_reports_account_models_and_default_availability(doctor_catalog, 
     assert all(report["packages"].values())
     factory.assert_called_once_with(state_dir, proxy=None)
     models.assert_called_once_with()
+
+
+@pytest.mark.parametrize("source", ["environment", "file"])
+def test_doctor_checks_api_key_without_saved_login(
+        doctor_catalog, monkeypatch, tmp_path, capsys, source):
+    state_dir, factory, models = doctor_catalog
+    (state_dir / "credentials.json").unlink()
+    if source == "environment":
+        monkeypatch.setenv("OPENAI_API_KEY", "private-key")
+    else:
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config/openai.env").write_text("OPENAI_API_KEY=private-key\n")
+    assert main(["--state-dir", str(state_dir), "doctor"]) == 0
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert report["openai"]["status"] == "available"
+    factory.assert_called_once_with(state_dir, proxy=None)
+    models.assert_called_once_with()
+    assert "private-key" not in captured.out + captured.err
+    assert not (state_dir / ".lock").exists()
 
 
 @pytest.mark.parametrize("missing", ["credentials", "proxy", "explicit_blank", "dependency"])
@@ -350,7 +375,7 @@ def test_notes_forwards_proxy_flag_or_none(monkeypatch, tmp_path, capsys, proxy,
 
     generate_notes.assert_called_once_with(job, state_dir, imported=None,
                                           manual=False, rebuild=False, proxy=proxy)
-    assert capsys.readouterr().err == ""
+    assert capsys.readouterr().err == zero_spending("notes")
 
 
 @pytest.fixture
@@ -399,7 +424,7 @@ def test_notes_batch_runs_in_order_with_options(notes_batch, tmp_path, rebuild, 
     assert render.call_args_list == ([call(job, rebuild=True) for job in jobs] if rebuild else [])
     output = capsys.readouterr()
     assert "3 completed, 0 failed" in output.out
-    assert output.err == ""
+    assert output.err == zero_spending("notes")
     if rebuild:
         assert all(str(job / "notes" / "main.pdf") in output.out for job in jobs)
 
@@ -449,7 +474,7 @@ def test_notes_manual_exports_each_handoff_without_rendering(notes_batch, count,
     render.assert_not_called()
     output = capsys.readouterr()
     assert all(str(job / "handoff") in output.out for job in jobs)
-    assert output.err == ""
+    assert output.err == zero_spending("notes")
 
 
 @pytest.mark.parametrize(("failure", "rebuild"), [

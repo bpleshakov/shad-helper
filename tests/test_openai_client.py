@@ -5,7 +5,9 @@ import base64
 import importlib.util
 import json
 import os
+import sys
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
@@ -84,10 +86,12 @@ def _client_module():
     auth_tree = ast.parse(auth_path.read_text())
     auth_class = next(node for node in auth_tree.body if isinstance(node, ast.ClassDef) and node.name == "PlanAccessError")
     exec(compile(ast.Module(body=[auth_class], type_ignores=[]), str(auth_path), "exec"), module.__dict__)
-    module.__dict__.update(base64=base64, json=json, Path=Path,
+    module.__dict__.update(base64=base64, json=json, sys=sys, Path=Path,
         RESOURCE="https://api.openai.com/v1", access_token=token_provider,
         resolve_openai_proxy=resolve_proxy, openai_http_client=Client,
-        http_error=lambda _: module.PlanAccessError("offline HTTP error"),
+        http_error=lambda _, **kwargs: module.PlanAccessError("offline HTTP error"),
+        load_api_key=lambda: None,
+        track_request=lambda **kwargs: nullcontext(None),
         httpx=SimpleNamespace(Client=Client, Timeout=lambda *args, **kwargs: None, HTTPError=OSError))
     source_path = Path(__file__).parents[1] / "shad_helper" / "openai_client.py"
     source_tree = ast.parse(source_path.read_text())
