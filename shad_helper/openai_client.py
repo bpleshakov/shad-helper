@@ -12,8 +12,8 @@ from shad_helper.network import openai_http_client, resolve_openai_proxy
 from shad_helper.openai_config import load_api_key
 from shad_helper.openai_usage import track_request
 
-DEFAULT_MODEL = "gpt-6-astra"
-DEFAULT_REASONING_EFFORT = "high"
+DEFAULT_MODEL = "gpt-6.1-sol"
+DEFAULT_REASONING_EFFORT = "low"
 MAX_PDF_BYTES = 500_000_000
 MAX_IMAGE_ENCODED_BYTES = 400_000_000
 CREDIT_EXHAUSTED_CODES = {"credit_balance_exhausted", "insufficient_quota"}

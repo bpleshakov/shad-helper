@@ -8,6 +8,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import httpx
+from tqdm import tqdm
 
 from . import rendering
 from .auth import PlanAccessError
@@ -358,8 +359,11 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
              **{identifier: item["timestamp"] for identifier, item in observations.items()}}
     retry_needed = False
     alternatives = {}
-    for chapter in notes["chapters"]:
-        for coverage in chapter.get("illustration_coverage", []):
+    coverage_items = [(chapter, coverage) for chapter in notes["chapters"]
+                      for coverage in chapter.get("illustration_coverage", [])]
+    with tqdm(coverage_items, desc="Illustration coverage", unit="observation",
+              dynamic_ncols=True, disable=not coverage_items) as progress:
+        for chapter, coverage in progress:
             original_id = coverage["block_id"]
             if not original_id:
                 continue
@@ -499,11 +503,12 @@ def finalize_illustrations(notes: dict, evidence: dict, job: Path, folder: Path,
     observations = illustration_index(evidence)
     retry_needed = False
     unpublished = {}
-    for chapter in result["chapters"]:
-        for block in chapter["blocks"]:
-            identifier = block.get("illustration_id")
-            if not identifier or block["kind"] not in {"diagram", "screenshot"}:
-                continue
+    figures = [block for chapter in result["chapters"] for block in chapter["blocks"]
+               if block.get("illustration_id") and block["kind"] in {"diagram", "screenshot"}]
+    with tqdm(figures, desc="Illustration verification", unit="figure",
+              dynamic_ncols=True, disable=not figures) as progress:
+        for block in progress:
+            identifier = block["illustration_id"]
             observation = observations[identifier]
             candidate = deepcopy(block)
             archive = Path(folder) / "illustration-verification" / block["id"]
