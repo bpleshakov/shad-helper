@@ -11,10 +11,13 @@ import time
 from collections import deque
 from pathlib import Path
 
+from tqdm import tqdm
+
+from .frame_novelty import filter_frames
 from .jobs import checkpoint, fingerprint, read_json
 
 SELECTION_SETTINGS = {
-    "version": 3,
+    "version": 4,
     "proxy_width": 720,
     "sample_fps": 2,
     "pixel_threshold": 24,
@@ -25,6 +28,11 @@ SELECTION_SETTINGS = {
     "maximum_change_gap_seconds": 15.0,
     "scroll_viewport_fraction": 0.4,
     "scroll_response": 0.55,
+    "region_thresholds": [128, 160, 180, 200, 220, 240],
+    "region_minimum_area": 0.5,
+    "region_minimum_span": 0.85,
+    "region_minimum_fill": 0.8,
+    "region_margin": 0.02,
 }
 
 
@@ -140,22 +148,26 @@ def _proxy_frames(media: Path, metadata: dict, start: float, end: float):
     reader.start()
     try:
         size = width * height
-        while True:
-            raw = process.stdout.read(size)
-            if not raw:
-                break
-            if len(raw) != size:
-                raise RuntimeError("FFmpeg returned an incomplete video proxy frame.")
-            try:
-                timestamp = timestamps.get(timeout=30)
-            except queue.Empty as error:
-                raise RuntimeError("Timed out waiting for FFmpeg source timestamps.") from error
-            if timestamp is None:
-                raise RuntimeError("FFmpeg did not return source timestamps for proxy frames.")
-            if start - 0.001 <= timestamp < end:
-                yield timestamp, np.frombuffer(raw, dtype=np.uint8).reshape(height, width)
-        if process.wait():
-            raise RuntimeError("FFmpeg video scan failed: " + " ".join(errors))
+        with tqdm(total=math.ceil(end - start), desc="Video selection", unit="s",
+                  dynamic_ncols=True) as progress:
+            while True:
+                raw = process.stdout.read(size)
+                if not raw:
+                    break
+                if len(raw) != size:
+                    raise RuntimeError("FFmpeg returned an incomplete video proxy frame.")
+                try:
+                    timestamp = timestamps.get(timeout=30)
+                except queue.Empty as error:
+                    raise RuntimeError("Timed out waiting for FFmpeg source timestamps.") from error
+                if timestamp is None:
+                    raise RuntimeError("FFmpeg did not return source timestamps for proxy frames.")
+                if start - 0.001 <= timestamp < end:
+                    yield timestamp, np.frombuffer(raw, dtype=np.uint8).reshape(height, width)
+                    progress.update(max(0, min(progress.total, int(timestamp - start)) - progress.n))
+            if process.wait():
+                raise RuntimeError("FFmpeg video scan failed: " + " ".join(errors))
+            progress.update(progress.total - progress.n)
     finally:
         if process.poll() is None:
             process.kill()
@@ -165,13 +177,61 @@ def _proxy_frames(media: Path, metadata: dict, start: float, end: float):
         process.stderr.close()
 
 
-def _difference(first, second):
+def _instructional_regions(gray):
+    """Find broad, bright rectangular surfaces; ambiguous layouts use the full frame.
+
+    Keep entire rectangles, including their dark writing, and all panels at a
+    given threshold. A small bright patch alone is not enough to identify a board.
+    Prefer the largest supported area so that darker panels are not cropped away.
+    """
+    import cv2
+    import numpy as np
+
+    height, width = gray.shape
+    margin = max(2, round(min(height, width) * SELECTION_SETTINGS["region_margin"]))
+    border = np.concatenate((gray[0], gray[-1], gray[:, 0], gray[:, -1]))
+    candidates = []
+    for threshold in SELECTION_SETTINGS["region_thresholds"]:
+        surface = np.uint8(gray > threshold) * 255
+        surface = cv2.morphologyEx(surface, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        contours, _ = cv2.findContours(surface, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        regions = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if (w < width * 0.2 or h < height * 0.4
+                    or cv2.contourArea(contour) < w * h * SELECTION_SETTINGS["region_minimum_fill"]):
+                continue
+            regions.append((max(0, x - margin), max(0, y - margin),
+                            min(width, x + w + margin), min(height, y + h + margin)))
+        if not regions:
+            continue
+        mask = np.zeros(gray.shape, dtype=bool)
+        for left, top, right, bottom in regions:
+            mask[top:bottom, left:right] = True
+        # A uniformly bright border indicates a full-frame slide/page, rather
+        # than a board surrounded by a room. Do not crop its darker panels.
+        if mask.mean() >= 0.95:
+            if np.mean(border > threshold) >= 0.95:
+                return None
+            continue
+        span = max(box[2] for box in regions) - min(box[0] for box in regions)
+        if (mask.mean() >= SELECTION_SETTINGS["region_minimum_area"]
+                and span >= width * SELECTION_SETTINGS["region_minimum_span"]):
+            candidates.append((int(mask.sum()), [list(box) for box in sorted(regions)], mask))
+    return max(candidates, key=lambda item: item[0])[1:] if candidates else None
+
+
+def _difference(first, second, mask=None):
     import numpy as np
 
     difference = second.astype(np.int16) - first.astype(np.int16)
     threshold = SELECTION_SETTINGS["pixel_threshold"]
-    added = float(np.count_nonzero(difference < -threshold)) / difference.size
-    removed = float(np.count_nonzero(difference > threshold)) / difference.size
+    added_pixels, removed_pixels = difference < -threshold, difference > threshold
+    if mask is not None:
+        added_pixels &= mask
+        removed_pixels &= mask
+    added = float(np.count_nonzero(added_pixels)) / difference.size
+    removed = float(np.count_nonzero(removed_pixels)) / difference.size
     return added + removed, added, removed
 
 
@@ -186,7 +246,7 @@ def _scroll(first, second):
     return 0.0
 
 
-def _select_proxy_frames(frames) -> tuple[list[dict], int]:
+def _select_proxy_frames(frames, diagnostics=None) -> tuple[list[dict], int]:
     """Retain changes conservatively; only constant-size gray frame state is kept."""
     import cv2
 
@@ -199,13 +259,22 @@ def _select_proxy_frames(frames) -> tuple[list[dict], int]:
     best_quiet = None
     previous_change = 0.0
     count = 0
+    region_frames = 0
+
+    def difference(first, second):
+        # Compare the union: a newly exposed panel or a lost region must never
+        # be hidden by the other frame's narrower detection.
+        mask = first[3][1] | second[3][1] if first[3] is not None and second[3] is not None else None
+        return _difference(first[1], second[1], mask)
 
     def retain(frame, reason):
         nonlocal anchor, scroll_distance
-        timestamp, _gray, sharpness = frame
+        timestamp, _gray, sharpness, regions = frame
         if selected and timestamp <= selected[-1]["timestamp"]:
             return
         selected.append({"timestamp": timestamp, "reason": reason, "sharpness": sharpness})
+        if regions is not None:
+            selected[-1]["content_regions"] = regions[0]
         anchor = frame
         scroll_distance = 0.0
 
@@ -213,21 +282,33 @@ def _select_proxy_frames(frames) -> tuple[list[dict], int]:
         nonlocal before_change
         if before_change is not None:
             candidate, reason = before_change
-            if (_difference(candidate[1], current[1])[0] >= minimum
-                    and _difference(anchor[1], candidate[1])[0] >= minimum):
+            if (difference(candidate, current)[0] >= minimum
+                    and difference(anchor, candidate)[0] >= minimum):
                 retain(candidate, reason)
             before_change = None
 
     for timestamp, gray in frames:
         count += 1
-        frame = (timestamp, gray, float(cv2.Laplacian(gray, cv2.CV_32F).var()))
+        regions = _instructional_regions(gray)
+        if regions is not None and previous is not None:
+            # Geometry is only a hint. When the excluded area settles into a
+            # new state, fall back to the whole frame and preserve that state.
+            outside = ~regions[1]
+            if (_difference(previous[1], gray, outside)[0] < minimum
+                    and _difference(anchor[1], gray, outside)[0] >= minimum):
+                regions = None
+        region_frames += regions is not None
+        detail = cv2.Laplacian(gray, cv2.CV_32F)
+        sharpness = float(detail[regions[1]].var() if regions is not None else detail.var())
+        frame = (timestamp, gray, sharpness, regions)
         if previous is None:
             retain(frame, "initial")
             previous = frame
             continue
-        adjacent, added, removed = _difference(previous[1], gray)
-        accumulated = _difference(anchor[1], gray)[0]
-        if adjacent >= minimum:
+        adjacent, added, removed = difference(previous, frame)
+        accumulated = difference(anchor, frame)[0]
+        scope_changed = (previous[3] is None) != (regions is None)
+        if adjacent >= minimum or scope_changed:
             quiet_since = None
             best_quiet = None
         else:
@@ -247,12 +328,12 @@ def _select_proxy_frames(frames) -> tuple[list[dict], int]:
         # Defer confirmation until the change settles or the time guard.
         # Lecturer movement must not trigger a new image every half-second.
         if ((erasure or transition)
-                and _difference(anchor[1], previous[1])[0] >= minimum):
+                and difference(anchor, previous)[0] >= minimum):
             reason = "before_erasure" if erasure else "before_transition"
             if previous_change < SELECTION_SETTINGS["settled_change_fraction"]:
                 retain_before_change(previous)
                 retain(previous, reason)
-                accumulated = _difference(anchor[1], gray)[0]
+                accumulated = difference(anchor, frame)[0]
             elif before_change is None:
                 before_change = (previous, reason)
 
@@ -267,7 +348,7 @@ def _select_proxy_frames(frames) -> tuple[list[dict], int]:
               and (accumulated >= SELECTION_SETTINGS["settled_change_fraction"]
                    or before_change is not None)):
             retain_before_change(best_quiet)
-            if _difference(anchor[1], best_quiet[1])[0] >= minimum:
+            if difference(anchor, best_quiet)[0] >= minimum:
                 retain(best_quiet, "settled_change")
         elif (accumulated >= minimum
               and timestamp - anchor[0] + (timestamp - previous[0])
@@ -279,8 +360,12 @@ def _select_proxy_frames(frames) -> tuple[list[dict], int]:
 
     if previous is not None:
         retain_before_change(previous)
+        # The last sample cannot wait for another observation to confirm a new
+        # state outside a detected surface.
         if _difference(anchor[1], previous[1])[0] >= minimum:
             retain(previous, "final_change")
+    if diagnostics is not None:
+        diagnostics.update(region_frames=region_frames, full_frame_frames=count - region_frames)
     return selected, count
 
 
@@ -322,25 +407,35 @@ def select_frames(media: Path, job: Path, start: float, end: float, media_hash: 
 
     def scan():
         began = time.monotonic()
-        frames, count = _select_proxy_frames(_proxy_frames(media, metadata, start, end))
-        return {"frames": frames, "proxy_frames": count, "seconds": time.monotonic() - began}
+        diagnostics = {}
+        frames, count = _select_proxy_frames(_proxy_frames(media, metadata, start, end), diagnostics)
+        return {"frames": frames, "proxy_frames": count, "seconds": time.monotonic() - began,
+                **diagnostics}
 
     selection = checkpoint(job, "video/selection", inputs, scan)
     began = time.monotonic()
     items = []
     retrieved = 0
-    for frame in selection["frames"]:
-        identifier = f"frame_{metadata['stream_index']}_{round(frame['timestamp'] * 1000000):012d}"
-        image = job / "frames" / f"{identifier}_{media_hash[:12]}.png"
-        if not image.is_file() or not image.stat().st_size:
-            _native_frame(media, metadata, frame["timestamp"], image)
-            retrieved += 1
-        items.append({"id": identifier, "image": str(image), **frame})
+    with tqdm(selection["frames"], desc="Video frames", unit="frame",
+              dynamic_ncols=True, disable=not selection["frames"]) as frames:
+        for frame in frames:
+            identifier = f"frame_{metadata['stream_index']}_{round(frame['timestamp'] * 1000000):012d}"
+            image = job / "frames" / f"{identifier}_{media_hash[:12]}.png"
+            if not image.is_file() or not image.stat().st_size:
+                _native_frame(media, metadata, frame["timestamp"], image)
+                retrieved += 1
+            items.append({"id": identifier, "image": str(image), **frame})
+    retrieval_seconds = time.monotonic() - began
+    items, novelty = filter_frames(job, items) if items else (items, {})
     return {"items": items, "diagnostics": {
         "settings": dict(SELECTION_SETTINGS), "clip_start": start, "clip_end": end,
         "proxy_frames": selection["proxy_frames"], "selected_frames": len(items),
         "scan_seconds": 0.0 if cache_hit else selection["seconds"],
-        "frame_retrieval_seconds": time.monotonic() - began,
+        "frame_retrieval_seconds": retrieval_seconds,
         "retrieved_frames": retrieved, "cache_hit": cache_hit,
-        "selection_note": "Conservative image changes; lecturer motion can retain extra frames.",
+        "region_frames": selection["region_frames"],
+        "full_frame_frames": selection["full_frame_frames"],
+        "novelty": novelty,
+        "selection_note": "Board/screen regions when detected; full-frame fallback otherwise. "
+                          "Person-aware novelty filtering runs before vision inference.",
     }}

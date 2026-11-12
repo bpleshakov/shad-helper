@@ -17,7 +17,8 @@ local = [
     "mlx-vlm>=0.7.6",
     "mlx-whisper>=0.4.3",
     "numpy>=2.4",
-    "opencv-python>=4.13",
+    "opencv-python>=4.13,<5",
+    "huggingface-hub>=0.34",
     "pillow>=12",
 ]
 

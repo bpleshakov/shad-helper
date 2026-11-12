@@ -12,6 +12,7 @@ import numpy as np
 
 from shad_helper.video import (
     SELECTION_SETTINGS,
+    _instructional_regions,
     _proxy_frames,
     _select_proxy_frames,
     packet_bounds,
@@ -21,6 +22,10 @@ from shad_helper.video import (
 
 
 class VideoTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch("shad_helper.frame_novelty._PersonSegmenter", return_value=
+                                lambda image: np.zeros(image.shape[:2], dtype=bool)))
+
     def test_probe_ignores_cover_and_preserves_stream_offset(self):
         data = {"streams": [
             {"index": 0, "codec_type": "video", "disposition": {"attached_pic": 1}},
@@ -155,6 +160,127 @@ class VideoTests(unittest.TestCase):
         self.assertEqual(selected[-1]["timestamp"], 4)
         self.assertTrue(any(frame["timestamp"] == 2 for frame in selected))
 
+    @staticmethod
+    def board_frame(step=0):
+        gray = np.full((240, 400), 40, np.uint8)
+        gray[20:180, 12:388] = 230
+        gray[50:54, 45:105] = 50
+        # Movement below the board, with more contrast than the writing.
+        x = 15 + (step * 7) % 300
+        gray[195:238, x:x + 50] = 110
+        return gray
+
+    def test_movement_outside_board_reduces_selection(self):
+        diagnostics = {}
+        frames = [(step / 2, self.board_frame(step)) for step in range(80)]
+        selected, count = _select_proxy_frames(iter(frames), diagnostics)
+        self.assertEqual(count, 80)
+        with patch("shad_helper.video._instructional_regions", return_value=None):
+            full_frame, _ = _select_proxy_frames(frames)
+        self.assertLess(len(selected), len(full_frame))
+        self.assertLessEqual(len(selected), 3)
+        self.assertEqual(diagnostics, {"region_frames": 80, "full_frame_frames": 0})
+        self.assertTrue(selected[0]["content_regions"])
+
+    def test_settled_outside_label_survives_erasure(self):
+        frames = []
+        for step in range(10):
+            gray = self.board_frame()
+            if 2 <= step < 8:
+                gray[205:217, 270:370] = 230
+            frames.append((step / 2, gray))
+        selected, _ = _select_proxy_frames(frames)
+        self.assertTrue(any(1 <= frame["timestamp"] < 4 for frame in selected))
+        self.assertTrue(any(frame["timestamp"] >= 4 for frame in selected))
+
+    def test_final_outside_content_does_not_need_another_sample(self):
+        first = self.board_frame()
+        last = first.copy()
+        last[207:211, 290:350] = 230
+        selected, _ = _select_proxy_frames([(0, first), (0.5, last)])
+        self.assertEqual(selected[-1]["timestamp"], 0.5)
+
+    def test_clear_representative_is_scored_inside_board(self):
+        frames = []
+        for step in range(6):
+            gray = self.board_frame()
+            if step:
+                gray[85:95, 70:170] = 20 if step == 2 else 36
+            # A sharp moving pattern below the board must not outweigh the
+            # clearer writing at t=1 when choosing a settled representative.
+            gray[195:] = 40
+            if step != 2:
+                gray[195:, step % 2::2] = 120
+            frames.append((step / 2, gray))
+        selected, _ = _select_proxy_frames(frames)
+        settled = [frame for frame in selected if frame["reason"] == "settled_change"]
+        self.assertEqual([frame["timestamp"] for frame in settled], [1])
+
+    def test_new_writing_and_erasure_survive_outside_motion(self):
+        frames = []
+        for step in range(9):
+            gray = self.board_frame(step)
+            if step in (1, 2):
+                gray[90:94, 50:100] = 50
+            frames.append((step / 2, gray))
+        selected, _ = _select_proxy_frames(frames)
+        self.assertIn((1, "before_erasure"),
+                      [(frame["timestamp"], frame["reason"]) for frame in selected])
+        self.assertGreaterEqual(selected[-1]["timestamp"], 1.5)
+
+    def test_two_detected_boards_preserve_independent_intermediate_drawings(self):
+        frames = []
+        for step in range(11):
+            gray = self.board_frame(step)
+            gray[20:180, 190:210] = 40
+            if 1 <= step < 5:
+                gray[95:100, 40:140] = 50
+            if step >= 5:
+                gray[95:100, 260:360] = 50
+            frames.append((step / 2, gray))
+        selected, _ = _select_proxy_frames(frames)
+        self.assertEqual(len(selected[0]["content_regions"]), 2)
+        self.assertTrue(any(0.5 <= frame["timestamp"] < 2.5 for frame in selected))
+        self.assertTrue(any(frame["timestamp"] >= 2.5 for frame in selected))
+
+    def test_region_detection_keeps_dark_diagrams_and_margin_labels(self):
+        gray = self.board_frame()
+        gray[65:145, 240:320] = 10
+        gray[18:22, 50:150] = 10
+        regions = _instructional_regions(gray)
+        self.assertIsNotNone(regions)
+        self.assertTrue(regions[1][65:145, 240:320].all())
+        self.assertTrue(regions[1][18:22, 50:150].all())
+
+    def test_full_frame_slides_and_ambiguous_layouts_use_full_frame(self):
+        slide = np.full((240, 400), 230, np.uint8)
+        slide[30:180, 30:370] = 255
+        small_panel = np.full((240, 400), 40, np.uint8)
+        small_panel[20:200, 20:190] = 230
+        dark_board = np.full((240, 400), 30, np.uint8)
+        dark_board[50:54, 45:105] = 240
+        for gray in (slide, small_panel, dark_board):
+            with self.subTest():
+                self.assertIsNone(_instructional_regions(gray))
+
+    def test_layout_change_rechecks_content_outside_previous_regions(self):
+        board = self.board_frame()
+        slide = np.full((240, 400), 230, np.uint8)
+        slide[210:218, 50:200] = 40
+        frames = [(0, board), (0.5, board), (1, slide), (1.5, slide), (2, slide)]
+        selected, _ = _select_proxy_frames(frames)
+        self.assertTrue(any(frame["timestamp"] >= 1 for frame in selected))
+        self.assertNotIn("content_regions", selected[-1])
+
+    def test_motion_inside_board_is_not_silently_masked(self):
+        frames = []
+        for step in range(10):
+            gray = self.board_frame(step)
+            gray[80:160, 40 + step * 15:100 + step * 15] = 40
+            frames.append((step / 2, gray))
+        selected, _ = _select_proxy_frames(frames)
+        self.assertGreater(len(selected), 1)
+
     def test_cache_rebuilds_missing_images_without_rescanning(self):
         metadata = {"stream_index": 1, "start": 2, "end": 200, "width": 320,
                     "height": 180, "duration": 198, "container_start": 0}
@@ -163,8 +289,10 @@ class VideoTests(unittest.TestCase):
             job = Path(directory)
 
             def native(media, meta, timestamp, image):
+                import cv2
+
                 image.parent.mkdir(parents=True, exist_ok=True)
-                image.write_bytes(b"image")
+                cv2.imwrite(str(image), blank)
 
             with (patch("shad_helper.video.probe_video", return_value=metadata),
                   patch("shad_helper.video._proxy_frames", return_value=[(105.25, blank)]) as scan,

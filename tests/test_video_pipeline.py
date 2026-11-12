@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from shad_helper import extraction, local_worker, video, vision_worker
+from shad_helper import extraction, frame_novelty, local_worker, video, vision_worker
 from shad_helper.illustrations import resolve_illustration
 from shad_helper.jobs import (
     AUDIO_CONFIG,
@@ -37,7 +37,10 @@ def pipeline(tmp_path, monkeypatch):
     probe_video = Mock(return_value=metadata)
     monkeypatch.setattr(extraction, "probe_video", probe_video)
     monkeypatch.setattr(video, "probe_video", probe_video)
+    monkeypatch.setattr(frame_novelty, "_PersonSegmenter", lambda:
+                        lambda image: np.zeros(image.shape[:2], dtype=bool))
     order = []
+    proxy_frames = {}
 
     def chunks(media, out, start, end, media_hash, audio_start=0):
         audio = out / "audio/chunk_0000.wav"
@@ -63,14 +66,16 @@ def pipeline(tmp_path, monkeypatch):
     def scan(*args):
         assert order[-1] == "asr"
         order.append("selection")
-        return [(105.25, blank), (106.75, changed)]
+        frames = [(105.25, blank), (106.75, changed)]
+        proxy_frames.update(frames)
+        return frames
 
     scan = Mock(side_effect=scan)
     monkeypatch.setattr(video, "_proxy_frames", scan)
 
     def native(media, metadata, timestamp, image):
         image.parent.mkdir(exist_ok=True)
-        Image.new("RGB", (320, 180), "white").save(image)
+        Image.fromarray(proxy_frames[timestamp]).convert("RGB").save(image)
 
     native = Mock(side_effect=native)
     monkeypatch.setattr(video, "_native_frame", native)
@@ -92,7 +97,7 @@ def pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(extraction, "_vision_worker", vision)
     return SimpleNamespace(media=media, job=job, order=order, transcribe=transcribe,
                            runtime=runtime, loader=loader, scan=scan, native=native,
-                           vision=vision, probe_video=probe_video)
+                           vision=vision, probe_video=probe_video, proxy_frames=proxy_frames)
 
 
 def run(pipeline, **kwargs):
@@ -222,6 +227,74 @@ def test_model_switches_reuse_audio_and_frames_but_refresh_visuals(pipeline):
     assert run(pipeline, vision_model="off")["schema_version"] == 3
     assert pipeline.runtime.infer.call_count == 6
     assert pipeline.transcribe.call_count == 1
+
+
+def test_board_regions_reduce_native_retrieval_and_inference_and_resume(pipeline):
+    def scan(*args):
+        pipeline.order.append("selection")
+        frames = []
+        for step in range(80):
+            gray = np.full((240, 400), 40, np.uint8)
+            gray[20:180, 12:388] = 230
+            gray[50:54, 45:105] = 50
+            x = 15 + (step * 7) % 300
+            gray[195:238, x:x + 50] = 110
+            frames.append((105 + step / 2, gray))
+        pipeline.proxy_frames.update(frames)
+        return frames
+
+    pipeline.probe_video.return_value.update(end=180, duration=178, width=400, height=240)
+    pipeline.scan.side_effect = scan
+    evidence = read_json(extraction.extract(pipeline.media, pipeline.job, start=105, duration=40))
+    assert len(evidence["visuals"]) == 2
+    assert pipeline.runtime.infer.call_count == 2
+    assert pipeline.native.call_count == 2
+    diagnostics = read_json(pipeline.job / "extraction-diagnostics.json")
+    assert diagnostics["selection"]["region_frames"] == 80
+    assert diagnostics["selection"]["full_frame_frames"] == 0
+    assert diagnostics["visuals"][0]["content_regions"]
+    assert "content_regions" not in evidence["visuals"][0]
+    assert read_json(extraction.extract(pipeline.media, pipeline.job,
+                                        start=105, duration=40)) == evidence
+    assert pipeline.runtime.infer.call_count == 2
+    assert pipeline.native.call_count == 2
+    pipeline.scan.assert_called_once()
+
+
+def test_novelty_filter_skips_inference_for_lecturer_motion_and_resumes(pipeline, monkeypatch):
+    frames = []
+    for step in range(80):
+        gray = np.full((240, 400), 240, np.uint8)
+        gray[25:30, 25:180] = 20
+        gray[90:95, 25:180] = 20
+        if step:
+            x = 30 + (step * 7) % 260
+            gray[50:, x:x + 60] = 80
+        frames.append((105 + step / 2, gray))
+
+    def scan(*args):
+        pipeline.order.append("selection")
+        pipeline.proxy_frames.update(frames)
+        return frames
+
+    factory = Mock(return_value=lambda image: np.all(image == 80, axis=2))
+    monkeypatch.setattr(frame_novelty, "_PersonSegmenter", factory)
+    pipeline.probe_video.return_value.update(end=180, duration=178, width=400, height=240)
+    pipeline.scan.side_effect = scan
+    candidates, _ = video._select_proxy_frames(frames)
+    assert len(candidates) > 1
+    evidence = read_json(extraction.extract(pipeline.media, pipeline.job, start=105, duration=40))
+    assert len(evidence["visuals"]) == 1
+    pipeline.runtime.infer.assert_called_once()
+    # Native candidates remain available for inspection even when inference is skipped.
+    assert pipeline.native.call_count == len(candidates)
+    selection = read_json(pipeline.job / "extraction-diagnostics.json")["selection"]
+    assert selection["novelty"]["suppressed_frames"] == len(candidates) - 1
+    assert read_json(extraction.extract(pipeline.media, pipeline.job,
+                                        start=105, duration=40)) == evidence
+    assert read_json(pipeline.job / "extraction-diagnostics.json")["selection"]["novelty"]["cache_hit"]
+    pipeline.runtime.infer.assert_called_once()
+    factory.assert_called_once()
 
 
 def test_illustration_crops_persist_and_legacy_jobs_upgrade_without_retranscription(pipeline):

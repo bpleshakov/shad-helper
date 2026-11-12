@@ -114,6 +114,48 @@ states, pre-erasure states and scrolling, then processed at native resolution
 up to the vision processor's 2.2-megapixel budget. Rotated streams must first be
 normalized. The recording still needs an audio stream.
 
+Frame selection scans proxies at 2 fps. Broad, bright rectangular board/screen
+surfaces guide change detection and sharpness scoring, suppressing movement
+outside them while keeping every detected panel and a margin around its edges.
+Uncertain layouts and settled changes outside those regions use whole-frame
+comparison. Pre-erasure, intermediate drawing, scrolling and time guards remain
+active. Selection diagnostics include `region_frames`,
+`full_frame_frames`, and per-image `content_regions` in proxy-pixel
+`[left, top, right, bottom]` coordinates. The updated selection version rescans
+older selections while retaining reusable transcription and vision checkpoints.
+
+A second pass suppresses candidates that add no visible instructional content.
+It uses the pinned, approximately 6 MB
+[PPHumanSeg model from OpenCV Zoo](https://github.com/opencv/opencv_zoo/tree/main/models/human_segmentation_pphumanseg)
+to mask foreground people, including people crossing a board. Comparisons
+compensate for small camera movements and smooth lighting changes, with a
+one-proxy-pixel tolerance and a separate check for small local annotations.
+Newly revealed writing, changed/erased strokes,
+scrolling boundaries, and clearer unobstructed views retain their native frames.
+The visibility map combines only pixels seen in retained source images; the
+lecture vision model still receives original images. All native candidates
+remain on disk for inspection.
+
+The person model downloads once into the existing Hugging Face cache. Local
+dependencies pin OpenCV below 5 because 5.0 misaligned this model's masks in
+validation; run `uv sync --extra local` when upgrading an existing environment.
+`checkpoints/video/novelty.json` records every retained/suppressed candidate and
+its reason. Its cache tracks image bytes, model revision/checksum, policy and
+OpenCV version. `extraction-diagnostics.json` reports candidate/suppression counts
+and filtering time under `selection.novelty`.
+
+To measure candidate reduction on saved extraction images without rerunning ASR
+or the lecture vision model:
+
+```bash
+.venv/bin/python -m scripts.frame_selection_benchmark out/lecture-job \
+  --out .cache/frame-selection-benchmark
+```
+
+The benchmark writes its own checkpoints and `report.json` outside the source
+job. Counts measure candidates that would skip inference. Full lecture runtime
+and content coverage still require evaluation on the recordings being processed.
+
 FFmpeg selects the first audio stream and produces 16 kHz mono WAV chunks.
 Ten-minute core intervals have five-second overlaps; each word belongs to one
 core interval. JSON, SRT, and VTT timestamps refer to the original recording.
