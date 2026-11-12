@@ -172,6 +172,167 @@ def test_segmenter_covers_both_edges_of_a_wide_recording():
     assert segmenter.net.forward.call_count == 5
 
 
+@pytest.fixture
+def segmenter():
+    instance = _PersonSegmenter.__new__(_PersonSegmenter)
+    instance.net = Mock()
+    return instance
+
+
+def test_person_geometry_includes_weak_edges_but_requires_a_confident_core(segmenter):
+    score = np.zeros((1, 2, 192, 192), np.float32)
+    score[0, 1, 80:, 60:120] = 0.3
+    score[0, 1, 100:120, 80:100] = 0.9
+    segmenter.net.forward.return_value = score
+    image = np.full((240, 240, 3), 180, np.uint8)
+    assert segmenter(image)[220, 100]
+    score[0, 1, 100:120, 80:100] = 0.3
+    assert not segmenter(image).any()
+
+
+def test_wide_board_diagram_near_bottom_is_not_a_standing_person(segmenter):
+    score = np.zeros((1, 2, 192, 192), np.float32)
+    score[0, 1, 60:180, 25:165] = 0.9
+    segmenter.net.forward.return_value = score
+    image = np.full((240, 240, 3), 240, np.uint8)
+    cv2.ellipse(image, (120, 150), (75, 45), 0, 0, 360, (180, 60, 60), 2)
+    assert not segmenter(image).any()
+
+
+@pytest.mark.parametrize("left,expected", [(150, False), (360, True)])
+def test_internal_pane_edges_support_cropped_people_but_not_portrait_outlines(
+        segmenter, left, expected):
+    image = np.full((240, 720, 3), 240, np.uint8)
+    image[:, 360:] = 160
+    image[70:170, left:left + 30] = (20, 100, 200)
+
+    def predict():
+        blob = segmenter.net.setInput.call_args.args[0]
+        person = (blob[0, 0] > 0.3) & (blob[0, 1] < 0) & (blob[0, 2] < 0)
+        score = np.zeros((1, 2, 192, 192), np.float32)
+        score[0, 1] = person * 0.9
+        return score
+
+    segmenter.net.forward.side_effect = predict
+    assert bool(segmenter(image)[120, left + 15]) == expected
+
+
+def test_confidence_drop_does_not_hide_brief_writing_revealed_under_a_pale_shirt(segmenter):
+    score = np.zeros((1, 2, 192, 192), np.float32)
+    score[0, 1, 80:, 60:120] = 0.9
+    segmenter.net.forward.return_value = score
+    image = np.full((240, 240, 3), 240, np.uint8)
+    cv2.putText(image, "A + B", (25, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20,) * 3, 2)
+    filterer = FrameNoveltyFilter(segmenter)
+    assert filterer.consider(image, "initial")[0]
+    score[0, 1, 80:, 60:120] = 0.1
+    written = image.copy()
+    written[180:184, 100:130] = 20
+    assert filterer.consider(written, "before_erasure")[0]
+    assert filterer.consider(image, "final_change")[0]
+
+
+def test_small_alignment_does_not_create_unknown_border_bands(monkeypatch):
+    monkeypatch.setattr(cv2, "findTransformECC", Mock(return_value=(
+        1.0, np.float32([[1, 0, 2], [0, 1, 1]]),
+    )))
+    image = np.full((240, 400), 240, np.uint8)
+    known = np.ones(image.shape, bool)
+    aligned, coverage, _ = frame_novelty._align(image, known, image, known)
+    assert coverage.all()
+    assert np.all(aligned == 240)
+    filterer = FrameNoveltyFilter(fake_person)
+    assert filterer.consider(cv2.cvtColor(image, cv2.COLOR_GRAY2BGR), "initial")[0]
+    image[100:130, -5:] = 20
+    assert filterer.consider(cv2.cvtColor(image, cv2.COLOR_GRAY2BGR), "final_change")[0]
+
+
+def test_later_additions_cover_earlier_writing_but_erasure_does_not():
+    earlier = board()
+    later = earlier.copy()
+    cv2.putText(later, "A + B", (240, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20,) * 3, 2)
+    visible = np.ones(earlier.shape[:2], bool)
+    assert frame_novelty._covers_content((earlier, visible), (later, visible))
+    assert not frame_novelty._covers_content((later, visible), (earlier, visible))
+
+
+def test_combining_preserves_marks_that_move_out_of_view(monkeypatch):
+    monkeypatch.setattr(cv2, "findTransformECC", Mock(return_value=(
+        1.0, np.float32([[1, 0, -4], [0, 1, 0]]),
+    )))
+    earlier = board()
+    earlier[195:215, 1:3] = 20
+    later = cv2.warpAffine(earlier, np.float32([[1, 0, -4], [0, 1, 0]]), (400, 240),
+                           borderMode=cv2.BORDER_REPLICATE)
+    visible = np.ones(earlier.shape[:2], bool)
+    assert not frame_novelty._covers_content((earlier, visible), (later, visible))
+
+
+@pytest.mark.parametrize("loss", ["erased", "hidden", "recolored", "blurred", "scene"])
+def test_combining_preserves_small_marks_color_visibility_and_readability(loss):
+    earlier = board()
+    cv2.ellipse(earlier, (300, 200), (6, 3), 0, 0, 360, (160, 40, 40), 1)
+    visible = np.ones(earlier.shape[:2], bool)
+    later = earlier.copy()
+    later_visible = visible.copy()
+    if loss == "erased":
+        later[190:210, 290:310] = 240
+    elif loss == "hidden":
+        later[190:210, 290:310] = 80
+        later_visible[190:210, 290:310] = False
+    elif loss == "recolored":
+        cv2.ellipse(later, (300, 200), (6, 3), 0, 0, 360, (40, 40, 160), 1)
+    elif loss == "blurred":
+        later = cv2.GaussianBlur(later, (9, 9), 2)
+    else:
+        later[:] = 100
+    assert not frame_novelty._covers_content((earlier, visible), (later, later_visible))
+
+
+def test_additive_groups_preserve_initial_view_bound_time_and_resolve_representatives(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(frame_novelty, "_PersonSegmenter", lambda: fake_person)
+    image = board()
+    items = []
+    # The final frame is within five seconds of its predecessor, but outside
+    # the first group's window. It must not extend that group indefinitely.
+    for index, timestamp in enumerate((0, 1, 3, 6, 7)):
+        if index:
+            cv2.putText(image, str(index), (210 + index * 30, 215),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20,) * 3, 2)
+        path = tmp_path / f"{index}.png"
+        cv2.imwrite(str(path), image)
+        items.append({"id": f"f{index}", "timestamp": timestamp, "image": str(path),
+                      "reason": "initial" if index == 0 else "before_erasure"})
+    selected, diagnostics = filter_frames(tmp_path, items)
+    assert selected == [items[0], items[3], items[4]]
+    assert diagnostics["merged_frames"] == 2
+    decisions = frame_novelty.read_json(tmp_path / "checkpoints/video/novelty.json")["result"]["decisions"]
+    assert [d["represented_by"] for d in decisions if not d["retained"]] == ["f3", "f3"]
+    assert all(d["novelty_retained"] for d in decisions)
+    assert filter_frames(tmp_path, items)[0] == selected
+    assert filter_frames(tmp_path, items)[1]["cache_hit"]
+
+
+@pytest.mark.parametrize("reason", ["scroll_overlap", "final_change"])
+def test_combining_keeps_scroll_boundaries_and_short_lived_pre_erasure_content(
+        tmp_path, monkeypatch, reason):
+    monkeypatch.setattr(frame_novelty, "_PersonSegmenter", lambda: fake_person)
+    initial = board()
+    written = initial.copy()
+    written[195:199, 250:280] = 20
+    final = written.copy() if reason == "scroll_overlap" else initial.copy()
+    items = []
+    for index, (image, selected_reason) in enumerate(((initial, "initial"),
+                                                     (written, "before_erasure"),
+                                                     (final, reason))):
+        path = tmp_path / f"{index}.png"
+        cv2.imwrite(str(path), image)
+        items.append({"id": f"f{index}", "timestamp": index, "image": str(path),
+                      "reason": selected_reason})
+    assert filter_frames(tmp_path, items)[0] == items
+
+
 def test_model_checksum_is_checked_before_loading(tmp_path, monkeypatch):
     import huggingface_hub
 

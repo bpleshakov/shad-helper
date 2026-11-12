@@ -130,19 +130,28 @@ It uses the pinned, approximately 6 MB
 to mask foreground people, including people crossing a board. Comparisons
 compensate for small camera movements and smooth lighting changes, with a
 one-proxy-pixel tolerance and a separate check for small local annotations.
+Masks also handle lecturers cropped by an inset camera pane and reduce false
+detections on broad board diagrams. Small camera shifts no
+longer create artificial unseen strips at the image borders.
 Newly revealed writing, changed/erased strokes,
 scrolling boundaries, and clearer unobstructed views retain their native frames.
-The visibility map combines only pixels seen in retained source images; the
-lecture vision model still receives original images. All native candidates
-remain on disk for inspection.
+Nearby additive writing stages are combined within a five-second window when a
+later clear frame preserves the visible marks from every earlier stage in the
+group. This can omit the order of intermediate strokes or labels. The first
+view, erasures, lost visibility, and scrolling boundaries prevent combining.
+Comparisons use aligned pixels and visibility masks; the lecture vision model
+still receives original images with their original timestamps. All native
+candidates remain on disk for inspection.
 
 The person model downloads once into the existing Hugging Face cache. Local
 dependencies pin OpenCV below 5 because 5.0 misaligned this model's masks in
 validation; run `uv sync --extra local` when upgrading an existing environment.
 `checkpoints/video/novelty.json` records every retained/suppressed candidate and
-its reason. Its cache tracks image bytes, model revision/checksum, policy and
+its reason, including the final `represented_by` source ID for combined stages.
+Its cache tracks image bytes, model revision/checksum, policy and
 OpenCV version. `extraction-diagnostics.json` reports candidate/suppression counts
-and filtering time under `selection.novelty`.
+as well as `merged_frames` and filtering time under `selection.novelty`. A changed
+filter policy recomputes these decisions while reusing matching vision results.
 
 To measure candidate reduction on saved extraction images without rerunning ASR
 or the lecture vision model:

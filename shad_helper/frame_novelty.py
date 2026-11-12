@@ -14,9 +14,14 @@ PERSON_MODEL = {
     "sha256": "552d8a984054e59b5d773d24b9b12022b22046ceb2bbc4c9aaeaceb36a9ddf24",
 }
 NOVELTY_SETTINGS = {
-    "version": 1,
+    "version": 4,
     "proxy_width": 720,
     "person_probability": 0.5,
+    "person_edge_probability": 0.2,
+    "pane_edge_threshold": 24,
+    "pane_edge_minimum_fraction": 0.4,
+    "standing_person_minimum_aspect": 1.25,
+    "person_bottom_fraction": 0.98,
     "person_margin_fraction": 0.01,
     "maximum_occlusion_fraction": 0.45,
     "minimum_overlap_fraction": 0.4,
@@ -30,6 +35,10 @@ NOVELTY_SETTINGS = {
     "comparison_margin_pixels": 10,
     "alignment_correlation": 0.9,
     "maximum_alignment_change": 0.03,
+    "merge_window_seconds": 5.0,
+    "merge_missing_fraction": 0.0004,
+    "merge_local_missing_pixels": 12,
+    "merge_minimum_sharpness_ratio": 0.85,
 }
 
 
@@ -64,17 +73,34 @@ class _PersonSegmenter:
             ))
             probability = cv2.resize(self.net.forward()[0, 1], (edge, height))
             score[:, left:left + edge] = np.maximum(score[:, left:left + edge], probability)
+        # An inset camera view can crop a lecturer at an internal pane edge.
+        edges = np.max(np.abs(image[:, 1:].astype(np.int16) - image[:, :-1]), axis=2)
+        edge_counts = np.pad(np.cumsum(edges > NOVELTY_SETTINGS["pane_edge_threshold"], axis=0),
+                             ((1, 0), (0, 0)))
         count, labels, stats, _ = cv2.connectedComponentsWithStats(
-            np.uint8(score > NOVELTY_SETTINGS["person_probability"]),
+            np.uint8(score > NOVELTY_SETTINGS["person_edge_probability"]),
         )
         people = np.zeros((height, width), np.uint8)
         for label in range(1, count):
             x, y, w, h, area = stats[label]
-            bottom = h >= height * 0.25 and y + h >= height * 0.85
-            side = h >= height * 0.1 and (x <= width * 0.1 or x + w >= width * 0.9)
+            bottom = (h >= height * 0.25 and y + h >= height * 0.85
+                      and (y + h >= height * NOVELTY_SETTINGS["person_bottom_fraction"]
+                           or h >= w * NOVELTY_SETTINGS["standing_person_minimum_aspect"]))
+            # A portrait's own outline is not a pane boundary. Require the
+            # boundary to continue outside the candidate person's vertical span.
+            outside_edges = edge_counts[-1] - (edge_counts[y + h] - edge_counts[y])
+            boundaries = np.flatnonzero(
+                outside_edges >= height * NOVELTY_SETTINGS["pane_edge_minimum_fraction"],
+            ) + 1
+            near_boundary = np.any(np.minimum(abs(boundaries - x), abs(boundaries - x - w))
+                                   <= width * 0.02)
+            side = h >= height * 0.1 and (x <= width * 0.1 or x + w >= width * 0.9 or near_boundary)
             # Interior portraits/figures on a slide are instructional candidates.
             if area >= height * width * 0.0005 and (bottom or side):
-                people[labels == label] = 1
+                component = labels == label
+                # Grow uncertain edges only around a confident person detection.
+                if np.max(score[component]) > NOVELTY_SETTINGS["person_probability"]:
+                    people[component] = 1
         margin = max(2, round(min(height, width) * NOVELTY_SETTINGS["person_margin_fraction"]))
         return cv2.dilate(people, np.ones((2 * margin + 1,) * 2, np.uint8)).astype(bool)
 
@@ -100,11 +126,68 @@ def _align(reference, known, gray, visible):
         # Blank or unrelated images need a direct comparison, not a guessed warp.
         warp = np.eye(2, 3, dtype=np.float32)
     size = (gray.shape[1], gray.shape[0])
+    # Small alignment shifts must not introduce black edges or unknown strips.
+    # Newly entering content still has to match the replicated boundary pixels.
     aligned = cv2.warpAffine(reference, warp, size,
-                             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+                             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                             borderMode=cv2.BORDER_REPLICATE)
     coverage = cv2.warpAffine(np.uint8(known), warp, size,
-                              flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP).astype(bool)
+                              flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+                              borderMode=cv2.BORDER_REPLICATE).astype(bool)
     return aligned, coverage, warp.tolist()
+
+
+def _covers_content(previous, current):
+    """Check that a later native frame preserves the earlier visible marks."""
+    import cv2
+    import numpy as np
+
+    first_image, known = previous
+    image, visible = current
+    if (first_image.shape != image.shape
+            or max((~known).mean(), (~visible).mean())
+            > NOVELTY_SETTINGS["maximum_occlusion_fraction"]):
+        return False
+    first_gray = cv2.cvtColor(first_image, cv2.COLOR_BGR2GRAY)
+    gray, _, warp = _align(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), visible, first_gray, known)
+    size = (first_gray.shape[1], first_gray.shape[0])
+    image = cv2.warpAffine(image, np.float32(warp), size,
+                           flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                           borderMode=cv2.BORDER_REPLICATE)
+    # Compare in the earlier frame's coordinates. Marks shifted out of view
+    # must count as missing, so visibility outside the later image stays false.
+    visible = cv2.warpAffine(np.uint8(visible), np.float32(warp), size,
+                             flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP).astype(bool)
+    common = known & visible
+    if common.mean() < NOVELTY_SETTINGS["minimum_overlap_fraction"]:
+        return False
+    changed = (cv2.absdiff(first_image, image).max(axis=2)
+               > NOVELTY_SETTINGS["pixel_threshold"]) & common
+    if changed.mean() >= NOVELTY_SETTINGS["scene_change_fraction"]:
+        return False
+    details = []
+    for pixels, coverage in ((first_image, known), (image, visible)):
+        # Normalize only against visible neighbors, without halos from people.
+        weights = cv2.GaussianBlur(coverage.astype(np.float32), (0, 0), 3)
+        mean = cv2.GaussianBlur(pixels.astype(np.float32) * coverage[:, :, None], (0, 0), 3)
+        mean /= np.maximum(weights[:, :, None], 1e-6)
+        details.append((pixels - mean) * coverage[:, :, None])
+    first, second = details
+    threshold = NOVELTY_SETTINGS["contrast_threshold"]
+    kernel = np.ones((3, 3), np.uint8)
+    missing = np.any(np.abs(first) > threshold, axis=2) & known & ~visible
+    for sign in (-1, 1):
+        missing |= np.any((first * sign > threshold)
+                          & (first * sign > cv2.dilate(second * sign, kernel) + threshold),
+                          axis=2) & common
+    window = NOVELTY_SETTINGS["local_change_window"]
+    local_missing = cv2.boxFilter(missing.astype(np.float32), -1, (window, window),
+                                  normalize=False, borderType=cv2.BORDER_CONSTANT).max()
+    old_sharpness = cv2.Laplacian(first_gray, cv2.CV_32F)[common].var()
+    new_sharpness = cv2.Laplacian(gray, cv2.CV_32F)[common].var()
+    return bool(missing.mean() < NOVELTY_SETTINGS["merge_missing_fraction"]
+                and local_missing < NOVELTY_SETTINGS["merge_local_missing_pixels"]
+                and new_sharpness >= old_sharpness * NOVELTY_SETTINGS["merge_minimum_sharpness_ratio"])
 
 
 class FrameNoveltyFilter:
@@ -114,6 +197,7 @@ class FrameNoveltyFilter:
         self.segmenter = _PersonSegmenter() if segmenter is None else segmenter
         self.reference = self.known = None
         self.best_occlusion = 1.0
+        self.current = None
 
     def consider(self, image, reason):
         import cv2
@@ -124,6 +208,7 @@ class FrameNoveltyFilter:
         image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         visible = ~self.segmenter(image)
+        self.current = image, visible
         occlusion = float((~visible).mean())
         metrics = {"occluded_fraction": occlusion, "changed_fraction": 0.0,
                    "newly_visible_fraction": 0.0}
@@ -201,6 +286,9 @@ def filter_frames(job: Path, items: list[dict]) -> tuple[list[dict], dict]:
     def scan():
         filterer = FrameNoveltyFilter()
         decisions = []
+        group = []
+        group_start = 0.0
+        retained_count = 0
         with tqdm(items, desc="Video filtering", unit="frame",
                   dynamic_ncols=True, disable=not items) as frames:
             for item in frames:
@@ -208,13 +296,36 @@ def filter_frames(job: Path, items: list[dict]) -> tuple[list[dict], dict]:
                 if image is None:
                     raise ValueError(f"Cannot read selected frame: {item['image']}")
                 keep, metrics = filterer.consider(image, item["reason"])
-                decisions.append({"id": item["id"], "timestamp": item["timestamp"],
-                                  "retained": keep, **metrics})
+                decision = {"id": item["id"], "timestamp": item["timestamp"],
+                            "retained": keep, "novelty_retained": keep, **metrics}
+                if keep:
+                    # Preserve the initial view and bound the whole group, so a
+                    # chain of additions cannot delay a representative indefinitely.
+                    if (retained_count > 1
+                            and item["timestamp"] - group_start <= NOVELTY_SETTINGS["merge_window_seconds"]
+                            and item["reason"] != "scroll_overlap"
+                            and group[-1][1] != "scroll_overlap"
+                            and all(_covers_content(entry[2], filterer.current) for entry in group)):
+                        group[-1][0].update(retained=False, reason="covered_by_later_frame",
+                                            represented_by=item["id"])
+                    else:
+                        group_start = item["timestamp"]
+                        group = []
+                        retained_count += 1
+                    group.append((decision, item["reason"], filterer.current))
+                decisions.append(decision)
+        representatives = {}
+        for decision in reversed(decisions):
+            if "represented_by" in decision:
+                decision["represented_by"] = representatives[decision["represented_by"]]
+            representatives[decision["id"]] = decision.get("represented_by", decision["id"])
         return {"decisions": decisions}
 
     result = checkpoint(job, "video/novelty", inputs, scan)
     retained = {item["id"] for item in result["decisions"] if item["retained"]}
     selected = [item for item in items if item["id"] in retained]
     return selected, {"candidate_frames": len(items), "suppressed_frames": len(items) - len(selected),
+                      "merged_frames": sum(item["reason"] == "covered_by_later_frame"
+                                           for item in result["decisions"]),
                       "seconds": time.monotonic() - started, "cache_hit": cache_hit,
                       "model": dict(PERSON_MODEL), "settings": dict(NOVELTY_SETTINGS)}
