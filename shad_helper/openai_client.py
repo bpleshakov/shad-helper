@@ -162,11 +162,12 @@ class PlanClient:
         print("OpenAI API credits exhausted; switching to saved ChatGPT login.", file=sys.stderr)
         return True
 
-    def models(self) -> list[str]:
+    def models(self, *, allow_fallback: bool = True) -> list[str]:
+        """List models; disable fallback to check the current credentials independently."""
         try:
             return self._models()
         except PlanAccessError as exc:
-            if not self._fallback_to_login(exc):
+            if not allow_fallback or not self._fallback_to_login(exc):
                 raise
             return self._models()
 

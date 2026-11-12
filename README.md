@@ -32,9 +32,13 @@ before the vision worker loads, so their model memory is not held together.
 Once tools and weights are installed, extraction works
 offline; use `HF_HUB_OFFLINE=1` to disable Hugging Face network access.
 
-With an API key or app-owned login credentials and a configured OpenAI proxy, `doctor` also lists
-account-available models and reports default-model availability. It does not
-start login or generate notes. Local checks determine its exit status.
+With a configured OpenAI proxy, `doctor` checks models independently for the API key
+and saved ChatGPT login. Its JSON contains `openai.api_key` and `openai.chatgpt_login`,
+each with `status`, `models`, `default_model`, and `default_model_available`.
+The API key comes from `OPENAI_API_KEY` or `config/openai.env`; the login check always
+uses app-owned credentials. Missing setup is reported as `not_checked`; an error in
+one check does not prevent the other. Catalog checks never fall back from the API key
+to login, start login, or generate notes. Local checks determine the command's exit status.
 
 ## Run the complete pipeline
 

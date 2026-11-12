@@ -8,6 +8,7 @@ import pytest
 
 from shad_helper import auth
 from shad_helper.auth import PlanAccessError
+from shad_helper.cli import main
 from shad_helper.openai_client import DEFAULT_MODEL, PlanClient, ResponseError
 from shad_helper.openai_config import load_api_key
 
@@ -254,3 +255,62 @@ def test_non_billing_failures_do_not_use_login(tmp_path, mode):
     with pytest.raises((PlanAccessError, ResponseError)):
         client.complete("Instructions", "Lecture")
     token.assert_not_called()
+
+
+@pytest.mark.parametrize(("failed_source", "code"), [
+    (None, None),
+    ("api_key", "credit_balance_exhausted"),
+    ("api_key", "insufficient_quota"),
+    ("api_key", "invalid_api_key"),
+    ("chatgpt_login", "authentication_error"),
+])
+def test_doctor_keeps_auth_catalogs_and_failures_separate(
+        tmp_path, monkeypatch, capsys, failed_source, code):
+    from shad_helper import cli, openai_client
+
+    monkeypatch.setenv("OPENAI_API_KEY", "api-key")
+    monkeypatch.setattr(cli.importlib.util, "find_spec", lambda name: True)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    state_dir = tmp_path / "auth"
+    state_dir.mkdir()
+    (state_dir / "credentials.json").write_text("{}")
+    token = Mock(return_value="plan-token")
+    monkeypatch.setattr(openai_client, "access_token", token)
+    browser = Mock(side_effect=AssertionError("Unexpected browser login"))
+    monkeypatch.setattr(auth.webbrowser, "open", browser)
+    requests = []
+
+    def handle(request):
+        assert request.method == "GET"
+        assert str(request.url) == "https://api.openai.com/v1/models"
+        authorization = request.headers["Authorization"]
+        requests.append(authorization)
+        source = "api_key" if authorization == "Bearer api-key" else "chatgpt_login"
+        if source == failed_source:
+            return httpx.Response(429, json={"error": {"code": code, "message": "private detail"}})
+        if source == "api_key":
+            return httpx.Response(200, json={"data": [{"id": DEFAULT_MODEL}, {"id": "api-only"}]})
+        return httpx.Response(200, json={"models": [
+            {"slug": "login-only", "visibility": "list"},
+            {"slug": "hidden", "visibility": "hide"}]})
+
+    monkeypatch.setattr(openai_client, "openai_http_client",
+                        lambda **kwargs: httpx.Client(transport=httpx.MockTransport(handle)))
+    assert main(["--state-dir", str(state_dir), "doctor"]) == 0
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)["openai"]
+    assert set(report) == {"api_key", "chatgpt_login"}
+    for source, available in {"api_key": [DEFAULT_MODEL, "api-only"],
+                              "chatgpt_login": ["login-only"]}.items():
+        result = report[source]
+        failed = source == failed_source
+        assert result["status"] == ("error" if failed else "available")
+        assert result["models"] == ([] if failed else available)
+        assert result["default_model"] == DEFAULT_MODEL
+        assert result["default_model_available"] is (None if failed else DEFAULT_MODEL in available)
+    assert requests == ["Bearer api-key", "Bearer plan-token"]
+    token.assert_called_once_with(state_dir, proxy="http://offline-proxy:8080", transport=None)
+    browser.assert_not_called()
+    for secret in ("api-key", "plan-token", "private detail", "switching"):
+        assert secret not in captured.out + captured.err
+    assert "API requests: 0; ChatGPT-plan requests: 0." in captured.err

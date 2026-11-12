@@ -76,7 +76,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def doctor(state_dir: Path = Path(".shad-helper/auth"), *, proxy: str | None = None) -> bool:
-    from .openai_config import API_KEY_FILE
+    from .openai_config import load_api_key
 
     packages = {name: importlib.util.find_spec(name) is not None for name in (
         "httpx", "jwt", "pydantic", "pymupdf")}
@@ -84,34 +84,38 @@ def doctor(state_dir: Path = Path(".shad-helper/auth"), *, proxy: str | None = N
     packages.update({name: importlib.util.find_spec(name) is not None
                      for name in ("mlx", "mlx_whisper", "mlx_vlm", "numpy", "cv2", "PIL")})
     tools = {name: shutil.which(name) for name in ("ffmpeg", "ffprobe", "latexmk", "lualatex")}
-    openai = {"status": "not_checked", "models": [], "default_model": "gpt-6-astra",
-              "default_model_available": None}
+    openai = {}
     configured_proxy = os.environ.get("SHAD_HELPER_OPENAI_PROXY") if proxy is None else proxy
-    if not (os.environ.get("OPENAI_API_KEY") or API_KEY_FILE.is_file()
-            or (Path(state_dir) / "credentials.json").is_file()):
-        openai["message"] = "Set OPENAI_API_KEY in the environment or config/openai.env, " \
-                            "or run shad-helper login to authorize ChatGPT plan access."
-    elif not configured_proxy:
-        openai["message"] = "Configure --openai-proxy or SHAD_HELPER_OPENAI_PROXY to check models."
-    elif not packages["httpx"] or not packages["jwt"]:
-        openai["message"] = "Install HTTP/auth dependencies with uv sync before checking models."
-    else:
+    for source in ("api_key", "chatgpt_login"):
+        result = {"status": "not_checked", "models": [], "default_model": None,
+                  "default_model_available": None}
+        openai[source] = result
         try:
-            from .openai_client import PlanClient
-            client = PlanClient(state_dir, proxy=proxy)
-            openai["default_model"] = client.model
-            openai["models"] = client.models()
-            openai["status"] = "available"
-            openai["default_model_available"] = client.model in openai["models"]
-            if not openai["default_model_available"]:
-                openai["message"] = "The default notes model is unavailable for this account."
+            api_key = load_api_key() if source == "api_key" else ""
+            if source == "api_key" and not api_key:
+                result["message"] = "Set OPENAI_API_KEY in the environment or config/openai.env."
+            elif source == "chatgpt_login" and not (Path(state_dir) / "credentials.json").is_file():
+                result["message"] = "Run shad-helper login to authorize ChatGPT plan access."
+            elif not configured_proxy:
+                result["message"] = "Configure --openai-proxy or SHAD_HELPER_OPENAI_PROXY to check models."
+            elif not packages["httpx"] or not packages["jwt"]:
+                result["message"] = "Install HTTP/auth dependencies with uv sync before checking models."
+            else:
+                from .openai_client import PlanClient
+                client = PlanClient(state_dir, proxy=proxy, api_key=api_key)
+                result["default_model"] = client.model
+                result["models"] = client.models(allow_fallback=False)
+                result["status"] = "available"
+                result["default_model_available"] = client.model in result["models"]
+                if not result["default_model_available"]:
+                    result["message"] = "The default notes model is unavailable for this account."
         except ModuleNotFoundError:
-            openai["message"] = "Install HTTP/auth dependencies with uv sync before checking models."
+            result["message"] = "Install HTTP/auth dependencies with uv sync before checking models."
         except ValueError:
-            openai.update(status="error", message="Invalid OpenAI configuration; check "
-                          "config/openai.env and the --openai-proxy or SHAD_HELPER_OPENAI_PROXY URL.")
+            result.update(status="error", message="Invalid OpenAI configuration; check "
+                          "credentials and the --openai-proxy or SHAD_HELPER_OPENAI_PROXY URL.")
         except (OSError, RuntimeError):
-            openai.update(status="error", message="Could not check the OpenAI model catalog. "
+            result.update(status="error", message="Could not check the OpenAI model catalog. "
                           "Verify proxy connectivity, API key and account access; run shad-helper login "
                           "if needed, then retry.")
     print(json.dumps({"python": sys.version.split()[0], "platform": platform.platform(),

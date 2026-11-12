@@ -249,13 +249,15 @@ def test_doctor_reports_account_models_and_default_availability(doctor_catalog, 
     models.return_value = available
     assert main(["--state-dir", str(state_dir), "doctor"]) == 0
     report = json.loads(capsys.readouterr().out)
-    assert report["openai"]["status"] == "available"
-    assert report["openai"]["models"] == available
-    assert report["openai"]["default_model"] == "gpt-6-astra"
-    assert report["openai"]["default_model_available"] is ("gpt-6-astra" in available)
+    login = report["openai"]["chatgpt_login"]
+    assert login["status"] == "available"
+    assert login["models"] == available
+    assert login["default_model"] == "gpt-6-astra"
+    assert login["default_model_available"] is ("gpt-6-astra" in available)
+    assert report["openai"]["api_key"]["status"] == "not_checked"
     assert all(report["packages"].values())
-    factory.assert_called_once_with(state_dir, proxy=None)
-    models.assert_called_once_with()
+    factory.assert_called_once_with(state_dir, proxy=None, api_key="")
+    models.assert_called_once_with(allow_fallback=False)
 
 
 @pytest.mark.parametrize("source", ["environment", "file"])
@@ -271,17 +273,57 @@ def test_doctor_checks_api_key_without_saved_login(
     assert main(["--state-dir", str(state_dir), "doctor"]) == 0
     captured = capsys.readouterr()
     report = json.loads(captured.out)
-    assert report["openai"]["status"] == "available"
-    factory.assert_called_once_with(state_dir, proxy=None)
-    models.assert_called_once_with()
+    assert report["openai"]["api_key"]["status"] == "available"
+    assert report["openai"]["chatgpt_login"]["status"] == "not_checked"
+    factory.assert_called_once_with(state_dir, proxy=None, api_key="private-key")
+    models.assert_called_once_with(allow_fallback=False)
     assert "private-key" not in captured.out + captured.err
     assert not (state_dir / ".lock").exists()
+
+
+@pytest.mark.parametrize(("contents", "status"), [
+    ("# No key\nUNRELATED=value\n", "not_checked"),
+    ("OPENAI_API_KEY=\n", "not_checked"),
+    ('OPENAI_API_KEY="private-key\n', "error"),
+])
+def test_doctor_missing_or_invalid_key_does_not_block_login(
+        doctor_catalog, tmp_path, capsys, contents, status):
+    state_dir, factory, models = doctor_catalog
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/openai.env").write_text(contents)
+
+    assert main(["--state-dir", str(state_dir), "doctor"]) == 0
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)["openai"]
+    assert report["api_key"]["status"] == status
+    assert report["api_key"]["models"] == []
+    assert report["chatgpt_login"]["status"] == "available"
+    factory.assert_called_once_with(state_dir, proxy=None, api_key="")
+    models.assert_called_once_with(allow_fallback=False)
+    assert "private-key" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("key", ["", "  "])
+def test_doctor_explicit_empty_key_disables_file_key(
+        doctor_catalog, monkeypatch, tmp_path, capsys, key):
+    state_dir, factory, _ = doctor_catalog
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/openai.env").write_text("OPENAI_API_KEY=private-key\n")
+    monkeypatch.setenv("OPENAI_API_KEY", key)
+
+    assert main(["--state-dir", str(state_dir), "doctor"]) == 0
+    report = json.loads(capsys.readouterr().out)["openai"]
+    assert report["api_key"]["status"] == "not_checked"
+    assert report["chatgpt_login"]["status"] == "available"
+    factory.assert_called_once_with(state_dir, proxy=None, api_key="")
 
 
 @pytest.mark.parametrize("missing", ["credentials", "proxy", "explicit_blank", "dependency"])
 def test_doctor_skips_catalog_without_required_setup(doctor_catalog, monkeypatch, capsys, missing):
     state_dir, factory, models = doctor_catalog
     proxy = None
+    if missing != "credentials":
+        monkeypatch.setenv("OPENAI_API_KEY", "private-key")
     if missing == "credentials":
         (state_dir / "credentials.json").unlink()
     elif missing == "proxy":
@@ -295,13 +337,15 @@ def test_doctor_skips_catalog_without_required_setup(doctor_catalog, monkeypatch
                             lambda name: None if name == "httpx" else SimpleNamespace())
     assert cli.doctor(state_dir, proxy=proxy) is (missing != "dependency")
     report = json.loads(capsys.readouterr().out)
-    assert report["openai"]["status"] == "not_checked"
-    assert report["openai"]["models"] == []
-    assert report["openai"]["default_model"] == "gpt-6-astra"
-    assert report["openai"]["default_model_available"] is None
     expected = {"credentials": "login", "proxy": "--openai-proxy",
                 "explicit_blank": "--openai-proxy", "dependency": "uv sync"}
-    assert expected[missing] in report["openai"]["message"]
+    for source, result in report["openai"].items():
+        assert result["status"] == "not_checked"
+        assert result["models"] == []
+        assert result["default_model"] is None
+        assert result["default_model_available"] is None
+        hint = "OPENAI_API_KEY" if missing == "credentials" and source == "api_key" else expected[missing]
+        assert hint in result["message"]
     factory.assert_not_called()
     models.assert_not_called()
     assert not (state_dir / ".lock").exists()
@@ -317,11 +361,11 @@ def test_doctor_catalog_errors_are_safe_and_do_not_fail_local_checks(doctor_cata
         models.side_effect = OSError(secret) if failure == "network" else RuntimeError(secret)
     assert main(["--state-dir", str(state_dir), "doctor"]) == 0
     captured = capsys.readouterr()
-    report = json.loads(captured.out)
-    assert report["openai"]["status"] == "error"
-    assert report["openai"]["models"] == []
-    assert report["openai"]["default_model_available"] is None
-    assert "proxy" in report["openai"]["message"]
+    report = json.loads(captured.out)["openai"]["chatgpt_login"]
+    assert report["status"] == "error"
+    assert report["models"] == []
+    assert report["default_model_available"] is None
+    assert "proxy" in report["message"]
     assert secret not in captured.out + captured.err
     assert "password" not in captured.out + captured.err
 
@@ -334,7 +378,7 @@ def test_doctor_catalog_error_preserves_local_dependency_failure(doctor_catalog,
     assert main(["--state-dir", str(state_dir), "doctor"]) == 1
     report = json.loads(capsys.readouterr().out)
     assert report["packages"]["mlx_whisper"] is False
-    assert report["openai"]["status"] == "error"
+    assert report["openai"]["chatgpt_login"]["status"] == "error"
 
 
 @pytest.mark.parametrize(("proxy", "position"), [
