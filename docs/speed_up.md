@@ -2,7 +2,7 @@
 
 Analysis date: 2026-11-12.
 
-Goal: reduce lecture-processing time while preserving the current quality of lecture notes and illustrations. This document consolidates the read-only analysis of saved artifacts in `out/` and `out_algo/`. No pipeline changes, model calls, or performance experiments were made during that analysis. The implementation and local validation of priority 1 on 2026-11-13 are recorded below; the audit figures remain historical.
+Goal: reduce lecture-processing time while preserving the current quality of lecture notes and illustrations. This document consolidates the read-only analysis of saved artifacts in `out/` and `out_algo/`. No pipeline changes, model calls, or performance experiments were made during that analysis. The implementation and local validation of priorities 1 and 2 on 2026-11-13 are recorded below; the audit figures remain historical.
 
 ## Main findings
 
@@ -205,11 +205,45 @@ uv run python scripts/illustration_states_benchmark.py \
 
 ### 2. Improve alternative matching before remote verification
 
-`_matching_figures` currently ranks candidates using source identity, topic equality, word overlap, and temporal distance, returning up to three candidates. Topic equality can admit different instructional figures into expensive comparison.
+Before this optimization, `_matching_figures` ranked candidates using source identity, topic equality, word overlap, and temporal distance, returning up to three candidates. Topic equality could admit different instructional figures into expensive comparison.
 
 Use stronger visual matching and figure-state tracking to rank plausible alternatives. Clear incompatibilities in panels or axis labels can help reject poor candidates; uncertain extraction must not silently eliminate a valid candidate. Retain unmatched source content and the existing recovery path.
 
 The 27.1% alternative pass share identifies a promising target, but is not itself a measured avoidable-call rate.
+
+Implemented on 2026-11-13 in [`illustration_matching.py`](../shad_helper/illustration_matching.py) and [`illustration_verification.py`](../shad_helper/illustration_verification.py), with an aggressive default shortlist:
+
+- Rank the actual managed source crops using locally matched visual features and geometric alignment. Count distinct matched target features so repeated labels cannot inflate the score above one. Match partial views against larger figures at several scales as an additional safeguard. A strong visual match can qualify despite different topics or descriptions.
+- Remember up to three source views already verified against each exact target crop. These examples help retrieve later stages or partial views that resemble an accepted observation more than the final figure. They influence retrieval only: they never authorize a merge or propagate a remote verdict.
+- Drop a candidate from the initial alternative search only when both observations have complete extraction and known source kinds, both crops have enough visual features, and both the feature and partial-view scores are weak. Missing optional OpenCV dependencies, sparse images, unknown source kinds, and incomplete extraction retain the text fallback.
+- Try just the leading alternative when its matched-feature fraction is at least `0.10` and it leads the second candidate by at least `0.02`; otherwise retain up to three alternatives. Uncertain candidates keep the broader budget. These are retrieval heuristics, not proof of equivalence.
+- Preserve the initial coverage check, remote merge verification, and unmatched-source fallback. Recompute retrieval after crop refinement, using its actual pixels. Refinement, recovery, and final figure reconciliation use the broader three-candidate search without visual pruning or the one-candidate limit. Recovery of an alias uses that observation's source, not a crop belonging to the failed representative.
+- Cache descriptors and pair scores within each stage. Save policy settings, candidate scores, verified source examples, crop IDs, and selected alternatives in `matching.json` beside the ordinary comparison diagnostics.
+
+The local replay covers the latest saved attempts in **17 currently completed jobs**, a different population from the original 15-job audit. It reads archived image pairs and verdicts, validates image hashes, and learns only from earlier accepted comparisons. It does not feed a pruned historical pass back into the source-view tracker.
+
+| Saved jobs | Archived alternative comparisons | Retained in shortlist | Reduction | Recorded passes retained |
+|---|---:|---:|---:|---:|
+| Eight ML jobs (`out/`) | 1,200 | 707 | 41.1% | 295 / 305 |
+| Nine algorithms jobs (`out_algo/`) | 1,874 | 1,377 | 26.5% | 843 / 863 |
+| **Total** | **3,074** | **2,084** | **32.2%** | **1,138 / 1,168 (97.4%)** |
+
+The replay took **59.15 seconds** locally. Two alternative verdict records without saved requests were excluded. Stopping at the first recorded pass among the retained candidates would evaluate 2,037 pairs, but that is also a retrospective replay count, not a measured API-call reduction.
+
+**Aggressive-policy tradeoff:** 30 recorded successful pairs fell outside the initial shortlist. Their source observations remain eligible for separate screenshots, refinement, recovery, and final reconciliation, but this can add figures or recovery work. Retaining source content does not establish unchanged final deduplication or lecture quality. The replay considers only historically evaluated alternatives; new candidates, changed fallback paths, wider candidate pools, existing caches, and remote retries can change real costs. No live verification or full lecture regeneration was performed, and **32.2% is not an end-to-end runtime improvement**.
+
+Regression tests exercise scaled and partial views, strong candidates outside the text shortlist, uncertain extraction, missing dependencies, actual refined crops, crop-specific tracking, recovery, and archive integrity. Controlled complete-finalization tests produce identical notes with **four mocked remote comparisons reduced to two (50%)** for a successful alternative or a visually similar but semantically rejected one, and **four reduced to one (75%)** when every alternative is incompatible. The latter cases retain the unmatched source screenshot. The focused matching/verification suite passes all 115 tests; the broader illustration, notes, crop, and figure suite passes 532 tests with a writable temporary TeX cache.
+
+The full-suite run with that cache reported 1,399 passed, 56 failed, and one skipped. Every failing test also failed on an isolated, untouched `HEAD` checkout; the remaining failures concern existing handoff/OpenAI client and usage expectations. No new failing test was introduced. Ruff and `git diff --check` pass.
+
+Reproduce the read-only replay with [`illustration_matching_benchmark.py`](../scripts/illustration_matching_benchmark.py):
+
+```sh
+uv run python scripts/illustration_matching_benchmark.py \
+  --out /tmp/illustration-matching-replay out/* out_algo/*
+```
+
+The output contains aggregate reports and per-pair scores, retained/pruned decisions, and historical verdicts. Input jobs are not modified.
 
 ### 3. Batch remaining checks against a common representative
 

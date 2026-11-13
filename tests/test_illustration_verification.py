@@ -1056,6 +1056,72 @@ def test_matching_figures_prioritizes_topic_over_generic_description_similarity(
     assert len(ranked) == 3 and ranked[0]["id"] == "histograms"
 
 
+@pytest.mark.parametrize("has_match,accepted_match", [(False, False), (True, True), (True, False)])
+def test_visual_shortlist_reduces_calls_without_changing_notes(
+        example, monkeypatch, has_match, accepted_match):
+    import cv2
+    import numpy as np
+
+    job, evidence, notes, _ = example
+    add_aliased_observation(example)
+    chapter = notes["chapters"][0]
+    manifest = read_json(job / "illustrations/manifest.json")
+    sources = []
+    for seed in range(4):
+        image = np.full((320, 480, 3), 245, np.uint8)
+        rng = np.random.default_rng(seed)
+        for number in range(45):
+            point = tuple(int(value) for value in rng.integers([10, 20], [430, 290]))
+            cv2.putText(image, f"{seed}:{number}", point, cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (20, 30, 40), 1, cv2.LINE_AA)
+        if seed == 3 and has_match:
+            image = cv2.resize(sources[0], None, fx=0.8, fy=0.8)
+            if not accepted_match:
+                cv2.putText(image, "CHANGED", (60, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (0, 0, 0), 2)
+        sources.append(image)
+        identifier = f"v{seed + 2:02}_ill01"
+        path = job / "illustrations" / f"{identifier}.png"
+        assert cv2.imwrite(str(path), image)
+        observation = {"id": identifier, "source_kind": "printed", "box": [0, 0, 1, 1],
+                       "description": "Учебный график", "image_sha256": sha256_file(path)}
+        manifest["assets"][identifier] = {"path": f"illustrations/{identifier}.png",
+                                          "sha256": observation["image_sha256"]}
+        if seed == 0:
+            evidence["visuals"][1]["illustrations"] = [observation]
+        else:
+            evidence["visuals"].append({"id": f"v{seed + 2:02}", "timestamp": 5 + seed,
+                                         "status": "complete", "illustrations": [observation]})
+            chapter["blocks"].append({**deepcopy(block(notes)), "id": f"alternative{seed}",
+                "illustration_id": identifier, "caption": "График", "content": "График",
+                "topic": "Другое название" if seed == 3 else block(notes)["topic"]})
+    write_json(job / "illustrations/manifest.json", manifest)
+    match_hash = manifest["assets"]["v05_ill01"]["sha256"]
+
+    class Compare(Client):
+        def complete(self, instructions, text, schema, *, images):
+            self.calls.append((instructions, text, schema, images))
+            passed = accepted_match and sha256_file(images[1][1]) == match_hash
+            return {"verdict": "pass" if passed else "fail", "reason": "Сравнение рисунков."}
+
+    optimized = Compare()
+    accepted, retry = finalize(example, optimized)
+    assert not retry and len(optimized.calls) == (2 if has_match else 1)
+    search = read_json(job / "attempt/illustration-coverage/v02_ill01/matching.json")
+    assert search["selected"] == (["alternative3"] if has_match else [])
+    matching = verification._matching_figures
+    monkeypatch.setattr(verification, "_matching_figures", lambda current, retained, observations,
+                        **kwargs: matching(current, retained, observations))
+    monkeypatch.setattr(verification, "_cached_verdict", lambda *args: None)
+    baseline = Compare()
+    previous, retry = finalize(example, baseline, "baseline")
+    assert not retry and previous == accepted
+    assert len(baseline.calls) == 4
+    if not accepted_match:
+        assert any(item.get("illustration_id") == "v02_ill01"
+                   for item in accepted["chapters"][0]["blocks"])
+
+
 def test_new_distinct_fallback_extends_existing_prose_references(example):
     _, _, notes, _ = example
     add_aliased_observation(example)

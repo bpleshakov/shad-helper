@@ -13,6 +13,12 @@ from tqdm import tqdm
 from . import rendering
 from .auth import PlanAccessError
 from .illustration_crops import refine_crop, resolve_crop
+from .illustration_matching import (
+    MATCHING_SETTINGS,
+    VisualMatcher,
+    candidate_limit,
+    visually_plausible,
+)
 from .illustration_states import (
     SOURCE_STATE_SETTINGS,
     group_source_states,
@@ -330,7 +336,7 @@ def _consolidation(observation, block, job, evidence, folder, client, *, source_
     return verdict, transient
 
 
-def _matching_figures(current, retained, observations):
+def _matching_figures(current, retained, observations, *, matcher=None, archive=None, broad=False):
     """Retrieve a few plausible matches; only visual verification can merge them."""
     def words(block):
         source = observations[block["illustration_id"]]
@@ -340,6 +346,7 @@ def _matching_figures(current, retained, observations):
     tokens = words(current)
     topic = " ".join(current.get("topic", "").casefold().split())
     ranked = []
+    decisions = []
     for position, block in enumerate(retained):
         if block["id"] == current["id"] or not block.get("illustration_id"):
             continue
@@ -351,10 +358,36 @@ def _matching_figures(current, retained, observations):
         similarity = len(tokens & other_tokens) / max(1, len(tokens | other_tokens))
         same_source = source["id"] == other["id"] or source["image_sha256"] == other["image_sha256"]
         same_topic = bool(topic) and topic == " ".join(block.get("topic", "").casefold().split())
-        if same_source or same_topic or similarity >= 0.5:
+        textual = same_source or same_topic or similarity >= 0.5
+        score = matcher.score(current, block) if matcher else None
+        reliable = all(item.get("status") == "complete" and item["source_kind"] != "unknown"
+                       for item in (source, other))
+        plausible = visually_plausible(score)
+        # Sparse/uncertain extraction keeps the text fallback. Strong visual
+        # matches can enter even when captions and topic names disagree.
+        visual = (score is not None and score["inlier_fraction"] >= MATCHING_SETTINGS[
+            "strong_match_fraction"])
+        eligible = (textual or visual) and (broad or not reliable or plausible)
+        decisions.append({"block_id": block["id"], "score": score, "eligible": eligible,
+                          "reliable": reliable, "illustration_id": block["illustration_id"],
+                          "crop_id": block.get("illustration_crop_id", "")})
+        if eligible:
             distance = abs(source["timestamp"] - other["timestamp"])
-            ranked.append((int(same_source), int(same_topic), similarity, -distance, position, block))
-    return [item[-1] for item in sorted(ranked, key=lambda item: item[:-1], reverse=True)[:3]]
+            strength = score["inlier_fraction"] if score is not None else 0
+            ranked.append((int(score is not None and score["identical"]), int(visual), strength,
+                           int(same_source), int(same_topic), similarity, -distance, position, block))
+    selected = [item[-1] for item in sorted(ranked, key=lambda item: item[:-1], reverse=True)]
+    by_id = {item["block_id"]: item for item in decisions}
+    limit = candidate_limit([by_id[item["id"]]["score"] for item in selected],
+                            broad=broad or any(not by_id[item["id"]]["reliable"]
+                                               for item in selected))
+    selected = selected[:limit]
+    if archive is not None:
+        write_json(archive / "matching.json", {"settings": MATCHING_SETTINGS, "broad": broad,
+                   "source_id": current["illustration_id"],
+                   "source_crop_id": current.get("illustration_crop_id", ""),
+                   "candidates": decisions, "selected": [item["id"] for item in selected]})
+    return selected
 
 
 def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublished):
@@ -366,6 +399,7 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
              **{identifier: item["timestamp"] for identifier, item in observations.items()}}
     retry_needed = False
     alternatives = {}
+    matcher = VisualMatcher(lambda identifier, crop_id: resolve_crop(job, evidence, identifier, crop_id))
     coverage_items = [(chapter, coverage) for chapter in notes["chapters"]
                       for coverage in chapter.get("illustration_coverage", [])]
     checked_ids = {coverage["illustration_id"] for _, coverage in coverage_items
@@ -443,18 +477,23 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
                                       "Выбранный рисунок требует восстановления."}, False
             else:
                 verdict, transient = consolidate(observation, representative, archive)
+            search = {"id": observation["id"], "illustration_id": observation["id"],
+                      "caption": "", "topic": representative.get("topic", ""),
+                      "illustration_crop_id": (source_blocks[observation["id"]] or {}).get(
+                          "illustration_crop_id", "")}
+            if verdict["verdict"] == "pass":
+                matcher.remember(search, representative)
             retry_needed |= transient
             if verdict["verdict"] != "pass":
-                search = {"id": observation["id"], "illustration_id": observation["id"],
-                          "caption": "", "topic": representative.get("topic", "")}
                 candidates = _matching_figures(search, [item for item in blocks.values()
                     if item["id"] != original_id and item["id"] not in unpublished
-                    and item.get("illustration_id")], observations)
+                    and item.get("illustration_id")], observations, matcher=matcher, archive=archive)
                 for alternative in candidates:
                     alternative_archive = archive / "alternatives" / alternative["id"]
                     verdict, transient = consolidate(observation, alternative, alternative_archive)
                     retry_needed |= transient
                     if verdict["verdict"] == "pass":
+                        matcher.remember(search, alternative)
                         coverage["block_id"] = alternative["id"]
                         break
             if (verdict["verdict"] != "pass" and original_id in unpublished
@@ -485,6 +524,10 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
                     fallback["illustration_crop_id"] = crop_id
                 retry_needed |= crop_retry
                 if crop_id:
+                    candidates = _matching_figures(fallback, [item for item in blocks.values()
+                        if item["id"] != original_id and item["id"] not in unpublished
+                        and item.get("illustration_id")], observations, matcher=matcher,
+                        archive=archive / "refined", broad=True)
                     choices = {item["id"]: item for item in
                                [representative, *candidates, *alternatives.get(original_id, [])]}
                     for alternative in choices.values():
@@ -495,6 +538,7 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
                             archive / "refined" / alternative["id"], client, source_block=fallback)
                         retry_needed |= transient
                         if verdict["verdict"] == "pass":
+                            matcher.remember(fallback, alternative)
                             coverage["block_id"] = alternative["id"]
                             break
                     if verdict["verdict"] == "pass":
@@ -530,6 +574,7 @@ def _recover_coverage(notes, evidence, job, folder, client, previous, unpublishe
                 for block in chapter["blocks"]
                 if block.get("illustration_id") and block["id"] not in unpublished]
     retry_needed = False
+    matcher = VisualMatcher(lambda identifier, crop_id: resolve_crop(job, evidence, identifier, crop_id))
     for chapter in notes["chapters"]:
         for coverage in chapter.get("illustration_coverage", []):
             failed = unpublished.get(coverage["block_id"])
@@ -539,13 +584,17 @@ def _recover_coverage(notes, evidence, job, folder, client, previous, unpublishe
             observation = observations[coverage["illustration_id"]]
             search = {**block, "id": observation["id"], "illustration_id": observation["id"]}
             source_block = block if block["illustration_id"] == observation["id"] else None
-            for alternative in _matching_figures(search, accepted, observations):
+            if source_block is None:
+                search.pop("illustration_crop_id", None)
+            for alternative in _matching_figures(search, accepted, observations, matcher=matcher,
+                    archive=Path(folder) / "illustration-recovery" / observation["id"], broad=True):
                 verdict, transient = _consolidation(
                     observation, alternative, job, evidence,
                     Path(folder) / "illustration-recovery" / observation["id"] / alternative["id"],
                     client, source_block=source_block)
                 retry_needed |= transient
                 if verdict["verdict"] == "pass":
+                    matcher.remember(search, alternative)
                     coverage.update(block_id=alternative["id"], exclusion_reason="")
                     break
     return retry_needed
@@ -734,8 +783,10 @@ def reconcile_illustrations(notes: dict, evidence: dict, job: Path, folder: Path
                if block.get("illustration_id") in observations]
     retained, replacements = [], {}
     retry_needed = False
+    matcher = VisualMatcher(lambda identifier, crop_id: resolve_crop(job, evidence, identifier, crop_id))
     for current in figures:
-        for left in _matching_figures(current, retained, observations):
+        for left in _matching_figures(current, retained, observations, matcher=matcher,
+                                     archive=Path(folder) / current["id"], broad=True):
             verdict, transient = _reconcile_pair(
                 left, current, observations, job, evidence,
                 Path(folder) / f"{left['id']}--{current['id']}", client)
@@ -749,6 +800,7 @@ def reconcile_illustrations(notes: dict, evidence: dict, job: Path, folder: Path
                 winner, loser = current, left
             else:
                 continue
+            matcher.remember(loser, winner)
             old_caption, caption = winner.get("caption", ""), loser.get("caption", "")
             def generic(text):
                 return not text or text == "Иллюстрация из лекции" or text.startswith("Иллюстрация к теме «")
