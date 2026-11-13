@@ -324,6 +324,226 @@ def test_verified_consolidation_preserves_mapping_and_caches_decision(example):
     assert len(client.calls) == 1
 
 
+def add_equivalent_observations(example):
+    import cv2
+    import numpy as np
+
+    job, evidence, notes, _ = example
+    add_aliased_observation(example)
+    image = np.full((240, 400, 3), 240, np.uint8)
+    cv2.arrowedLine(image, (40, 190), (340, 190), (20,) * 3, 2)
+    cv2.putText(image, "A -> B", (70, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20,) * 3, 2)
+    manifest = read_json(job / "illustrations" / "manifest.json")
+    evidence["visuals"] = evidence["visuals"][:1]
+    notes["chapters"][0]["illustration_coverage"] = [
+        {"illustration_id": "v01_ill01", "block_id": "drawing"}]
+    for number in range(2, 5):
+        visual_id, identifier = f"v{number:02d}", f"v{number:02d}_ill01"
+        source = job / "illustrations" / f"{identifier}.png"
+        cv2.imwrite(str(source), image - number)
+        observation = {"id": identifier, "source_kind": "drawn", "box": [0, 0, 1, 1],
+                       "description": f"Граф, наблюдение {number}",
+                       "image_sha256": sha256_file(source)}
+        evidence["visuals"].append({"id": visual_id, "timestamp": number,
+                                     "status": "complete", "illustrations": [observation]})
+        manifest["assets"][identifier] = {"path": f"illustrations/{identifier}.png",
+                                          "sha256": observation["image_sha256"]}
+        notes["chapters"][0]["illustration_coverage"].append(
+            {"illustration_id": identifier, "block_id": "drawing"})
+    write_json(job / "illustrations" / "manifest.json", manifest)
+
+
+def test_equivalent_sources_verify_once_and_keep_all_coverage_and_archives(example):
+    job, _, notes, _ = example
+    add_equivalent_observations(example)
+    original = deepcopy(notes)
+    client = Client()
+    accepted, retry = finalize(example, client)
+    assert accepted == original and notes == original and not retry
+    assert len(client.calls) == 1
+    state_folder = job / "attempt/illustration-source-states"
+    states = read_json(state_folder / "groups.json")
+    assert len(states["groups"]) == 1
+    representative = next(iter(states["groups"]))
+    for identifier in ("v02_ill01", "v03_ill01", "v04_ill01"):
+        archive = job / "attempt/illustration-coverage" / identifier
+        assert read_json(archive / "accepted.json") == {
+            "illustration_id": identifier, "block_id": "drawing"}
+        assert read_json(archive / "source-state.json") == {
+            "observation_id": identifier, "representative_id": representative}
+        assert (archive / "artifacts/source.png").read_bytes() == (
+            job / "illustrations" / f"{representative}.png").read_bytes()
+    repeated, retry = finalize(example, client, "second-attempt")
+    assert repeated == accepted and not retry and len(client.calls) == 1
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_equivalent_rejections_share_check_and_reuse_fallback(example, monkeypatch, native):
+    if native:
+        add_native_observations(example)
+    else:
+        add_equivalent_observations(example)
+
+    class RejectTarget(Client):
+        def complete(self, instructions, text, schema, *, images):
+            self.calls.append((instructions, text, schema, images))
+            target = pymupdf.Pixmap(images[1][1])
+            return {"verdict": "fail" if target.width == 16 else "pass", "reason": "Проверено."}
+
+    client = RejectTarget()
+    accepted, retry = finalize(example, client)
+    coverage = accepted["chapters"][0]["illustration_coverage"]
+    assert not retry
+    assert len(accepted["chapters"][0]["blocks"]) == 2
+    assert len({item["block_id"] for item in coverage[1:]}) == 1
+    assert coverage[1]["block_id"] != "drawing"
+    assert sum(pymupdf.Pixmap(call[3][1][1]).width == 16 for call in client.calls) == 1
+    assert len(client.calls) <= 2
+    monkeypatch.setattr(verification, "group_source_states",
+                        lambda observations, sources, **kwargs: {key: [key] for key in sources})
+    monkeypatch.setattr(verification, "_cached_verdict", lambda *args: None)
+    baseline_client = RejectTarget()
+    baseline, retry = finalize(example, baseline_client, "ungrouped-attempt")
+    assert baseline == accepted and not retry
+    assert len(baseline_client.calls) == 5
+
+
+@pytest.mark.parametrize("response", [
+    {"verdict": "uncertain", "reason": "Подпись не читается."}, OSError("Offline"),
+])
+def test_uncertain_group_check_retains_individual_verification(example, response):
+    add_equivalent_observations(example)
+    client = Client(response)
+    accepted, retry = finalize(example, client)
+    target_calls = [call for call in client.calls if pymupdf.Pixmap(call[3][1][1]).width == 16]
+    assert len({call[1] for call in target_calls}) == 3
+    assert retry is isinstance(response, Exception)
+    assert len(accepted["chapters"][0]["illustration_coverage"]) == 4
+    assert len(accepted["chapters"][0]["blocks"]) == 2
+    assert len(target_calls) == (12 if isinstance(response, Exception) else 3)
+
+
+def test_group_verdicts_are_specific_to_selected_target(example):
+    _, _, notes, _ = example
+    add_equivalent_observations(example)
+    chapter = notes["chapters"][0]
+    chapter["blocks"].append({**deepcopy(block(notes)), "id": "other",
+                               "caption": "Другая область рисунка"})
+    chapter["illustration_coverage"][-1]["block_id"] = "other"
+    client = Client()
+    accepted, retry = finalize(example, client)
+    assert accepted == notes and not retry and len(client.calls) == 2
+
+
+def test_changed_member_leaves_group_and_gets_fresh_verification(example):
+    job, evidence, _, _ = example
+    add_equivalent_observations(example)
+    client = Client()
+    finalize(example, client)
+    assert len(client.calls) == 1
+    source = png(job / "illustrations/v04_ill01.png", 80)
+    digest = sha256_file(source)
+    evidence["visuals"][-1]["illustrations"][0]["image_sha256"] = digest
+    manifest = read_json(job / "illustrations/manifest.json")
+    manifest["assets"]["v04_ill01"]["sha256"] = digest
+    write_json(job / "illustrations/manifest.json", manifest)
+    _, retry = finalize(example, client)
+    assert not retry and len(client.calls) == 2
+    states = read_json(job / "attempt/illustration-source-states/groups.json")
+    assert states["groups"]["v04_ill01"] == ["v04_ill01"]
+    assert read_json(job / "attempt/illustration-coverage/v04_ill01/source-state.json")[
+        "representative_id"] == "v04_ill01"
+
+
+def test_grouping_uses_actual_refined_sources(example, monkeypatch):
+    job, evidence, notes, _ = example
+    add_equivalent_observations(example)
+    cropped = png(job / "refined.png", 80)
+    notes["chapters"][0]["blocks"].append({
+        **deepcopy(block(notes)), "id": "refined", "illustration_id": "v04_ill01",
+        "illustration_crop_id": "refined-source"})
+    original_resolve = verification.resolve_crop
+
+    def resolve(job, evidence, identifier, crop_id=""):
+        if identifier == "v04_ill01":
+            assert crop_id == "refined-source"
+            return cropped
+        return original_resolve(job, evidence, identifier, crop_id)
+
+    monkeypatch.setattr(verification, "resolve_crop", resolve)
+    client = Client()
+    assert not verification._finalize_coverage(notes, evidence, job, job / "attempt", client, [], {})
+    assert len(client.calls) == 2
+    states = read_json(job / "attempt/illustration-source-states/groups.json")
+    assert states["groups"]["v04_ill01"] == ["v04_ill01"]
+    assert states["observations"]["v04_ill01"]["source_sha256"] == sha256_file(cropped)
+
+
+def add_native_observations(example):
+    import cv2
+
+    job, evidence, _, _ = example
+    add_equivalent_observations(example)
+    evidence["media"] = {"sha256": "b" * 64}
+    (job / "frames").mkdir()
+    original = cv2.imread(str(job / "illustrations/v02_ill01.png"))
+    manifest = read_json(job / "illustrations/manifest.json")
+    for index, (visual, box) in enumerate(zip(evidence["visuals"][1:], [
+        (0, 0, 380, 240), (20, 0, 400, 240), (40, 0, 400, 240),
+    ])):
+        observation = visual["illustrations"][0]
+        image = original if index else cv2.addWeighted(
+            original, 0.96, cv2.GaussianBlur(original, (3, 3), 0), 0.04, 0)
+        frame = job / "frames" / f"{visual['id']}_{'b' * 12}.png"
+        assert cv2.imwrite(str(frame), image)
+        x0, y0, x1, y1 = box
+        source = job / "illustrations" / f"{observation['id']}.png"
+        assert cv2.imwrite(str(source), image[y0:y1, x0:x1])
+        observation.update(box=[x0 / 400, y0 / 240, x1 / 400, y1 / 240],
+                           image_sha256=sha256_file(source))
+        manifest["assets"][observation["id"]]["sha256"] = observation["image_sha256"]
+    write_json(job / "illustrations/manifest.json", manifest)
+
+
+def test_group_verifier_receives_the_complete_native_state_and_its_provenance(example):
+    job, _, notes, _ = example
+    add_native_observations(example)
+    client = Client()
+    accepted, retry = finalize(example, client)
+    assert accepted == notes and not retry and len(client.calls) == 1
+    assert pymupdf.Pixmap(client.calls[0][3][0][1]).width == 400
+    folder = job / "attempt/illustration-source-states"
+    states = read_json(folder / "groups.json")
+    representative = next(iter(states["groups"]))
+    assert representative == "v03_ill01"
+    assert states["contexts"][representative]["region"] == [0, 0, 400, 240]
+    assert pymupdf.Pixmap(job / "illustrations" / f"{representative}.png").width == 380
+    assert pymupdf.Pixmap(folder / representative / "source.png").width == 400
+    repeated, retry = finalize(example, client, "second-attempt")
+    assert repeated == accepted and not retry and len(client.calls) == 1
+
+
+@pytest.mark.parametrize("offline", [False, True])
+def test_uncertain_native_state_checks_every_original_crop_including_representative(example, offline):
+    _, _, notes, _ = example
+    add_native_observations(example)
+
+    class NativeClient(Client):
+        def complete(self, instructions, text, schema, *, images):
+            self.calls.append((instructions, text, schema, images))
+            if pymupdf.Pixmap(images[0][1]).width == 400:
+                if offline:
+                    raise OSError("Offline")
+                return {"verdict": "uncertain", "reason": "Неясна область рисунка."}
+            return {"verdict": "pass", "reason": "Исходный рисунок сохранён."}
+
+    client = NativeClient()
+    accepted, retry = finalize(example, client)
+    assert accepted == notes and not retry
+    assert len(client.calls) == (7 if offline else 4)
+    assert sum(pymupdf.Pixmap(call[3][0][1]).width < 400 for call in client.calls) == 3
+
+
 @pytest.mark.parametrize("verdict", ["fail", "uncertain"])
 def test_distinct_or_uncertain_observation_gets_separate_crop_and_mapping(example, verdict):
     job, _, notes, _ = example

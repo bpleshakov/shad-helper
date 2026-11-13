@@ -13,6 +13,12 @@ from tqdm import tqdm
 from . import rendering
 from .auth import PlanAccessError
 from .illustration_crops import refine_crop, resolve_crop
+from .illustration_states import (
+    SOURCE_STATE_SETTINGS,
+    group_source_states,
+    save_state_source,
+    source_contexts,
+)
 from .illustrations import illustration_index
 from .jobs import fingerprint, read_json, sha256_file, write_json
 from .openai_client import DEFAULT_REASONING_EFFORT, PlanClient, ResponseError
@@ -275,10 +281,11 @@ def _compare(client, source, preview, description, folder, *, instructions=None,
             client.request_recorder = recorder
 
 
-def _consolidation(observation, block, job, evidence, folder, client, *, source_block=None):
+def _consolidation(observation, block, job, evidence, folder, client, *, source_block=None,
+                   source_path=None):
     """Reject unverified merges of distinct image observations."""
-    source = resolve_crop(job, evidence, observation["id"],
-                          (source_block or {}).get("illustration_crop_id", ""))
+    source = source_path or resolve_crop(job, evidence, observation["id"],
+                                         (source_block or {}).get("illustration_crop_id", ""))
     representative = resolve_crop(job, evidence, block["illustration_id"],
                                   block.get("illustration_crop_id", ""))
     source_hash, representative_hash = sha256_file(source), sha256_file(representative)
@@ -361,6 +368,64 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
     alternatives = {}
     coverage_items = [(chapter, coverage) for chapter in notes["chapters"]
                       for coverage in chapter.get("illustration_coverage", [])]
+    checked_ids = {coverage["illustration_id"] for _, coverage in coverage_items
+                   if coverage["block_id"] and (
+                       coverage["block_id"] in unpublished or coverage["illustration_id"]
+                       != blocks[coverage["block_id"]]["illustration_id"])}
+    source_blocks = {identifier: next((item for item in blocks.values()
+                                     if item.get("illustration_id") == identifier
+                                     and item.get("illustration_crop_id")), None)
+                     for identifier in sorted(checked_ids)}
+    sources = {identifier: resolve_crop(job, evidence, identifier,
+                                       (source_block or {}).get("illustration_crop_id", ""))
+               for identifier, source_block in source_blocks.items()}
+    contexts = source_contexts(observations, sources, job, evidence)
+    groups = group_source_states(observations, sources, contexts=contexts)
+    state_folder = Path(folder) / "illustration-source-states"
+    represented_by = {identifier: representative for representative, members in groups.items()
+                      for identifier in members}
+    write_json(state_folder / "groups.json", {
+        "settings": SOURCE_STATE_SETTINGS, "groups": groups, "contexts": contexts,
+        "observations": {identifier: {
+            "representative_id": represented_by[identifier],
+            "source_sha256": sha256_file(path),
+            "crop_id": (source_blocks[identifier] or {}).get("illustration_crop_id", ""),
+        } for identifier, path in sources.items()},
+    })
+    state_results = {}
+    state_sources = {}
+
+    def consolidate(observation, target, archive):
+        identifier = observation["id"]
+        state_id = represented_by[identifier]
+        if len(groups[state_id]) > 1:
+            key = state_id, target["id"]
+            shared = state_folder / state_id / target["id"]
+            if key not in state_results:
+                source_path = None
+                if state_id in contexts:
+                    if state_id not in state_sources:
+                        state_sources[state_id] = state_folder / state_id / "source.png"
+                        save_state_source(state_id, sources, contexts, state_sources[state_id])
+                    source_path = state_sources[state_id]
+                state_results[key] = _consolidation(
+                    observations[state_id], target, job, evidence, shared, client,
+                    source_block=source_blocks[state_id], source_path=source_path)
+            verdict, transient = state_results[key]
+            # An unreadable representative or a failed request is not evidence
+            # about another member. Keep its original per-observation fallback.
+            if verdict["verdict"] != "uncertain" or (identifier == state_id and state_id not in contexts):
+                shutil.copytree(shared, archive, dirs_exist_ok=True)
+                write_json(archive / "source-state.json", {
+                    "observation_id": identifier, "representative_id": state_id,
+                })
+                return verdict, transient
+        write_json(archive / "source-state.json", {
+            "observation_id": identifier, "representative_id": identifier,
+        })
+        return _consolidation(observation, target, job, evidence, archive, client,
+                              source_block=source_blocks[identifier])
+
     with tqdm(coverage_items, desc="Illustration coverage", unit="observation",
               dynamic_ncols=True, disable=not coverage_items) as progress:
         for chapter, coverage in progress:
@@ -373,15 +438,11 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
                 continue
             archive = Path(folder) / "illustration-coverage" / observation["id"]
             write_json(archive / "candidate.json", coverage)
-            source_block = next((item for item in blocks.values()
-                                 if item.get("illustration_id") == observation["id"]
-                                 and item.get("illustration_crop_id")), None)
             if original_id in unpublished:
                 verdict, transient = {"verdict": "uncertain", "reason":
                                       "Выбранный рисунок требует восстановления."}, False
             else:
-                verdict, transient = _consolidation(observation, representative, job, evidence,
-                                                   archive, client, source_block=source_block)
+                verdict, transient = consolidate(observation, representative, archive)
             retry_needed |= transient
             if verdict["verdict"] != "pass":
                 search = {"id": observation["id"], "illustration_id": observation["id"],
@@ -391,9 +452,7 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
                     and item.get("illustration_id")], observations)
                 for alternative in candidates:
                     alternative_archive = archive / "alternatives" / alternative["id"]
-                    verdict, transient = _consolidation(
-                        observation, alternative, job, evidence, alternative_archive, client,
-                        source_block=source_block)
+                    verdict, transient = consolidate(observation, alternative, alternative_archive)
                     retry_needed |= transient
                     if verdict["verdict"] == "pass":
                         coverage["block_id"] = alternative["id"]

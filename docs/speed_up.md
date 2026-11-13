@@ -2,7 +2,7 @@
 
 Analysis date: 2026-11-12.
 
-Goal: reduce lecture-processing time while preserving the current quality of lecture notes and illustrations. This document consolidates the read-only analysis of saved artifacts in `out/` and `out_algo/`. No pipeline changes, model calls, or performance experiments were made during the analysis. All proposed improvements remain unimplemented and unbenchmarked.
+Goal: reduce lecture-processing time while preserving the current quality of lecture notes and illustrations. This document consolidates the read-only analysis of saved artifacts in `out/` and `out_algo/`. No pipeline changes, model calls, or performance experiments were made during that analysis. The implementation and local validation of priority 1 on 2026-11-13 are recorded below; the audit figures remain historical.
 
 ## Main findings
 
@@ -172,6 +172,37 @@ Split groups when labels, arrows, panels, geometry, or meaningful intermediate s
 
 This addresses both repeated passes and repeated rejected matches. The logs show substantial repetition, but do not prove a safe reduction percentage. Preserve a per-observation fallback for ambiguous grouping.
 
+Implemented and revised on 2026-11-13 in [`illustration_states.py`](../shad_helper/illustration_states.py) and [`illustration_verification.py`](../shad_helper/illustration_verification.py):
+
+- Group nearby, complete observations using image evidence. Descriptions, topics, selected targets, and model output do not establish equivalence. The first implementation required nearly identical crop dimensions and pixels and removed only 31 of 3,771 observations; changing crop boundaries, capture noise, and lighting defeated that policy.
+- For original managed crops, locate their saved native frames and require the frame pixels to reproduce each crop exactly. Track overlapping figure boxes and give the track a fixed native region containing the union of its original boxes. This recovers content clipped by inconsistent crop boundaries without discarding anything visible in a member. Refined crops and missing or mismatched frames use their existing source files instead.
+- Compare locally normalized native detail and colors, with separate limits for tiny strong marks and concentrated local changes. Estimate a small global camera/crop alignment from visual features when necessary. Check content outside the aligned overlap and, for interpolated alignment, compare on both original pixel grids to detect detail that interpolation might weaken. There is no person masking or overlap-only approval; detected changes in labels, panels, scrolling content, or occlusion keep observations separate.
+- Allow a continuous state to last beyond the representative timestamp, with at most 180 seconds between matching observations. Every member must match the fixed first representative directly, then pass another direct check if a sharper representative is selected. This prevents transitive visual drift. Blank states, incomplete extraction, unknown source kinds, and separate observations from the same frame remain independent.
+- Verify each state against each selected target once, reusing completed passes and rejections for initial and alternative matches. Send the full native state region actually used for grouping to the verifier. Preserve original coverage IDs, fallback placement, refinement, recovery, and the existing persistent verification cache. Uncertain native-state checks and request failures fall back to every original crop, including the representative's original crop.
+- Save policy settings, original source hashes, frame hashes, native regions, crop IDs, and group membership in `illustration-source-states/groups.json` inside the finalization attempt. Save each verified native state as `source.png`; each observation retains its ordinary comparison archive and `source-state.json`. Groups are recomputed on every attempt. Without the optional local OpenCV dependencies, verification stays per observation.
+
+Regression tests cover capture noise, illumination, crop boundaries, camera translation/zoom, changed labels, arrows, geometry, panels, colors, meaningful intermediate states, tiny and faint marks, clipping, occlusion, temporal separation, refined sources, frame provenance, cache reuse, and transient failures. Controlled rejection/fallback tests preserve identical final notes while reducing five mocked remote comparisons to one with original crops or two with native state regions. A visual spot-check of 18 representative/member pairs from the four saved jobs found no instructional differences; it is not an exhaustive quality evaluation.
+
+A read-only local replay of **all original source crops and their native frames**, rather than finalization or live model calls, found:
+
+| Saved job | Observations | First implementation states | Revised states | Reduction | Local replay time |
+|---|---:|---:|---:|---:|---:|
+| 22 September, linear regression | 342 | 334 | 279 | 18.4% | 53.57 s |
+| 3 November, random forest | 1,023 | 1,005 | 874 | 14.6% | 135.16 s |
+| 30 September, sorting seminar | 1,512 | 1,510 | 898 | 40.6% | 292.45 s |
+| 14 October, sorting and heaps | 894 | 891 | 574 | 35.8% | 181.98 s |
+| **Total** | **3,771** | **3,740** | **2,625** | **30.4%** | **663.17 s** |
+
+The revised policy removes **1,146 redundant observations instead of 31**, approximately **37 times as many**. Replay time includes source validation, native-region preparation, and grouping: **11.1 minutes** across the four jobs. This added local work is not a measured API-call or end-to-end speedup: actual finalization uses the active coverage subset and may use refined sources, different targets, existing caches, or individual retries. Live verification and full lecture regeneration were not run.
+
+Reproduce the replay with [`illustration_states_benchmark.py`](../scripts/illustration_states_benchmark.py), which validates managed sources and writes settings, source/frame hashes, groups, and stage timings outside the input jobs:
+
+```sh
+uv run python scripts/illustration_states_benchmark.py \
+  --out /tmp/illustration-state-replay \
+  out/22-09-* out/03-11-* out_algo/30-09-* out_algo/14-10-*
+```
+
 ### 2. Improve alternative matching before remote verification
 
 `_matching_figures` currently ranks candidates using source identity, topic equality, word overlap, and temporal distance, returning up to three candidates. Topic equality can admit different instructional figures into expensive comparison.
@@ -246,13 +277,14 @@ Measure:
 
 For state grouping and candidate filtering, inspect discarded distinctions against original images; final figure count alone is insufficient. For batching, check each source verdict independently. For concurrency, preserve deterministic application of decisions and reliable request archives.
 
-Acceptance means fewer calls or lower elapsed time while preserving the quality and coverage of the saved notes. No such optimization has yet been validated by this audit.
+Acceptance means fewer calls or lower elapsed time while preserving the quality and coverage of the saved notes. The original audit did not validate an optimization; the priority 1 implementation has the local and regression evidence listed above, without an end-to-end benchmark.
 
 ## Code and artifact references
 
 - [`video.py`](../shad_helper/video.py): selection settings, proxy-frame selection, native retrieval.
 - [`vision_worker.py`](../shad_helper/vision_worker.py): sequential inference, schema parsing, retries, frame checkpoints.
 - [`illustrations.py`](../shad_helper/illustrations.py): illustration-observation validation and source assets.
+- [`illustration_states.py`](../shad_helper/illustration_states.py): conservative local source-state grouping and fixed representative selection.
 - [`illustration_verification.py`](../shad_helper/illustration_verification.py): `_consolidation`, `_matching_figures`, `_finalize_coverage`, `_recover_coverage`, `_compare`, and reconciliation.
 - [`notes.py`](../shad_helper/notes.py): finalization retries and chapter generation.
 - Regularization evidence: `out/06-10-2026-Лекция---Никита-Волков---Польза-регуляризации-39c721e69f77/`.
