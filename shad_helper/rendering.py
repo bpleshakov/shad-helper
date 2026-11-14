@@ -18,6 +18,10 @@ class RenderError(RuntimeError):
     """A note project cannot safely be rendered, or its compiler failed."""
 
 
+class LatexCompilationError(RenderError):
+    """Generated chapter LaTeX failed compilation and can be regenerated."""
+
+
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}\Z")
 _COMMAND = re.compile(r"\\([A-Za-z@]+|.)", re.DOTALL)
 _MAX_TEX_BYTES = 2_000_000
@@ -683,9 +687,10 @@ def validate_chapter_latex(notes: dict, evidence: dict, folder: Path, *,
                     detail = f"block {markers[-1]}: {detail}"
                 elif source.startswith("figures/diagram-"):
                     detail = f"block {Path(source).stem.removeprefix('diagram-')}: {detail}"
-            raise RenderError(f"{detail}; inspect {log_path}")
+            raise LatexCompilationError(f"{detail}; inspect {log_path}")
     except (OSError, subprocess.TimeoutExpired, RenderError) as error:
-        raise RenderError(f"Chapter {chapter['id']} LaTeX validation failed: {error}") from error
+        error_type = LatexCompilationError if isinstance(error, LatexCompilationError) else RenderError
+        raise error_type(f"Chapter {chapter['id']} LaTeX validation failed: {error}") from error
 
 
 def diagram_preview_fingerprint() -> str:

@@ -8,6 +8,7 @@ from shad_helper import notes
 from shad_helper.auth import PlanAccessError
 from shad_helper.jobs import read_json, write_json
 from shad_helper.openai_client import ResponseError
+from shad_helper.rendering import LatexCompilationError
 
 
 def prepare_job(job, duration=900):
@@ -157,6 +158,28 @@ def test_invalid_chapter_reply_is_retried_before_checkpointing(tmp_path, isolate
     assert isolate_generation == [5]
     assert read_json(tmp_path / "checkpoints/notes/ch001.json")["result"]["chapters"][0][
         "id"] == "ch001"
+
+
+def test_request_and_compilation_failures_share_retry_limit(tmp_path, monkeypatch, isolate_generation):
+    prepare_job(tmp_path)
+    compilations = []
+
+    def fail_first_request(payload, attempt):
+        if attempt == 1:
+            raise ResponseError("Temporary failure", code="server_error")
+
+    def fail_compilation(result, evidence, folder):
+        compilations.append(folder)
+        raise LatexCompilationError("Missing $ inserted.")
+
+    monkeypatch.setattr("shad_helper.rendering.validate_chapter_latex", fail_compilation)
+    client = FakeClient(fail_first_request)
+    assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client) == tmp_path / "handoff"
+    assert client.attempts == {"ch001": 4}
+    assert len(compilations) == 3
+    assert isolate_generation == [5, 10, 20]
+    assert not (tmp_path / "checkpoints/notes/ch001.json").exists()
+    assert read_json(tmp_path / "handoff/status.json")["reason"] == "Missing $ inserted."
 
 
 @pytest.mark.parametrize("error_type", [ResponseError, PlanAccessError])

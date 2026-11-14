@@ -297,8 +297,10 @@ the command name.
 
 Automatic synthesis checks availability of `gpt-6-astra` for the selected credentials
 and uses the existing reasoning configuration through the OpenAI Responses API.
-Each failed chapter request or invalid reply gets three retries after the initial
-attempt, waiting 5, 10, and 20 seconds. Completed chapters remain cached.
+Failed chapter requests, invalid replies, and failures of the chapter's LaTeX check
+share three retries after the initial attempt, waiting 5, 10, and 20 seconds. Each
+retry sends the original request again and validates the newly generated chapter.
+Completed chapters remain cached.
 Unavailable access or failure after all four attempts exports a manual handoff.
 
 The app uses `outline.json`, or creates consecutive fifteen-minute chapters.
@@ -463,9 +465,11 @@ Keep manual TeX edits for subsequent ordinary `render` commands.
 
 Automatic generation compiles each chapter locally with the final notes preamble
 before saving its synthesis checkpoint. This requires `latexmk` and LuaLaTeX.
-A compilation failure stops that chapter without another model request; the handoff
-reports the chapter and compiler error, with a block ID when available. `response.json` and
-`latex-check/notes/` retain the response, editable sources, and compiler logs locally.
+A compilation failure during a generation attempt retries the whole attempt, up
+to the shared limit above. Missing compilers stop immediately. If all attempts fail,
+the handoff reports the chapter and compiler error, with a block ID when available.
+Each attempt's `response.json` and `latex-check/notes/` retain its response, editable
+sources, and compiler logs locally.
 Compiler diagnostics are not sent to OpenAI. Checkpoints created before this check
 are regenerated once; successfully checked chapters are reused on later runs.
 

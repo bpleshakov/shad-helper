@@ -1,6 +1,7 @@
 import copy
 import json
 import shutil
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -39,33 +40,71 @@ def attempt(job):
     return job / "handoff/requests/ch001/attempt-01"
 
 
-def test_compile_failure_retains_response_without_retry_or_checkpoint(tmp_path, monkeypatch):
+@pytest.fixture(autouse=True)
+def retry_delays(monkeypatch):
+    delays = []
+    monkeypatch.setattr(notes, "time", SimpleNamespace(sleep=delays.append))
+    return delays
+
+
+@pytest.mark.parametrize("recovers", [True, False])
+def test_compile_failure_retries_fresh_responses_and_retains_each_attempt(
+        tmp_path, monkeypatch, chapter_latex_checker, retry_delays, recovers):
     prepare_job(tmp_path)
     client = Client("x=0")
-    checker = Mock(side_effect=rendering.RenderError("Chapter ch001: block ch001_b2 failed"))
-    monkeypatch.setattr(rendering, "validate_chapter_latex", checker)
-    sleep = Mock()
-    monkeypatch.setattr(notes.time, "sleep", sleep)
+    roots = []
+    monkeypatch.setattr(rendering, "validate_chapter_latex", chapter_latex_checker)
 
-    assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client) == tmp_path / "handoff"
-    assert len(client.calls) == 1
-    sleep.assert_not_called()
-    assert not (tmp_path / "checkpoints/notes/ch001.json").exists()
-    assert not (tmp_path / "notes.json").exists()
-    folder = attempt(tmp_path)
-    assert read_json(folder / "response.json")["chapters"][0]["blocks"][1]["content"] == "x=0"
-    assert read_json(folder / "status.json")["error_type"] == "RenderError"
-    assert read_json(tmp_path / "handoff/status.json")["reason"] == checker.side_effect.args[0]
-    assert "failed" not in json.dumps(client.calls)
+    def compile_response(root):
+        assert not (tmp_path / "checkpoints/notes/ch001.json").exists()
+        roots.append(root)
+        client.content = f"x={len(roots)}"
+        if recovers and len(roots) == 4:
+            (root / "main.pdf").write_bytes(b"%PDF")
+            return Mock(returncode=0)
+        (root / "compiler-output.log").write_text(
+            "./chapters/section-001.tex:13: Missing $ inserted.", encoding="utf-8")
+        return Mock(returncode=1)
+
+    monkeypatch.setattr(rendering, "_run_latex", compile_response)
+    result = notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    assert result == tmp_path / ("notes/main.tex" if recovers else "handoff")
+    assert len(client.calls) == 4
+    assert retry_delays == [5, 10, 20]
+    assert all(call == client.calls[0] for call in client.calls)
+    assert len(set(roots)) == 4
+    for number, root in enumerate(roots, 1):
+        folder = tmp_path / f"handoff/requests/ch001/attempt-{number:02d}"
+        assert root == folder / "latex-check/notes"
+        assert read_json(folder / "call.json") == read_json(attempt(tmp_path) / "call.json")
+        assert read_json(folder / "response.json")["chapters"][0]["blocks"][1][
+            "content"] == f"x={number - 1}"
+        status = read_json(folder / "status.json")
+        if recovers and number == 4:
+            assert status == {"status": "success"}
+        else:
+            assert status["status"] == "failed"
+            assert "Missing $ inserted" in status["error"]
+            assert (root / "compiler-output.log").is_file()
+    if recovers:
+        assert read_json(tmp_path / "checkpoints/notes/ch001.json")["result"]["chapters"][0][
+            "blocks"][1]["content"] == "x=3"
+        assert not (tmp_path / "handoff/status.json").exists()
+    else:
+        assert not (tmp_path / "checkpoints/notes/ch001.json").exists()
+        assert not (tmp_path / "notes.json").exists()
+        assert "Missing $ inserted" in read_json(tmp_path / "handoff/status.json")["reason"]
 
 
-def test_missing_compiler_stops_generation_locally(tmp_path, monkeypatch, chapter_latex_checker):
+def test_missing_compiler_stops_generation_locally(
+        tmp_path, monkeypatch, chapter_latex_checker, retry_delays):
     prepare_job(tmp_path)
     monkeypatch.setattr(rendering, "validate_chapter_latex", chapter_latex_checker)
     monkeypatch.setattr(rendering.shutil, "which", lambda name: None)
     client = Client("x=0")
     assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client) == tmp_path / "handoff"
     assert len(client.calls) == 1
+    assert retry_delays == []
     assert not (tmp_path / "checkpoints/notes/ch001.json").exists()
     assert "requires latexmk and LuaLaTeX" in read_json(tmp_path / "handoff/status.json")["reason"]
     assert (attempt(tmp_path) / "latex-check/notes/main.tex").is_file()
@@ -73,14 +112,23 @@ def test_missing_compiler_stops_generation_locally(tmp_path, monkeypatch, chapte
 
 @pytest.mark.skipif(not shutil.which("latexmk") or not shutil.which("lualatex"),
                     reason="requires TeX Live/MacTeX")
-def test_real_cases_failure_then_correction_and_cache(tmp_path, monkeypatch, chapter_latex_checker):
+def test_real_cases_failure_then_correction_and_cache(
+        tmp_path, monkeypatch, chapter_latex_checker, retry_delays):
     prepare_job(tmp_path)
     monkeypatch.setattr(rendering, "validate_chapter_latex", chapter_latex_checker)
     malformed = r"\partial f(x)=\begin{cases}\{1\},&x>0,\\\{-1\},&x<0,\\[-1,1],&x=0.\end{cases}"
     client = Client(malformed)
-    assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client) == tmp_path / "handoff"
-    assert len(client.calls) == 1
-    assert not (tmp_path / "checkpoints/notes/ch001.json").exists()
+
+    def correct_next_response(delay):
+        retry_delays.append(delay)
+        assert not (tmp_path / "checkpoints/notes/ch001.json").exists()
+        client.content = malformed.replace(r"\\[-1,1]", r"\\{[-1,1]}")
+
+    monkeypatch.setattr(notes.time, "sleep", correct_next_response)
+    assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client).is_file()
+    assert len(client.calls) == 2
+    assert client.calls[0] == client.calls[1]
+    assert retry_delays == [5]
     folder = attempt(tmp_path)
     error = read_json(folder / "status.json")["error"]
     assert "Chapter ch001" in error
@@ -88,16 +136,16 @@ def test_real_cases_failure_then_correction_and_cache(tmp_path, monkeypatch, cha
     assert "Illegal unit of measure" in error
     assert (folder / "latex-check/notes/compiler-output.log").is_file()
 
-    client.content = malformed.replace(r"\\[-1,1]", r"\\{[-1,1]}")
-    assert notes.generate_notes(tmp_path, tmp_path / "auth", client=client).is_file()
-    assert len(client.calls) == 2
     assert read_json(tmp_path / "checkpoints/notes/ch001.json")["result"]["chapters"][0][
         "blocks"][1]["content"] == client.content
     assert not (tmp_path / "handoff/status.json").exists()
-    pdf = attempt(tmp_path) / "latex-check/notes/main.pdf"
+    second = folder.parent / "attempt-02"
+    pdf = second / "latex-check/notes/main.pdf"
     assert pdf.read_bytes().startswith(b"%PDF")
     assert not (pdf.parent / "qa").exists()
     assert read_json(folder / "response.json")["chapters"][0]["blocks"][1][
+        "content"] == malformed
+    assert read_json(second / "response.json")["chapters"][0]["blocks"][1][
         "content"] == client.content
 
     monkeypatch.setattr(rendering, "validate_chapter_latex", Mock(side_effect=AssertionError("Cached")))

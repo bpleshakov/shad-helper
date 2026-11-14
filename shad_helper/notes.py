@@ -541,7 +541,7 @@ def _generate_chapter(client, text: str, evidence: dict, chapter: dict,
                       previous: list[dict] | None = None) -> dict:
     from .auth import PlanAccessError
     from .openai_client import PlanClient, ResponseError
-    from .rendering import RenderError, validate_chapter_latex
+    from .rendering import LatexCompilationError, RenderError, validate_chapter_latex
     from .schemas import LectureNotes
 
     schema = LectureNotes.model_json_schema()
@@ -566,14 +566,15 @@ def _generate_chapter(client, text: str, evidence: dict, chapter: dict,
                 validate_chapter_latex(result, evidence, folder / "latex-check")
             write_json(folder / "status.json", {"status": "success"})
             return result
-        except RenderError as exc:
-            write_json(folder / "status.json", {"status": "failed", "error_type": type(exc).__name__,
-                                              "error": str(exc)})
-            raise
-        except (PlanAccessError, ResponseError, ValueError) as exc:
-            write_json(folder / "status.json", {"status": "failed", "error_type": type(exc).__name__,
-                                              "error_code": getattr(exc, "code", None)})
-            if attempt == 3 or getattr(exc, "code", None) == "context_length_exceeded":
+        except (PlanAccessError, ResponseError, ValueError, RenderError) as exc:
+            status = {"status": "failed", "error_type": type(exc).__name__}
+            if isinstance(exc, RenderError):
+                status["error"] = str(exc)
+            else:
+                status["error_code"] = getattr(exc, "code", None)
+            write_json(folder / "status.json", status)
+            if (attempt == 3 or getattr(exc, "code", None) == "context_length_exceeded"
+                    or isinstance(exc, RenderError) and not isinstance(exc, LatexCompilationError)):
                 raise
             delay = 5 * 2 ** attempt
             print(f"Notes chapter {chapter['id']} failed: {exc}\n"
