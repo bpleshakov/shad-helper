@@ -148,3 +148,95 @@ lecturer moves. It does not yet detect independent board regions or score
 occlusion. Rotated streams are explicitly unsupported. No confidence threshold
 currently detects the models' confidently wrong outputs; retries based only on
 JSON validity or self-reported unreadability cannot solve that problem.
+
+## Native video-input pilot (2026-11-15)
+
+`scripts/video_mode_pilot.py` runs the pinned Qwen3.5-35B-A3B checkpoint through
+MLX-VLM's native video input, including video tokens and frame timestamps. It also
+runs independent image requests on SHA256-identical sampled frames. Each mode
+loads the model in a separate process and records inputs, prompts, responses,
+processed dimensions, retries, package versions, time and peak MLX allocation.
+
+Two 20-second clips were tested: `gaussian-mle` starting at 5029 seconds and
+`stress-test` starting at 2005 seconds in the recordings named by the existing
+gold fixture. Four frames were sampled uniformly per video. Spatial resolution
+matched the image controls: 1920 × 640 and 1920 × 1088 after patch alignment.
+Thinking was disabled, temperature was zero, and the existing 2048/4096-token
+initial/retry limits and 2.2 MP per-frame budget were retained.
+
+| Clip | Native video | Four matched image requests | Current selector + image worker (inference only) |
+| --- | ---: | ---: | ---: |
+| Gaussian MLE | 27.2 s | 44.1 s | 43.5 s, 4 selected frames |
+| Stress-test diagram | 9.2 s | 28.5 s | 14.4 s, 2 selected frames |
+
+Times include preprocessing and formatting retries, but exclude model loading,
+clip preparation, selection, ASR and notes generation. The Gaussian video needed
+one formatting retry; the stress-test video passed on its first attempt. Peak
+video MLX allocation was 22.4–22.5 GB. These are single-run short-clip results,
+about 1.6× faster than the selected-image inference baselines, not measured
+whole-lecture savings.
+
+Source inspection found unresolved errors in both modes. Video changed the
+Gaussian graph's x axis to theta and invented a maximum arrow. In the stress-test
+diagram it invented `yours → slow! and correct` and `generator → checker`, where
+the source arrows enter a central block. Both videos and all eight matched image
+responses omitted illustration boxes despite visible instructional diagrams.
+This standalone pilot's prompt produces one aggregate object, without per-frame
+evidence IDs, timestamps or illustration ownership. Its timings do not measure the
+integrated mode below, which uses a different prompt and temporal input layout.
+No full-lecture quality or notes run was made in this pilot.
+
+Artifacts and the detailed comparison are in `.cache/video-mode-pilot/`.
+To try another short, unrotated clip, choose a fresh output directory:
+
+```sh
+HF_HOME=.cache/huggingface .venv/bin/python -m scripts.video_mode_pilot clip.mkv --mode video --out .cache/video-mode-pilot/new-video
+HF_HOME=.cache/huggingface .venv/bin/python -m scripts.video_mode_pilot clip.mkv --mode frames --out .cache/video-mode-pilot/new-frames
+```
+
+## Full-cycle video mode
+
+The pipeline now accepts `--vision-mode video` on `extract` and `run`; independent
+frame requests remain the default. For the full cycle:
+
+```sh
+UV_CACHE_DIR=.cache/uv uv run shad-helper run lecture.mp4 --out jobs-video --vision-model 35b --vision-mode video
+```
+
+The normal API/login and OpenAI proxy setup is required for notes and Anki.
+Use `--start 0 --duration 120` for a short end-to-end trial, or omit both for the
+entire recording. The same flag also works with the existing `4b` and `9b` presets.
+
+The existing selector supplies native source images. Requests contain at most
+four images of the same dimensions within a 20-second span. Each source image is
+repeated within its temporal patch so Qwen does not fuse different board states
+under one timestamp. These arrays go through `videos`, `video_metadata`,
+`pixel_values_videos` and `video_grid_thw`, with native video tokens. Source PTS
+are represented using microsecond ticks. Spatial resolution retains the existing
+2.2 MP per-source-frame cap; generation uses 4096 tokens, with one 8192-token retry.
+
+The model assigns each observation to source frame indices. Multiple observations
+for a frame, such as separate boards, are combined; invalid indices, repeated
+indices within an observation, missing frames and malformed content trigger a
+retry. The worker expands the result into the existing per-frame evidence schema,
+so citations, illustration crops, notes, PDF and Anki need no new format.
+Batch checkpoints are separate from independent-frame checkpoints and include
+all source image hashes and timestamps. Failed batches remain explicitly incomplete
+and are retried on the next extraction.
+
+Integration checks used the same two recording intervals with the actual CLI,
+ASR, selector, pinned 35B model, native-video worker and illustration materializer.
+The final prompt passed on the first attempt for both batches: four Gaussian
+frames in 23.7 s and two stress-test frames in 11.9 s of preprocessing/inference,
+with about 22.5 GB peak MLX allocation. These are single runs, not a benchmark.
+Both boards' formulas were retained in the Gaussian output; source IDs, timestamps,
+managed crops and the offline notes handoff were verified. A repeat invocation
+reused the video batch without loading the model. Artifacts and code hashes are
+in `.cache/video-mode-integration/verification.json`.
+
+Generated diagram descriptions still contain reading/inference errors, so these
+checks establish integration and resumption, not whole-lecture content quality.
+The full-cycle stage wiring is covered by automated tests; no live online
+notes → PDF → Anki run was performed for these clips.
+The runner defaults to four sampled frames; `--frames` accepts even counts of at
+least four. The pilot was verified with actual GPU inference and Ruff.

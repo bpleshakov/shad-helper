@@ -32,6 +32,8 @@ def parser() -> argparse.ArgumentParser:
     extract.add_argument("--vision-model", choices=(*VISION_MODELS, "off"),
                          default=DEFAULT_VISION_MODEL,
                          help="Local video model: 35b (default), 9b, 4b, or off for audio only")
+    extract.add_argument("--vision-mode", choices=("frames", "video"), default="frames",
+                         help="Separate frame requests (default) or native video batches")
     notes = commands.add_parser("notes", help="Generate notes or export/import a ChatGPT handoff")
     notes.add_argument("jobs", nargs="+", type=Path, metavar="JOB",
                        help="Project directories to process sequentially, in order")
@@ -65,6 +67,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--vision-model", choices=(*VISION_MODELS, "off"),
                      default=DEFAULT_VISION_MODEL,
                      help="Local video model: 35b (default), 9b, 4b, or off for audio only")
+    run.add_argument("--vision-mode", choices=("frames", "video"), default="frames",
+                     help="Separate frame requests (default) or native video batches")
     run.add_argument("--rebuild", action="store_true",
                      help="Delete notes/render and Anki artifacts before rebuilding each stage")
     run.add_argument("--anki-collection", type=Path,
@@ -152,7 +156,8 @@ def _run(args) -> int:
         elif args.command == "extract":
             from .extraction import extract
             print(extract(args.media, args.out, language=args.language,
-                          start=args.start, duration=args.duration, vision_model=args.vision_model))
+                          start=args.start, duration=args.duration, vision_model=args.vision_model,
+                          vision_mode=args.vision_mode))
         elif args.command == "notes":
             from .notes import generate_notes
             batch = len(args.jobs) > 1
@@ -256,6 +261,7 @@ def _run(args) -> int:
             completed = run_pipeline(args.media, args.out, args.state_dir,
                                      language=args.language, start=args.start,
                                      duration=args.duration, vision_model=args.vision_model,
+                                     vision_mode=args.vision_mode,
                                      rebuild=args.rebuild, proxy=args.openai_proxy,
                                      anki_collection=args.anki_collection)
             return 0 if completed else 1

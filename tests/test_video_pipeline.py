@@ -82,6 +82,8 @@ def pipeline(tmp_path, monkeypatch):
     runtime = Mock()
     runtime.infer.return_value = (json.dumps(CONTENT, ensure_ascii=False), {
         "seconds": 1, "finish_reason": "stop", "generation_tokens": 20})
+    runtime.infer_video.return_value = (json.dumps({"observations": [
+        {"frame_indices": [0, 1], **CONTENT}]}), {"finish_reason": "stop"})
     loader = Mock(return_value=runtime)
     monkeypatch.setattr(vision_worker, "_load_runtime", loader)
     monkeypatch.setattr(vision_worker, "_versions", lambda: {"mlx-vlm": "test"})
@@ -127,7 +129,7 @@ def test_presets_load_pinned_models_sequentially_and_keep_source_timeline(
         "schema_version": 5, "pipeline": "audio_video", "vision_model": alias}
     diagnostics = read_json(pipeline.job / "extraction-diagnostics.json")
     assert diagnostics["evidence_fingerprint"] == fingerprint(evidence)
-    assert diagnostics["models"]["vision"] == {"preset": alias, "model": model,
+    assert diagnostics["models"]["vision"] == {"preset": alias, "model": model, "mode": "frames",
                                                 "revision": revision}
     assert diagnostics["selection"]["clip_start"] == 105
     assert diagnostics["visuals"][0]["image"]
@@ -138,8 +140,60 @@ def test_presets_load_pinned_models_sequentially_and_keep_source_timeline(
     assert 0 <= timings["vision_seconds"] <= timings["total_seconds"]
 
 
-def test_off_skips_all_video_work_and_dependencies(pipeline):
-    evidence = run(pipeline, vision_model="off")
+def test_video_mode_preserves_source_crops_and_notes_handoff(pipeline):
+    from shad_helper.notes import generate_notes
+
+    content = {**CONTENT, "illustrations": [
+        {"source_kind": "drawn", "box": [0, 0, 1, 1], "description": "Схема"}]}
+    pipeline.runtime.infer_video.return_value = (json.dumps({"observations": [
+        {"frame_indices": [0, 1], **content}]}), {"finish_reason": "stop"})
+    evidence = run(pipeline, vision_mode="video")
+    assert validate_evidence(evidence) == evidence
+    extraction.assert_extraction_complete(pipeline.job, evidence)
+    check_job(pipeline.job)
+    assert read_json(pipeline.job / "extraction-config.json")["vision_mode"] == "video"
+    pipeline.runtime.infer.assert_not_called()
+    pipeline.runtime.infer_video.assert_called_once()
+    assert [item["timestamp"] for item in evidence["visuals"]] == [105.25, 106.75]
+    hashes = []
+    for item in evidence["visuals"]:
+        illustration = item["illustrations"][0]
+        assert illustration["id"] == f"{item['id']}_ill01"
+        crop = resolve_illustration(pipeline.job, evidence, illustration["id"])
+        with Image.open(crop) as image:
+            assert np.array_equal(np.asarray(image.convert("L")),
+                                  pipeline.proxy_frames[item["timestamp"]])
+        hashes.append(illustration["image_sha256"])
+    assert len(set(hashes)) == 2
+    handoff = generate_notes(pipeline.job, pipeline.job / "auth", manual=True)
+    assert read_json(handoff / "inputs/ch001/context.json")["visuals"] == evidence["visuals"]
+
+
+def test_mode_switches_reuse_asr_and_frames_with_separate_vision_caches(pipeline):
+    original = run(pipeline)
+    video_evidence = run(pipeline, vision_mode="video")
+    assert video_evidence == original
+    assert run(pipeline, vision_mode="video") == video_evidence
+    assert read_json(pipeline.job / "extraction-diagnostics.json")["vision"]["cached_items"] == 2
+    assert run(pipeline) == original
+    assert pipeline.transcribe.call_count == 1
+    assert pipeline.scan.call_count == 1
+    assert pipeline.native.call_count == 2
+    assert pipeline.runtime.infer.call_count == 2
+    assert pipeline.runtime.infer_video.call_count == 1
+    assert "vision_mode" not in read_json(pipeline.job / "extraction-config.json")
+
+
+def test_invalid_mode_is_rejected_before_creating_job(pipeline):
+    with pytest.raises(ValueError, match="vision_mode"):
+        run(pipeline, vision_mode="unknown")
+    assert not pipeline.job.exists()
+    pipeline.transcribe.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["frames", "video"])
+def test_off_skips_all_video_work_and_dependencies(pipeline, mode):
+    evidence = run(pipeline, vision_model="off", vision_mode=mode)
     assert evidence["schema_version"] == 3
     assert "visuals" not in evidence
     assert read_json(pipeline.job / "extraction-config.json") == AUDIO_CONFIG

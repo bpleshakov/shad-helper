@@ -1,6 +1,7 @@
 """Isolated, resumable visual extraction; exiting releases Apple unified memory."""
 
 import argparse
+import copy
 import json
 import re
 import time
@@ -109,6 +110,11 @@ class _MLXRuntime:
             raise RuntimeError("Local vision requires: uv sync --extra local.") from error
         self.model, self.processor = load(model_id, revision=revision)
 
+    def infer_video(self, items: list[dict], max_tokens: int, *, retry: bool = False):
+        from .video_vision import infer_video
+
+        return infer_video(self, items, max_tokens, retry=retry)
+
     def infer(self, image: str, max_tokens: int, *, retry: bool = False) -> tuple[str, dict]:
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import apply_chat_template
@@ -162,36 +168,61 @@ class _InvalidOutput(ValueError):
 
 
 def run(request: dict) -> dict:
+    mode = request.get("mode", "frames")
+    if mode not in ("frames", "video"):
+        raise ValueError("Vision mode must be frames or video")
+    video_mode = mode == "video"
+    if video_mode:
+        from .video_vision import (
+            MAX_FRAMES,
+            MAX_SECONDS,
+            VIDEO_PROMPT,
+            group_frames,
+            parse_video_output,
+        )
+
     job = Path(request["job"])
     model_id, revision = request["model"], request.get("revision")
-    max_tokens = request.get("max_tokens", 2048)
+    max_tokens = request.get("max_tokens", 4096 if video_mode else 2048)
     if type(max_tokens) is not int or not 1 <= max_tokens <= 4096:
         raise ValueError("max_tokens must be an integer between 1 and 4096")
-    settings = {"max_tokens": max_tokens, "retry_max_tokens": 4096,
+    retry_max_tokens = 8192 if video_mode else 4096
+    settings = {"max_tokens": max_tokens, "retry_max_tokens": retry_max_tokens,
                 "max_pixels": MAX_PIXELS, "min_pixels": 1024,
                 "enable_thinking": False, "temperature": 0.0}
+    if video_mode:
+        settings.update(max_frames=MAX_FRAMES, max_seconds=MAX_SECONDS,
+                        temporal_sampling="repeat_each_source_frame")
     packages = _versions()
     started = time.monotonic()
     runtime = None
     model_load_seconds = 0.0
     fresh_items = 0
 
-    def process(item):
+    def process(batch):
         nonlocal runtime, model_load_seconds, fresh_items
+        item = batch[0]
         item_id = item["id"]
-        if (not isinstance(item_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", item_id)
-                or item_id in {".", ".."}):
-            raise ValueError("Invalid visual item ID")
+        for frame in batch:
+            if (not isinstance(frame["id"], str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", frame["id"])
+                    or frame["id"] in {".", ".."}):
+                raise ValueError("Invalid visual item ID")
         signature = {"model": model_id, "revision": revision, "prompt": PROMPT,
                      "illustration_policy": ILLUSTRATION_POLICY_VERSION,
                      "retry_prompt": RETRY_PROMPT,
                      "settings": settings, "packages": packages,
                      "sha256": sha256_file(Path(item["image"]))}
+        stage = "vision-video" if video_mode else "vision"
+        if video_mode:
+            signature.update(prompt=VIDEO_PROMPT, frames=[
+                {"id": frame["id"], "timestamp": frame["timestamp"],
+                 "sha256": sha256_file(Path(frame["image"]))} for frame in batch])
 
         def persist_attempts(status, attempts):
-            write_json(job / "diagnostics" / "vision" / f"{item_id}.json", {
+            write_json(job / "diagnostics" / stage / f"{item_id}.json", {
                 "fingerprint": fingerprint(signature), "inputs": signature, "item": item,
                 "status": status, "attempts": attempts,
+                **({"frames": batch} if video_mode else {}),
             })
 
         def action():
@@ -200,10 +231,12 @@ def run(request: dict) -> dict:
                 load_started = time.monotonic()
                 runtime = _load_runtime(model_id, revision)
                 model_load_seconds = time.monotonic() - load_started
-            fresh_items += 1
+            fresh_items += len(batch)
             attempts = []
-            for attempt_index, limit in enumerate((max_tokens, 4096)):
-                raw, metrics = runtime.infer(item["image"], limit, retry=bool(attempt_index))
+            for attempt_index, limit in enumerate((max_tokens, retry_max_tokens)):
+                raw, metrics = (runtime.infer_video(batch, limit, retry=bool(attempt_index))
+                                if video_mode else
+                                runtime.infer(item["image"], limit, retry=bool(attempt_index)))
                 attempt = {**metrics, "max_tokens": limit, "raw": raw}
                 attempts.append(attempt)
                 persist_attempts("validating", attempts)
@@ -212,7 +245,8 @@ def run(request: dict) -> dict:
                             or (not metrics.get("finish_reason")
                                 and metrics.get("generation_tokens", 0) >= limit)):
                         raise ValueError("Visual output reached the token limit")
-                    content = parse_output(raw)
+                    content = (parse_video_output(raw, len(batch)) if video_mode
+                               else parse_output(raw))
                     persist_attempts("complete", attempts)
                     return {"content": content,
                             "diagnostics": {"status": "complete", "attempts": attempts}}
@@ -222,7 +256,7 @@ def run(request: dict) -> dict:
             raise _InvalidOutput(attempts)
 
         try:
-            result = checkpoint(job, f"vision/{item_id}", signature, action, quiet=True)
+            result = checkpoint(job, f"{stage}/{item_id}", signature, action, quiet=True)
         except _InvalidOutput as error:
             # Keep a candidate for notes-stage inspection, not a confirmed illustration.
             # Failed responses must not poison successful-stage caches.
@@ -233,14 +267,23 @@ def run(request: dict) -> dict:
                             "unreadable": ["Не удалось получить корректное описание кадра."]},
                 "diagnostics": {"status": "incomplete", "attempts": error.attempts},
             }
-        return {**item, **result}
+            if video_mode:
+                result["content"] = [copy.deepcopy(result["content"]) for _ in batch]
+        if video_mode:
+            return [{**frame, "content": content, "diagnostics": {
+                **result["diagnostics"], "batch_id": item_id}}
+                for frame, content in zip(batch, result["content"], strict=True)]
+        return [{**item, **result}]
 
-    with tqdm(request["items"], desc="Vision", unit="frame", dynamic_ncols=True) as frames:
-        items = [process(item) for item in frames]
+    batches = group_frames(request["items"]) if video_mode else [[item] for item in request["items"]]
+    with tqdm(batches, desc="Video vision" if video_mode else "Vision",
+              unit="batch" if video_mode else "frame", dynamic_ncols=True) as progress:
+        items = [item for batch in progress for item in process(batch)]
     return {"items": items, "diagnostics": {
         "model": model_id, "revision": revision, "settings": settings, "packages": packages,
         "seconds": time.monotonic() - started, "model_load_seconds": model_load_seconds,
         "fresh_items": fresh_items, "cached_items": len(items) - fresh_items,
+        **({"mode": mode, "batches": len(batches)} if video_mode else {}),
     }}
 
 

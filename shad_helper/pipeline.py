@@ -38,7 +38,8 @@ def _jobs(media: list[Path], out: Path) -> list[tuple[Path, Path]]:
 
 def run_pipeline(media: list[Path], out: Path, state_dir: Path, *, language: str = "ru",
                  start: float = 0.0, duration: float | None = None,
-                 vision_model: str = DEFAULT_VISION_MODEL, rebuild: bool = False,
+                 vision_model: str = DEFAULT_VISION_MODEL, vision_mode: str = "frames",
+                 rebuild: bool = False,
                  proxy: str | None = None, anki_collection: Path | None = None) -> bool:
     jobs = _jobs(media, out)
     completed, next_position = 0, 1
@@ -48,7 +49,7 @@ def run_pipeline(media: list[Path], out: Path, state_dir: Path, *, language: str
         try:
             print(f"{label}: {stage}", flush=True)
             extract(source, job, language=language, start=start, duration=duration,
-                    vision_model=vision_model)
+                    vision_model=vision_model, vision_mode=vision_mode)
             stage = "notes"
             print(f"{label}: {stage}", flush=True)
             result = generate_notes(job, state_dir, rebuild=rebuild, proxy=proxy)

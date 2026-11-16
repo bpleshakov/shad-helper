@@ -206,11 +206,13 @@ def _audio_chunks(media: Path, out: Path, start: float, end: float, media_hash: 
 
 def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
             duration: float | None = None, asr_model: str = ASR_MODEL,
-            vision_model: str = DEFAULT_VISION_MODEL) -> Path:
+            vision_model: str = DEFAULT_VISION_MODEL, vision_mode: str = "frames") -> Path:
     total_started = time.monotonic()
     media, out = Path(media).resolve(), Path(out).resolve()
     if vision_model != "off" and vision_model not in VISION_MODELS:
         raise ValueError("vision_model must be off, 4b, 9b, or 35b.")
+    if vision_mode not in ("frames", "video"):
+        raise ValueError("vision_mode must be frames or video.")
     check_job(out)
     for binary in ("ffmpeg", "ffprobe"):
         if not shutil.which(binary):
@@ -230,6 +232,8 @@ def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
     end = metadata["duration"] if duration is None else min(metadata["duration"], start + duration)
     config = ({"schema_version": VIDEO_EVIDENCE_VERSION, "pipeline": "audio_video",
                "vision_model": vision_model} if video_metadata is not None else AUDIO_CONFIG)
+    if video_metadata is not None and vision_mode == "video":
+        config["vision_mode"] = vision_mode
     media_hash = sha256_file(media)
     out.mkdir(parents=True, exist_ok=True)
     write_json(out / "extraction-config.json", config)
@@ -271,11 +275,12 @@ def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
     if video_metadata is not None:
         vision_started = time.monotonic()
         model = VISION_MODELS[vision_model]
-        diagnostics["models"]["vision"] = {"preset": vision_model, **model}
+        diagnostics["models"]["vision"] = {"preset": vision_model, "mode": vision_mode, **model}
         try:
             selection = select_frames(media, out, start, end, media_hash, metadata=video_metadata)
             diagnostics["selection"] = selection["diagnostics"]
-            visual_result = (_vision_worker(out, {**model, "items": selection["items"]})
+            visual_result = (_vision_worker(out, {**model, "mode": vision_mode,
+                                                 "items": selection["items"]})
                              if selection["items"] else {"items": [], "diagnostics": {
                                  "status": "no_frames", "fresh_items": 0, "cached_items": 0}})
             visuals = []

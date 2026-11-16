@@ -150,7 +150,10 @@ class CheckpointTests(unittest.TestCase):
             audio["schema_version"] = 3
             for config in (AUDIO_CONFIG, *({"schema_version": 4, "pipeline": "audio_video",
                                            "vision_model": model}
-                                          for model in ("4b", "9b", "35b"))):
+                                          for model in ("4b", "9b", "35b")),
+                           *({"schema_version": 5, "pipeline": "audio_video",
+                              "vision_model": "35b", "vision_mode": mode}
+                             for mode in ("frames", "video"))):
                 for evidence in (audio, video):
                     with self.subTest(config=config, version=evidence["schema_version"]):
                         write_json(job / "extraction-config.json", config)
@@ -162,6 +165,15 @@ class CheckpointTests(unittest.TestCase):
             job = Path(temporary)
             write_json(job / "extraction-config.json",
                        {"schema_version": 4, "pipeline": "audio_video", "vision_model": "unknown"})
+            with self.assertRaisesRegex(ValueError, "Unsupported job format"):
+                check_job(job)
+
+    def test_unsupported_video_mode_in_job_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            job = Path(temporary)
+            write_json(job / "extraction-config.json", {
+                "schema_version": 5, "pipeline": "audio_video",
+                "vision_model": "35b", "vision_mode": "unknown"})
             with self.assertRaisesRegex(ValueError, "Unsupported job format"):
                 check_job(job)
 

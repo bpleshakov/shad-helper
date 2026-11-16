@@ -22,10 +22,12 @@ def check_job(job: Path) -> None:
     if config.exists():
         saved = read_json(config)
         video_config = (isinstance(saved, dict)
-                        and set(saved) == {"schema_version", "pipeline", "vision_model"}
+                        and set(saved) in ({"schema_version", "pipeline", "vision_model"},
+                                           {"schema_version", "pipeline", "vision_model", "vision_mode"})
                         and saved["schema_version"] in (4, VIDEO_EVIDENCE_VERSION)
                         and saved["pipeline"] == "audio_video"
-                        and saved["vision_model"] in ("4b", "9b", "35b"))
+                        and saved["vision_model"] in ("4b", "9b", "35b")
+                        and saved.get("vision_mode", "frames") in ("frames", "video"))
         if saved != AUDIO_CONFIG and not video_config:
             raise ValueError("Unsupported job format; use a new output directory for extraction.")
     elif job.exists() and any(job.iterdir()):

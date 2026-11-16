@@ -37,13 +37,14 @@ def test_run_forwards_multiple_files_and_stage_options(monkeypatch, tmp_path, po
         arguments.extend(["--openai-proxy", proxy])
     arguments.extend(["run", *(str(file) for file in files), "--out", str(out),
                       "--start", "30", "--duration", "60", "--language", "en",
-                      "--vision-model", "4b", "--rebuild", "--anki-collection", str(collection)])
+                      "--vision-model", "4b", "--vision-mode", "video",
+                      "--rebuild", "--anki-collection", str(collection)])
     if position == "local":
         arguments.extend(["--openai-proxy", proxy])
 
     assert main(arguments) == 0
     run.assert_called_once_with(files, out, state, language="en", start=30, duration=60,
-                                vision_model="4b", rebuild=True, proxy=proxy,
+                                vision_model="4b", vision_mode="video", rebuild=True, proxy=proxy,
                                 anki_collection=collection)
 
 
@@ -54,7 +55,7 @@ def test_run_defaults_and_batch_exit_status(monkeypatch, tmp_path, completed):
     assert main(["run", "lecture.mp4", "--out", "jobs"]) == (0 if completed else 1)
     run.assert_called_once_with([cli.Path("lecture.mp4")], cli.Path("jobs"),
                                 cli.Path(".shad-helper/auth"), language="ru", start=0,
-                                duration=None, vision_model="35b", rebuild=False,
+                                duration=None, vision_model="35b", vision_mode="frames", rebuild=False,
                                 proxy=None, anki_collection=None)
 
 
@@ -62,6 +63,8 @@ def test_run_defaults_and_batch_exit_status(monkeypatch, tmp_path, completed):
     ["run", "--out", "jobs"],
     ["run", "lecture.mp4"],
     ["run", "lecture.mp4", "--out", "jobs", "--vision-model", "unknown"],
+    ["run", "lecture.mp4", "--out", "jobs", "--vision-mode", "unknown"],
+    ["extract", "lecture.mp4", "--out", "jobs", "--vision-mode", "unknown"],
 ])
 def test_run_rejects_missing_inputs_output_or_unknown_model(monkeypatch, arguments):
     run = Mock()
@@ -616,12 +619,13 @@ def test_extract_forwards_audio_options_without_writing(monkeypatch, tmp_path, m
     assert main(["extract", media, "--out", str(out), "--start", "30",
                  "--duration", "60", "--language", "ru"]) == 0
     extract.assert_called_once_with(
-        cli.Path(media), out, language="ru", start=30, duration=60, vision_model="35b")
+        cli.Path(media), out, language="ru", start=30, duration=60, vision_model="35b",
+        vision_mode="frames")
     assert not out.exists()
 
 
 @pytest.mark.parametrize("command,flag", [
-    ("extract", "--source"), ("extract", "--vision-mode"),
+    ("extract", "--source"),
     ("extract", "--vision-budget-minutes"), ("render", "--images"),
 ])
 def test_removed_options_are_rejected_before_work(tmp_path, command, flag):
@@ -656,12 +660,14 @@ def test_doctor_smoke_runs_only_transcription(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("model", ["4b", "9b", "35b", "off"])
-def test_extract_forwards_vision_model(monkeypatch, tmp_path, model):
+@pytest.mark.parametrize("mode", ["frames", "video"])
+def test_extract_forwards_vision_options(monkeypatch, tmp_path, model, mode):
     extract = Mock(return_value=tmp_path / "evidence.json")
     monkeypatch.setitem(sys.modules, "shad_helper.extraction", SimpleNamespace(extract=extract))
     assert main(["extract", "lecture.mp4", "--out", str(tmp_path),
-                 "--vision-model", model]) == 0
+                 "--vision-model", model, "--vision-mode", mode]) == 0
     assert extract.call_args.kwargs["vision_model"] == model
+    assert extract.call_args.kwargs["vision_mode"] == mode
 
 
 def test_unknown_vision_model_is_rejected_before_work(monkeypatch, tmp_path):

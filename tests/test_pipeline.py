@@ -41,16 +41,18 @@ def stages(monkeypatch):
     return calls
 
 
-def test_runs_all_stages_for_each_file_and_forwards_options(media, stages, tmp_path, capsys):
+@pytest.mark.parametrize("mode", ["frames", "video"])
+def test_runs_all_stages_for_each_file_and_forwards_options(media, stages, tmp_path, capsys, mode):
     state, collection = tmp_path / "auth", tmp_path / "collection.anki2"
     assert pipeline.run_pipeline(media[:2], tmp_path / "out", state, language="en", start=10,
-                                 duration=30, vision_model="off", rebuild=True,
+                                 duration=30, vision_model="35b", vision_mode=mode, rebuild=True,
                                  proxy="http://localhost:8080", anki_collection=collection)
     jobs = [item.args[1] for item in stages.extract.call_args_list]
     expected = []
     for index, (source, job) in enumerate(zip(media, jobs)):
         expected.extend([
-            call.extract(source, job, language="en", start=10, duration=30, vision_model="off"),
+            call.extract(source, job, language="en", start=10, duration=30,
+                         vision_model="35b", vision_mode=mode),
             call.generate_notes(job, state, rebuild=True, proxy="http://localhost:8080"),
             call.render(job, rebuild=True),
             call.generate_anki(job, state, pdf=job / "notes" / "main.pdf", rebuild=True,

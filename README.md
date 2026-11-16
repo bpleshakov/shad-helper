@@ -46,6 +46,7 @@ After installing dependencies, configuring an API key or signing in, and setting
 
 ```sh
 UV_CACHE_DIR=.cache/uv uv run shad-helper run lecture.mp4 --out jobs
+UV_CACHE_DIR=.cache/uv uv run shad-helper run lecture.mp4 --out jobs-video --vision-mode video
 UV_CACHE_DIR=.cache/uv uv run shad-helper run 'Lecture 1.mp4' 'Lecture 2.mkv' --out jobs --vision-model 9b
 ```
 
@@ -64,7 +65,7 @@ file. A manual notes handoff also counts as an incomplete job, so an older PDF i
 never used in its place. The final summary reports completed/failed jobs, and the
 command exits with status 1 if any job failed.
 
-The extraction options `--start`, `--duration`, `--language`, and `--vision-model`
+The extraction options `--start`, `--duration`, `--language`, `--vision-model`, and `--vision-mode`
 apply to every input. `--rebuild` clears each notes/Anki stage's generated files,
 caches, and diagnostics before that stage starts, including the Anki deck identity,
 then regenerates them and compiles the PDF from scratch. Otherwise existing stage
@@ -99,6 +100,19 @@ UV_CACHE_DIR=.cache/uv uv run shad-helper extract lecture.mp4 --out jobs/audio-l
 `--vision-model` accepts `35b`, `9b`, `4b`, or `off`. The default is `35b` on
 every invocation; repeat the flag when continuing a job with another preset.
 Audio-only files and album-cover images do not load a vision model.
+
+`--vision-mode frames|video` works with both `extract` and `run`. The default,
+`frames`, processes selected frames independently. `video` sends up to four
+selected frames spanning at most 20 seconds together through Qwen3.5's native
+video input, with source timestamps. It uses the same frame selector and spatial
+resolution budget; it does not send every frame of the recording. Transcription
+still runs separately. Original frame IDs and illustration crops are preserved,
+so the remaining notes → PDF → Anki stages run normally.
+
+Video mode is experimental: short-clip checks do not establish whole-lecture
+quality or speed. See the [video pilot and integration notes](docs/vision-pilot.md).
+Repeat `--vision-mode video` on subsequent runs; omitting it selects `frames`.
+With `--vision-model off` or audio-only input, the mode has no effect.
 
 | Preset | Local model (4-bit) | Peak MLX memory in the 16-frame pilot |
 | --- | --- | ---: |
@@ -189,10 +203,16 @@ Notes do not read that report, and warnings do not block generation.
 
 Reruns reuse matching audio, ASR, frame selection and vision checkpoints. Changing
 `--vision-model` reuses transcription and selected frames while recomputing visual
-content. Changes to media, intervals, language, model, or vision prompt/settings
+content. Frame and video modes have separate vision checkpoints; switching modes
+reuses transcription and frame selection, and returning to a previously used mode
+can reuse its matching results. Video checkpoints also include the IDs, timestamps,
+and image hashes of every frame in the batch. Changes to media, intervals, language,
+model, or vision prompt/settings
 invalidate affected results. Deleted audio/frame artifacts are rebuilt. Interrupted
 work resumes from completed chunks/frames. Invalid vision JSON gets one retry;
 an unsuccessful frame remains explicitly `incomplete` and is retried on rerun.
+In video mode, retries and checkpoints cover a batch; a malformed response leaves
+all its frames `incomplete`. Raw batch responses live in `diagnostics/vision-video/`.
 
 Version 3 audio and version 4/5 video jobs can be reused, including enabling or
 disabling vision in an existing supported job. Older formats require a **new
