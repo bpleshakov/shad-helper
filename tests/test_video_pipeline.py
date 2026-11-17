@@ -184,10 +184,11 @@ def test_mode_switches_reuse_asr_and_frames_with_separate_vision_caches(pipeline
     assert "vision_mode" not in read_json(pipeline.job / "extraction-config.json")
 
 
-def test_invalid_mode_is_rejected_before_creating_job(pipeline):
+def test_invalid_mode_only_writes_failed_run_diagnostics(pipeline):
     with pytest.raises(ValueError, match="vision_mode"):
         run(pipeline, vision_mode="unknown")
-    assert not pipeline.job.exists()
+    assert {path.name for path in pipeline.job.iterdir()} == {"run-diagnostics.json"}
+    assert read_json(pipeline.job / "run-diagnostics.json")["status"] == "failed"
     pipeline.transcribe.assert_not_called()
 
 
@@ -236,10 +237,11 @@ def test_video_without_frames_keeps_v5_without_loading_vision(pipeline, monkeypa
     pipeline.vision.assert_not_called()
 
 
-def test_unknown_model_rejected_before_creating_job_or_probing(pipeline):
+def test_unknown_model_only_writes_failed_run_diagnostics_without_probing(pipeline):
     with pytest.raises(ValueError, match="vision_model"):
         run(pipeline, vision_model="unknown")
-    assert not pipeline.job.exists()
+    assert {path.name for path in pipeline.job.iterdir()} == {"run-diagnostics.json"}
+    assert read_json(pipeline.job / "run-diagnostics.json")["status"] == "failed"
     pipeline.probe_video.assert_not_called()
 
 
@@ -501,7 +503,8 @@ def test_off_still_rejects_clip_beyond_audio_even_with_longer_video(pipeline, mo
     with pytest.raises(ValueError, match="duration"):
         extraction.extract(pipeline.media, pipeline.job, start=90, duration=15, vision_model="off")
     pipeline.probe_video.assert_not_called()
-    assert not pipeline.job.exists()
+    assert {path.name for path in pipeline.job.iterdir()} == {"run-diagnostics.json"}
+    assert read_json(pipeline.job / "run-diagnostics.json")["status"] == "failed"
 
 
 @pytest.mark.parametrize("stream_duration,expected_end", [("2", 7), (None, 8)])

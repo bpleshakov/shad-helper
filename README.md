@@ -80,6 +80,24 @@ share a position. Each export also checks the live Anki allocation. Import the
 completed decks before starting a separate batch, since separate invocations do
 not reserve positions for each other.
 
+Each pipeline invocation writes `JOB/run-diagnostics.json`, also when calling
+`extract`, `notes`, `render`, or `anki` separately (including their Python APIs).
+It records the full source-checkout `commit_hash`, a `git_dirty` flag for uncommitted
+changes, UTC start/end timestamps, and total `elapsed_seconds`. Git fields are
+`null` when the checkout or Git metadata is unavailable.
+
+The ordered `steps` tree records elapsed seconds and status for each executed stage
+and its substeps, including chapter checkpoints, illustration verification and
+reconciliation, LaTeX compilation, and Anki generation.
+Times include nested work: compare siblings, rather than adding parents to children.
+Cached checkpoints record this run's lookup time with status `cached`; they do not
+reuse the original generation duration. Failed/interrupted steps retain elapsed time.
+The report updates as steps finish and replaces the previous invocation's report;
+no history directories are created. A full `run` keeps all four stages together,
+and `notes --rebuild` keeps notes generation and PDF rendering together. Even a
+rejected stage invocation writes its failed diagnostic report without publishing
+new pipeline output. Existing `handoff/run.json` retains the notes-specific result.
+
 ## Extract lecture evidence
 
 Start with a representative ten-minute interval:

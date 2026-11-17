@@ -12,6 +12,7 @@ import pytest
 
 from shad_helper import anki, pipeline
 from shad_helper.jobs import read_json, write_json
+from shad_helper.run_diagnostics import record_run
 
 
 @pytest.fixture
@@ -79,6 +80,39 @@ def test_jobs_stable_across_reordered_runs_and_duplicate_stems(tmp_path, stages)
     stages.reset_mock()
     assert pipeline.run_pipeline(sources[::-1], tmp_path / "out", tmp_path / "auth")
     assert {item.args[0]: item.args[1] for item in stages.extract.call_args_list} == jobs
+
+
+@pytest.mark.parametrize("failure", [None, "render", "interrupt"])
+def test_each_job_keeps_a_combined_pipeline_diagnostic_report(
+        media, stages, tmp_path, monkeypatch, failure):
+    # The existing stage mocks stand in for the decorated public Python APIs.
+    for attribute, command in (("extract", "extract"), ("generate_notes", "notes"),
+                               ("render", "render"), ("generate_anki", "anki")):
+        action = getattr(stages, attribute)
+        if command == "extract":
+            def invoke(media, out, *, _action=action, **kwargs):
+                return _action(media, out, **kwargs)
+        else:
+            def invoke(job, *args, _action=action, **kwargs):
+                return _action(job, *args, **kwargs)
+        monkeypatch.setattr(pipeline, attribute, record_run(
+            command, job_argument="out" if command == "extract" else "job")(invoke))
+    if failure:
+        stages.render.side_effect = KeyboardInterrupt() if failure == "interrupt" else ValueError("Bad TeX")
+    if failure == "interrupt":
+        with pytest.raises(KeyboardInterrupt):
+            pipeline.run_pipeline(media[:2], tmp_path / "out", tmp_path / "auth", rebuild=True)
+    else:
+        assert pipeline.run_pipeline(media[:2], tmp_path / "out", tmp_path / "auth", rebuild=True) is (failure is None)
+    reports = [read_json(call.args[1] / "run-diagnostics.json") for call in stages.extract.call_args_list]
+    assert len(reports) == (1 if failure == "interrupt" else 2)
+    for report in reports:
+        assert report["command"] == "run"
+        assert report["status"] == ("interrupted" if failure == "interrupt" else "failed" if failure else "completed")
+        assert [step["name"] for step in report["steps"]] == (
+            ["extract", "notes", "render"] if failure else ["extract", "notes", "render", "anki"])
+        assert all(step["elapsed_seconds"] >= 0 for step in report["steps"])
+        assert sum(step["elapsed_seconds"] for step in report["steps"]) <= report["elapsed_seconds"]
 
 
 @pytest.mark.parametrize("invalid", ["empty", "missing", "directory", "repeated", "alias"])

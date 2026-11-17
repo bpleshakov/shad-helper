@@ -9,6 +9,8 @@ import pytest
 
 from shad_helper import cli
 from shad_helper.cli import main
+from shad_helper.jobs import read_json
+from shad_helper.run_diagnostics import record_run
 
 
 def zero_spending(command):
@@ -491,6 +493,31 @@ def test_notes_single_rebuild_renders_completed_notes(notes_batch, tmp_path, imp
     render.assert_called_once_with(job, rebuild=True)
     assert events == [("notes", job), ("render", job)]
     assert str(job / "notes" / "main.pdf") in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fail_render", [False, True])
+def test_notes_rebuild_keeps_generation_and_render_timings_in_one_report(
+        notes_batch, monkeypatch, fail_render):
+    jobs, generate, render, _ = notes_batch
+
+    @record_run("notes")
+    def tracked_notes(job, state, **kwargs):
+        return generate(job, state, **kwargs)
+
+    @record_run("render")
+    def tracked_render(job, **kwargs):
+        return render(job, **kwargs)
+
+    monkeypatch.setattr(sys.modules["shad_helper.notes"], "generate_notes", tracked_notes)
+    monkeypatch.setattr(sys.modules["shad_helper.rendering"], "render", tracked_render)
+    if fail_render:
+        render.side_effect = RuntimeError("Compilation failed")
+    assert main(["notes", str(jobs[0]), "--rebuild"]) == int(fail_render)
+    report = read_json(jobs[0] / "run-diagnostics.json")
+    assert report["command"] == "notes"
+    assert report["status"] == ("failed" if fail_render else "completed")
+    assert [step["name"] for step in report["steps"]] == ["notes", "render"]
+    assert all(step["elapsed_seconds"] >= 0 for step in report["steps"])
 
 
 def test_notes_single_rebuild_does_not_render_automatic_handoff(notes_batch, capsys):

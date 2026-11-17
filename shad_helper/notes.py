@@ -18,6 +18,7 @@ from .jobs import (
     validate_evidence,
     write_json,
 )
+from .run_diagnostics import record_run, timed_step
 
 INSTRUCTIONS = r"""Ты составляешь компактный русский учебный конспект университетской лекции.
 Данные лекции переданы отдельным JSON-контекстом; схема задает формат ответа.
@@ -476,6 +477,7 @@ def _chapter_prompt(context: dict, outline: dict, glossary: list[dict],
                       ensure_ascii=False, separators=(",", ":"))
 
 
+@timed_step("handoff_export")
 def export_handoff(job: Path, evidence: dict, outline: dict, *, contexts: dict | None = None) -> Path:
     from .schemas import LectureNotes
 
@@ -585,6 +587,7 @@ def _generate_chapter(client, text: str, evidence: dict, chapter: dict,
                 client.request_recorder = recorder
 
 
+@timed_step("chapter_merge")
 def _merge_chapters(parts: list[dict], outline: dict, evidence: dict,
                     resolutions: dict | None = None) -> dict:
     notes = {"title": outline["title"], "language": "ru", "chapters": [],
@@ -599,6 +602,7 @@ def _merge_chapters(parts: list[dict], outline: dict, evidence: dict,
     return validate_notes(notes, evidence, resolutions, finalized=True)
 
 
+@timed_step("illustration_finalization")
 def _finalize_notes(notes: dict, evidence: dict, job: Path, folder: Path, client,
                     resolutions: dict) -> dict:
     from .illustration_verification import finalize_illustrations
@@ -669,6 +673,7 @@ def _split_chapter(chapter: dict) -> list[dict] | None:
     return split
 
 
+@timed_step("outline_preparation")
 def _bounded_outline(evidence: dict, outline: dict, *, job: Path | None = None) -> dict:
     chapters = []
 
@@ -689,6 +694,7 @@ def _bounded_outline(evidence: dict, outline: dict, *, job: Path | None = None) 
     return validate_outline(dict(outline, chapters=chapters), evidence)
 
 
+@record_run("notes")
 def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
                    manual: bool = False, client=None, rebuild: bool = False,
                    proxy: str | None = None) -> Path:

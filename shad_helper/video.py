@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from .frame_novelty import filter_frames
 from .jobs import checkpoint, fingerprint, read_json
+from .run_diagnostics import timed_step
 
 SELECTION_SETTINGS = {
     "version": 4,
@@ -73,6 +74,7 @@ def packet_bounds(media: Path, stream: str | int, container_start: float) -> tup
     return first - container_start, last - container_start
 
 
+@timed_step("video_probe")
 def probe_video(media: Path) -> dict | None:
     """Return video bounds in seconds relative to the container's start PTS."""
     result = subprocess.run(
@@ -388,6 +390,7 @@ def _native_frame(media: Path, metadata: dict, timestamp: float, image: Path) ->
         temporary.unlink(missing_ok=True)
 
 
+@timed_step("frame_selection")
 def select_frames(media: Path, job: Path, start: float, end: float, media_hash: str,
                   metadata: dict | None = None) -> dict:
     """Select and cache native source images for a recording-relative interval."""

@@ -13,6 +13,7 @@ from .auth import PlanAccessError
 from .illustrations import illustration_index, resolve_illustration
 from .jobs import fingerprint, read_json, sha256_file, write_json
 from .openai_client import DEFAULT_REASONING_EFFORT, PlanClient, ResponseError
+from .run_diagnostics import timed_step
 
 CROP_POLICY_VERSION = 4
 MAX_CROP_REPAIRS = 2
@@ -476,6 +477,7 @@ def _save_crop(job, evidence, identifier, inputs, frame, response, verdict,
     return crop_id, selection_retry, "", False
 
 
+@timed_step("crop_refinement")
 def refine_crop(job: Path, evidence: dict, block: dict, client,
                 folder: Path) -> tuple[str, bool, str, bool]:
     """Return crop ID, retry flag, review reason, and explicit lack of usable content."""

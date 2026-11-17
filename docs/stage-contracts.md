@@ -145,9 +145,16 @@ synthesis; it remains relevant even when the transcription is accurate.
 
 Paths in this tree are relative to the job passed through `--out` or `JOB`.
 Files marked conditional appear only when that branch runs or that content exists.
+`run-diagnostics.json` describes the latest pipeline/stage invocation: source commit
+hash, dirty working tree flag, UTC start/end, total elapsed seconds, and ordered,
+nested step timings with completion/cache/failure/interruption status. Parent times
+include their children. Cache hits measure current lookup time, not saved generation
+time. This file is replaced per invocation, updated as steps finish, and also written
+on stage validation failures. A directory containing only this file can start extraction.
 
 ~~~text
 JOB/
+├── run-diagnostics.json                      # latest commit and per-step wall times
 ├── extraction-config.json
 ├── audio/
 │   └── chunk_0000.wav                         # one file per audio core interval
@@ -403,8 +410,10 @@ resume before `evidence.json` exists.
 The job guard accepts a new or empty directory, a directory with a supported marker,
 or a directory containing supported version 3 or 4 evidence. An incompatible marker,
 legacy evidence, or a nonempty directory with neither marker nor evidence is
-rejected before writing. This includes version 1 and 2 jobs. The commands do not
-migrate them; use a fresh directory.
+rejected before writing pipeline outputs. The current `run-diagnostics.json` is
+ignored when deciding whether the directory is empty; rejected stage invocations
+may still replace that report. This includes version 1 and 2 jobs. The commands
+do not migrate them; use a fresh directory.
 
 ### audio/chunk_0000.wav
 

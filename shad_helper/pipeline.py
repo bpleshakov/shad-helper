@@ -11,6 +11,7 @@ from .extraction import extract
 from .jobs import read_json
 from .notes import generate_notes
 from .rendering import render
+from .run_diagnostics import diagnostic_run
 from .vision_config import DEFAULT_VISION_MODEL
 
 
@@ -47,23 +48,24 @@ def run_pipeline(media: list[Path], out: Path, state_dir: Path, *, language: str
         label = f"[{number}/{len(jobs)}] {source} (job {job})"
         stage = "extract"
         try:
-            print(f"{label}: {stage}", flush=True)
-            extract(source, job, language=language, start=start, duration=duration,
-                    vision_model=vision_model, vision_mode=vision_mode)
-            stage = "notes"
-            print(f"{label}: {stage}", flush=True)
-            result = generate_notes(job, state_dir, rebuild=rebuild, proxy=proxy)
-            if result.resolve() != job / "notes" / "main.tex":
-                raise RuntimeError(f"Notes require manual completion: {result}")
-            stage = "render"
-            print(f"{label}: {stage}", flush=True)
-            pdf = render(job, rebuild=True) if rebuild else render(job)
-            stage = "anki"
-            print(f"{label}: {stage}", flush=True)
-            package = generate_anki(job, state_dir, pdf=pdf, rebuild=rebuild, proxy=proxy,
-                                    anki_collection=anki_collection,
-                                    minimum_position=next_position)
-            next_position = read_json(job / "anki" / "report.json")["end_position"] + 1
+            with diagnostic_run(job, "run"):
+                print(f"{label}: {stage}", flush=True)
+                extract(source, job, language=language, start=start, duration=duration,
+                        vision_model=vision_model, vision_mode=vision_mode)
+                stage = "notes"
+                print(f"{label}: {stage}", flush=True)
+                result = generate_notes(job, state_dir, rebuild=rebuild, proxy=proxy)
+                if result.resolve() != job / "notes" / "main.tex":
+                    raise RuntimeError(f"Notes require manual completion: {result}")
+                stage = "render"
+                print(f"{label}: {stage}", flush=True)
+                pdf = render(job, rebuild=True) if rebuild else render(job)
+                stage = "anki"
+                print(f"{label}: {stage}", flush=True)
+                package = generate_anki(job, state_dir, pdf=pdf, rebuild=rebuild, proxy=proxy,
+                                        anki_collection=anki_collection,
+                                        minimum_position=next_position)
+                next_position = read_json(job / "anki" / "report.json")["end_position"] + 1
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError,
                 ModuleNotFoundError) as exc:
             print(f"{label}: {stage} failed: {exc}", file=sys.stderr, flush=True)

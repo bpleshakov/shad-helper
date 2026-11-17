@@ -28,6 +28,7 @@ from .illustration_states import (
 from .illustrations import illustration_index
 from .jobs import fingerprint, read_json, sha256_file, write_json
 from .openai_client import DEFAULT_REASONING_EFFORT, PlanClient, ResponseError
+from .run_diagnostics import timed_step
 
 VERIFICATION_POLICY_VERSION = 2
 VERIFICATION_INSTRUCTIONS = """Compare a lecture illustration with its LaTeX reconstruction.
@@ -269,6 +270,7 @@ def _cached_verdict(cache, validator=_valid_verdict):
     return None
 
 
+@timed_step("figure_comparison")
 def _compare(client, source, preview, description, folder, *, instructions=None,
              schema=VERIFICATION_SCHEMA, validator=_valid_verdict, retry=False, images=None):
     instructions = VERIFICATION_INSTRUCTIONS if instructions is None else instructions
@@ -363,6 +365,7 @@ def _consolidation_batches(requests):
             yield batch
 
 
+@timed_step("figure_coverage_batches")
 def _batch_consolidations(requests, job, folder, client):
     """Prefill per-pair caches; all conditional decisions stay in the coverage loop."""
     pending, archived = {}, set()
@@ -532,6 +535,7 @@ def _matching_figures(current, retained, observations, *, matcher=None, archive=
     return selected
 
 
+@timed_step("illustration_coverage")
 def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublished):
     observations = illustration_index(evidence)
     blocks = {block["id"]: block for part in [*previous, notes]
@@ -759,6 +763,7 @@ def _recover_coverage(notes, evidence, job, folder, client, previous, unpublishe
     return retry_needed
 
 
+@timed_step("illustration_verification")
 def finalize_illustrations(notes: dict, evidence: dict, job: Path, folder: Path,
                            client, *, previous: list[dict] | None = None) -> tuple[dict, bool]:
     """Return accepted notes and whether unavailable verification should be retried.
@@ -929,6 +934,7 @@ def _reconcile_pair(left, right, observations, job, evidence, folder, client):
     return verdict, transient
 
 
+@timed_step("figure_reconciliation")
 def reconcile_illustrations(notes: dict, evidence: dict, job: Path, folder: Path,
                            client) -> tuple[dict, bool]:
     """Keep a verified representative of neighboring figures on each lecture topic.

@@ -49,14 +49,17 @@ def test_probe_rejects_missing_audio_or_invalid_duration(monkeypatch, data, mess
     (-1, None), (120, None), (float("nan"), None), (float("inf"), None),
     (0, 0), (0, -1), (0, float("nan")), (0, float("inf")),
 ])
-def test_invalid_intervals_create_no_job(tmp_path, monkeypatch, start, duration):
+def test_invalid_intervals_only_write_failed_run_diagnostics(tmp_path, monkeypatch, start, duration):
     monkeypatch.setattr(extraction.shutil, "which", lambda name: name)
     monkeypatch.setattr(extraction, "probe", lambda media: {"duration": 120})
     out = tmp_path / "job"
     with pytest.raises(ValueError):
         extraction.extract(tmp_path / "lecture.wav", out, start=start, duration=duration,
                            vision_model="off")
-    assert not out.exists()
+    assert {path.name for path in out.iterdir()} == {"run-diagnostics.json"}
+    report = read_json(out / "run-diagnostics.json")
+    assert report["command"] == "extract" and report["status"] == "failed"
+    assert report["steps"][0]["status"] == "failed"
 
 
 def worker_request(job, count=2):
@@ -143,6 +146,11 @@ def test_legacy_jobs_are_rejected_with_cleanup_only_on_rebuild(
     if operation == "notes_rebuild":
         before.pop(Path("checkpoints/notes/ch001.json"))
         before.pop(Path("notes.json"))
+    if operation in ("extract", "notes", "notes_rebuild", "render"):
+        report = read_json(tmp_path / "run-diagnostics.json")
+        assert report["status"] == "failed"
+        assert report["command"] == operation.removesuffix("_rebuild")
+        before[Path("run-diagnostics.json")] = (tmp_path / "run-diagnostics.json").read_bytes()
     assert {path.relative_to(tmp_path): path.read_bytes()
             for path in tmp_path.rglob("*") if path.is_file()} == before
 

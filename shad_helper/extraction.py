@@ -21,6 +21,7 @@ from .jobs import (
     sha256_file,
     write_json,
 )
+from .run_diagnostics import record_run, timed_step
 from .video import packet_bounds, probe_video, select_frames
 from .vision_config import DEFAULT_VISION_MODEL, VISION_MODELS
 
@@ -47,6 +48,7 @@ def assert_extraction_complete(job: Path, evidence: dict) -> None:
                          "before generating notes, or explicitly extract with vision off.")
 
 
+@timed_step("media_probe")
 def probe(media: Path) -> dict:
     import json
 
@@ -162,6 +164,7 @@ def _artifact_checkpoint(out: Path, key: str, inputs, action, artifact_paths):
     return result
 
 
+@timed_step("speech_recognition")
 def _worker(out: Path, request: dict) -> dict:
     request = {"job": str(out.resolve()), **request}
     request_path = out / "workers" / "asr.request.json"
@@ -172,6 +175,7 @@ def _worker(out: Path, request: dict) -> dict:
     return read_json(response_path)
 
 
+@timed_step("visual_extraction")
 def _vision_worker(out: Path, request: dict) -> dict:
     request = {"job": str(out.resolve()), **request}
     request_path = out / "workers" / "vision.request.json"
@@ -182,6 +186,7 @@ def _vision_worker(out: Path, request: dict) -> dict:
     return read_json(response_path)
 
 
+@timed_step("audio_preparation")
 def _audio_chunks(media: Path, out: Path, start: float, end: float, media_hash: str,
                   audio_start: float = 0) -> list[dict]:
     chunks = []
@@ -204,6 +209,7 @@ def _audio_chunks(media: Path, out: Path, start: float, end: float, media_hash: 
     return chunks
 
 
+@record_run("extract", job_argument="out")
 def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
             duration: float | None = None, asr_model: str = ASR_MODEL,
             vision_model: str = DEFAULT_VISION_MODEL, vision_mode: str = "frames") -> Path:

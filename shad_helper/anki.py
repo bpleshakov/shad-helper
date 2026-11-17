@@ -37,6 +37,7 @@ from .openai_client import (
     PlanClient,
     ResponseError,
 )
+from .run_diagnostics import record_run, timed_step
 
 
 def _figure_catalog(sources, assets):
@@ -134,6 +135,7 @@ def _publish(staging: Path, folder: Path) -> None:
         raise
 
 
+@timed_step("anki_note_preparation")
 def _prepare_notes(response, document, media_dir, identity, pdf_hash, *, start_position=1,
                    job=None, figure_assets=None):
     models = get_models()
@@ -194,6 +196,7 @@ def _prepare_notes(response, document, media_dir, identity, pdf_hash, *, start_p
     return notes, list(media.values()), provenance
 
 
+@record_run("anki")
 def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
                   rebuild: bool = False, proxy: str | None = None,
                   anki_collection: Path | None = None, minimum_position: int = 1,
@@ -235,27 +238,30 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
             # Freeze the source bytes so the request, provenance and crops always agree.
             frozen_pdf = staging / source.name
             frozen_pdf.write_bytes(data)
-            cached = read_json(cache_path) if cache_path.exists() else {}
-            if cached.get("fingerprint") == signature:
-                print("Reusing anki generation", flush=True)
-                response = validate_response(cached["result"], len(document))
-                validate_card_sources(response, len(document), lecture_sources)
-                _validate_figure_sources(response, lecture_sources, figure_assets)
-            else:
-                print(f"Generating Anki cards from {len(document)} PDF pages", flush=True)
-                selected_client = client or PlanClient(state_dir, proxy=proxy)
-                diagnostics = job / "diagnostics" / "anki" / str(time.time_ns())
-                response = _generate(selected_client, frozen_pdf, len(document), lecture_sources,
-                                     diagnostics, figure_assets)
-                write_json(cache_path, {"fingerprint": signature,
-                                       "result": response.model_dump()})
+            with timed_step("anki_generation") as step:
+                cached = read_json(cache_path) if cache_path.exists() else {}
+                if cached.get("fingerprint") == signature:
+                    print("Reusing anki generation", flush=True)
+                    response = validate_response(cached["result"], len(document))
+                    validate_card_sources(response, len(document), lecture_sources)
+                    _validate_figure_sources(response, lecture_sources, figure_assets)
+                    step["status"] = "cached"
+                else:
+                    print(f"Generating Anki cards from {len(document)} PDF pages", flush=True)
+                    selected_client = client or PlanClient(state_dir, proxy=proxy)
+                    diagnostics = job / "diagnostics" / "anki" / str(time.time_ns())
+                    response = _generate(selected_client, frozen_pdf, len(document), lecture_sources,
+                                         diagnostics, figure_assets)
+                    write_json(cache_path, {"fingerprint": signature,
+                                           "result": response.model_dump()})
             identity = _identity(folder, response.title)
             media_dir = staging / "media"
             media_dir.mkdir()
             notes, media, provenance = _prepare_notes(
                 response, document, media_dir, identity, pdf_hash,
                 job=job, figure_assets=figure_assets)
-            media.extend(render_latex_media(notes, media_dir))
+            with timed_step("anki_latex_rendering"):
+                media.extend(render_latex_media(notes, media_dir))
             # Generation and TeX compilation can take minutes. Read the allocation
             # cursor again immediately before packaging, including current WAL data.
             position_source = collection_position(Path(position_source["collection_path"]))
@@ -265,8 +271,9 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
                 positions = {ordinal: start_position + index for ordinal in note["positions"]}
                 note["positions"] = positions
                 source_note["positions"] = positions
-            write_package(staging / "deck.apkg", deck_id=identity["deck_id"],
-                          deck_name=identity["deck_name"], notes=notes, media_files=media)
+            with timed_step("anki_packaging"):
+                write_package(staging / "deck.apkg", deck_id=identity["deck_id"],
+                              deck_name=identity["deck_name"], notes=notes, media_files=media)
             report = {"schema_version": 2, **identity, "source_pdf": str(source.resolve()),
                 "pdf_sha256": pdf_hash, "page_count": len(document), "model": model,
                 "reasoning_effort": DEFAULT_REASONING_EFFORT, "prompt_version": PROMPT_VERSION,

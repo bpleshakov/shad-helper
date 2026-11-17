@@ -11,6 +11,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from .jobs import check_job, fingerprint, read_json, sha256_file, write_json
+from .run_diagnostics import record_run, timed_step
 from .schemas import NoteBlock
 
 
@@ -333,6 +334,7 @@ _PREAMBLE = r"""\documentclass[a4paper,11pt]{article}
 """
 
 
+@timed_step("latex_project")
 def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> Path:
     """Create editable sources from evidence-grounded notes.
 
@@ -634,6 +636,7 @@ def _validate_project(root: Path, manifest: dict) -> None:
                 raise RenderError(f"Illustration image asset is not a PNG: {relative}")
 
 
+@timed_step("latex_compilation")
 def _run_latex(root: Path, *, rebuild: bool = False) -> subprocess.CompletedProcess:
     if not shutil.which("latexmk") or not shutil.which("lualatex"):
         raise RenderError("Rendering requires latexmk and LuaLaTeX (for example, MacTeX)")
@@ -649,6 +652,7 @@ def _run_latex(root: Path, *, rebuild: bool = False) -> subprocess.CompletedProc
         )
 
 
+@timed_step("chapter_latex_validation")
 def validate_chapter_latex(notes: dict, evidence: dict, folder: Path, *,
                            asset_job: Path | None = None) -> None:
     """Compile a chapter locally; retain sources and logs without PDF previews."""
@@ -699,6 +703,7 @@ def diagram_preview_fingerprint() -> str:
                         "shell_escape": False, "page_style": "empty", "padding": 6, "scale": 2})
 
 
+@timed_step("diagram_rendering")
 def render_diagram_preview(content: str, folder: Path) -> Path:
     """Compile only the drawing and crop its painted bounds for visual comparison."""
     import pymupdf
@@ -763,6 +768,7 @@ def render_diagram_preview(content: str, folder: Path) -> Path:
         raise RenderError(f"Diagram preview failed; compiler sources and logs are retained: {error}") from error
 
 
+@timed_step("pdf_qa")
 def _qa(pdf: Path) -> int:
     try:
         import pymupdf
@@ -779,6 +785,7 @@ def _qa(pdf: Path) -> int:
         return document.page_count
 
 
+@record_run("render")
 def render(job: Path, *, rebuild: bool = False) -> Path:
     """Compile existing sources without replacing manual TeX corrections."""
     check_job(job)

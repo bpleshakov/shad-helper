@@ -160,6 +160,7 @@ def _run(args) -> int:
                           vision_mode=args.vision_mode))
         elif args.command == "notes":
             from .notes import generate_notes
+            from .run_diagnostics import diagnostic_run
             batch = len(args.jobs) > 1
             if batch and args.imported is not None:
                 raise ValueError("--import requires a single project directory")
@@ -176,18 +177,19 @@ def _run(args) -> int:
                 try:
                     if batch:
                         print(f"{label}: {stage}", flush=True)
-                    result = generate_notes(job, args.state_dir, imported=args.imported,
-                                            manual=args.manual, rebuild=args.rebuild,
-                                            proxy=args.openai_proxy)
-                    if (not args.manual and (batch or args.rebuild)
-                            and result.resolve() != (job / "notes" / "main.tex").resolve()):
-                        raise RuntimeError(f"Notes require manual completion: {result}")
-                    if args.rebuild and not args.manual:
-                        from .rendering import render
-                        stage = "render"
-                        if batch:
-                            print(f"{label}: {stage}", flush=True)
-                        result = render(job, rebuild=True)
+                    with diagnostic_run(job, "notes"):
+                        result = generate_notes(job, args.state_dir, imported=args.imported,
+                                                manual=args.manual, rebuild=args.rebuild,
+                                                proxy=args.openai_proxy)
+                        if (not args.manual and (batch or args.rebuild)
+                                and result.resolve() != (job / "notes" / "main.tex").resolve()):
+                            raise RuntimeError(f"Notes require manual completion: {result}")
+                        if args.rebuild and not args.manual:
+                            from .rendering import render
+                            stage = "render"
+                            if batch:
+                                print(f"{label}: {stage}", flush=True)
+                            result = render(job, rebuild=True)
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError,
                         ModuleNotFoundError) as exc:
                     if not batch:

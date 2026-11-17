@@ -30,7 +30,8 @@ def check_job(job: Path) -> None:
                         and saved.get("vision_mode", "frames") in ("frames", "video"))
         if saved != AUDIO_CONFIG and not video_config:
             raise ValueError("Unsupported job format; use a new output directory for extraction.")
-    elif job.exists() and any(job.iterdir()):
+    elif job.exists() and any(path.name != "run-diagnostics.json" or not path.is_file()
+                              for path in job.iterdir()):
         evidence = job / "evidence.json"
         if not evidence.is_file():
             raise ValueError("Existing job requires a new output directory for extraction.")
@@ -176,24 +177,28 @@ def sha256_file(path: Path) -> str:
 def checkpoint(job: Path, key: str, inputs: Any, action: Callable[[], Any], *,
                quiet: bool = False) -> Any:
     """Only successful stages are cached; interrupted actions can be rerun."""
+    from .run_diagnostics import timed_step
+
     if (not key or Path(key).is_absolute()
             or any(part in ("..", "") for part in key.split("/"))):
         raise ValueError("Invalid checkpoint key")
-    path = Path(job) / "checkpoints" / f"{key}.json"
-    signature = fingerprint(inputs)
-    if path.exists():
-        cached = read_json(path)
-        if cached.get("fingerprint") == signature:
-            if not quiet:
-                print(f"Reusing {key}", flush=True)
-            return cached["result"]
-    if not quiet:
-        print(f"Running {key}", flush=True)
-    started = time.monotonic()
-    result = action()
-    write_json(path, {"fingerprint": signature, "seconds": time.monotonic() - started,
-                      "result": result})
-    return result
+    with timed_step(f"checkpoint/{key}") as step:
+        path = Path(job) / "checkpoints" / f"{key}.json"
+        signature = fingerprint(inputs)
+        if path.exists():
+            cached = read_json(path)
+            if cached.get("fingerprint") == signature:
+                if not quiet:
+                    print(f"Reusing {key}", flush=True)
+                step["status"] = "cached"
+                return cached["result"]
+        if not quiet:
+            print(f"Running {key}", flush=True)
+        started = time.monotonic()
+        result = action()
+        write_json(path, {"fingerprint": signature, "seconds": time.monotonic() - started,
+                          "result": result})
+        return result
 
 
 def evidence_index(evidence: dict) -> dict[str, str]:

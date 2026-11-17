@@ -559,7 +559,12 @@ def test_standalone_pdf_job_can_be_repeated_offline_and_rebuilt(tmp_path, client
 
     assert client.complete.call_count == 2
     assert read_json(job / "anki" / "identity.json") != identity
-    assert {path.name for path in job.iterdir()} == {"anki", "checkpoints", "diagnostics"}
+    assert {path.name for path in job.iterdir()} == {
+        "anki", "checkpoints", "diagnostics", "run-diagnostics.json"}
+    report = read_json(job / "run-diagnostics.json")
+    assert report["command"] == "anki" and report["status"] == "completed"
+    assert {step["name"] for step in report["steps"][0]["steps"]} == {
+        "anki_generation", "anki_note_preparation", "anki_latex_rendering", "anki_packaging"}
 
 
 def test_cache_repackages_without_model_or_auth_and_keeps_identity(job, client, monkeypatch):
