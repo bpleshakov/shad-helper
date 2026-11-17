@@ -68,6 +68,8 @@ class Client:
             raise self.response
         if schema == verification.REPAIR_SCHEMA:
             return {"content": r"\draw[->] (0,0)--(1,1);"}
+        if instructions.endswith(verification.BATCH_INSTRUCTIONS):
+            return {label: self.response for label in schema["required"]}
         return self.response
 
 
@@ -402,6 +404,7 @@ def test_equivalent_rejections_share_check_and_reuse_fallback(example, monkeypat
     monkeypatch.setattr(verification, "group_source_states",
                         lambda observations, sources, **kwargs: {key: [key] for key in sources})
     monkeypatch.setattr(verification, "_cached_verdict", lambda *args: None)
+    monkeypatch.setitem(verification.BATCH_SETTINGS, "max_sources", 1)
     baseline_client = RejectTarget()
     baseline, retry = finalize(example, baseline_client, "ungrouped-attempt")
     assert baseline == accepted and not retry
@@ -473,10 +476,301 @@ def test_grouping_uses_actual_refined_sources(example, monkeypatch):
     monkeypatch.setattr(verification, "resolve_crop", resolve)
     client = Client()
     assert not verification._finalize_coverage(notes, evidence, job, job / "attempt", client, [], {})
-    assert len(client.calls) == 2
+    assert len(client.calls) == 1
+    assert sha256_file(cropped) in [sha256_file(path) for _, path in client.calls[0][3]]
     states = read_json(job / "attempt/illustration-source-states/groups.json")
     assert states["groups"]["v04_ill01"] == ["v04_ill01"]
     assert states["observations"]["v04_ill01"]["source_sha256"] == sha256_file(cropped)
+
+
+def add_batch_observations(example, count=16):
+    job, evidence, notes, _ = example
+    block(notes).update(kind="screenshot", content="Учебный рисунок")
+    evidence["visuals"][0]["illustrations"][0]["source_kind"] = "printed"
+    manifest = read_json(job / "illustrations/manifest.json")
+    coverage = [{"illustration_id": "v01_ill01", "block_id": "drawing"}]
+    for number in range(2, count + 2):
+        visual_id, identifier = f"v{number:02d}", f"v{number:02d}_ill01"
+        path = png(job / "illustrations" / f"{identifier}.png", number)
+        observation = {"id": identifier, "source_kind": "printed", "box": [0, 0, 1, 1],
+                       "description": f"Источник {number}", "image_sha256": sha256_file(path)}
+        evidence["visuals"].append({"id": visual_id, "timestamp": number,
+                                     "status": "complete", "illustrations": [observation]})
+        manifest["assets"][identifier] = {"path": f"illustrations/{identifier}.png",
+                                          "sha256": observation["image_sha256"]}
+        coverage.append({"illustration_id": identifier, "block_id": "drawing"})
+    write_json(job / "illustrations/manifest.json", manifest)
+    notes["chapters"][0]["illustration_coverage"] = coverage
+
+
+@pytest.mark.parametrize("count,calls", [(8, 1), (16, 2), (17, 3)])
+def test_coverage_batches_preserve_notes_and_cache_independent_decisions(example, count, calls):
+    job, _, notes, _ = example
+    add_batch_observations(example, count)
+    original = deepcopy(notes)
+    client = Client()
+    accepted, retry = finalize(example, client)
+    assert accepted == original and notes == original and not retry
+    assert len(client.calls) == calls
+    assert all(len(call[3]) <= 9 for call in client.calls)
+    for instructions, _, schema, images in client.calls:
+        if instructions.endswith(verification.BATCH_INSTRUCTIONS):
+            assert images[0][0] == "RECONSTRUCTION"
+            assert schema["required"] == [label for label, _ in images[1:]]
+            assert schema["additionalProperties"] is False
+    for number in range(2, min(count, 16) + 2):
+        archive = job / "attempt/illustration-coverage" / f"v{number:02d}_ill01"
+        provenance = read_json(archive / "artifacts/batch.json")
+        batch = job / "attempt/illustration-batches" / provenance["batch_id"]
+        result = read_json(batch / "response.json")[provenance["source_label"]]
+        assert result == client.response
+        assert sha256_file(batch / f"{provenance['source_label']}.png") == sha256_file(
+            job / "illustrations" / f"v{number:02d}_ill01.png")
+        assert read_json(archive / "verdict.json")["verdict"] == result["verdict"]
+        assert read_json(batch / "timing.json")["seconds"] >= 0
+    repeated, retry = finalize(example, client, "repeated")
+    assert repeated == accepted and not retry and len(client.calls) == calls
+    assert len(list((job / "repeated/illustration-batches").iterdir())) == count // 8
+
+
+def test_mixed_batch_results_preserve_sequential_fallbacks_and_prose_refs(example, monkeypatch):
+    add_batch_observations(example)
+    _, _, notes, _ = example
+    notes["chapters"][0]["blocks"].append({
+        "id": "explanation", "kind": "text", "content": "Сравним рисунки.",
+        "evidence_ids": ["v01"], "figure_refs": ["drawing"]})
+
+    class Mixed(Client):
+        def complete(self, instructions, text, schema, *, images):
+            self.calls.append((instructions, text, schema, images))
+            target = next(path for label, path in images if label == "RECONSTRUCTION")
+            target_shade = pymupdf.Pixmap(target).samples[0]
+
+            def verdict(path):
+                shade = pymupdf.Pixmap(path).samples[0]
+                # Two distinct rejected sources can share the first new fallback.
+                passed = shade not in (3, 4) or target_shade in (3, 4)
+                return {"verdict": "pass" if passed else "fail", "reason": f"Источник {shade}."}
+
+            if instructions.endswith(verification.BATCH_INSTRUCTIONS):
+                # Deliberately reverse response order: association must use the keys.
+                return {label: verdict(path) for label, path in reversed(images[1:])}
+            return verdict(images[0][1])
+
+    client = Mixed()
+    accepted, retry = finalize(example, client)
+    assert not retry and len(client.calls) == 3  # Two batches plus one conditional alternative.
+    coverage = accepted["chapters"][0]["illustration_coverage"]
+    assert coverage[2]["block_id"] == coverage[3]["block_id"] != "drawing"
+    assert all(item["block_id"] == "drawing" for index, item in enumerate(coverage)
+               if index not in (2, 3))
+    monkeypatch.setitem(verification.BATCH_SETTINGS, "max_sources", 1)
+    monkeypatch.setattr(verification, "_cached_verdict", lambda *args: None)
+    baseline = Mixed()
+    sequential, retry = finalize(example, baseline, "sequential")
+    assert sequential == accepted and not retry
+    assert len(baseline.calls) == 17
+
+
+@pytest.mark.parametrize("problem", ["missing", "extra", "group_verdict", "invalid_item", "transport"])
+def test_broken_batches_fall_back_without_caching_partial_passes(example, problem):
+    job, _, notes, _ = example
+    add_batch_observations(example, 8)
+
+    class BrokenBatch(Client):
+        def complete(self, instructions, text, schema, *, images):
+            result = super().complete(instructions, text, schema, images=images)
+            if not instructions.endswith(verification.BATCH_INSTRUCTIONS):
+                return result
+            if problem == "transport":
+                raise ResponseError("Batch exceeds context", code="context_length_exceeded")
+            if problem == "missing":
+                result.pop("SOURCE_01")
+            elif problem == "extra":
+                result["UNKNOWN"] = self.response
+            elif problem == "group_verdict":
+                return self.response
+            else:
+                result["SOURCE_01"] = {"verdict": "pass", "reason": ""}
+            return result
+
+    client = BrokenBatch()
+    accepted, retry = finalize(example, client)
+    assert accepted == notes and not retry and len(client.calls) == 9
+    errors = list((job / "attempt/illustration-batches").glob("*/error.json"))
+    assert len(errors) == 1
+    assert not list((job / "illustration-verification").glob("*/batch.json"))
+    finalize(example, client, "retry")
+    assert len(client.calls) == 9
+
+
+def test_only_uncertain_source_is_rechecked_individually(example):
+    job, _, notes, _ = example
+    add_batch_observations(example, 8)
+
+    class UncertainBatch(Client):
+        def complete(self, instructions, text, schema, *, images):
+            result = super().complete(instructions, text, schema, images=images)
+            if instructions.endswith(verification.BATCH_INSTRUCTIONS):
+                result["SOURCE_04"] = {"verdict": "uncertain", "reason": "Мелкая подпись."}
+            return result
+
+    client = UncertainBatch()
+    accepted, retry = finalize(example, client)
+    assert accepted == notes and not retry and len(client.calls) == 2
+    assert sha256_file(client.calls[-1][3][0][1]) == sha256_file(job / "illustrations/v05_ill01.png")
+    assert len(list((job / "illustration-verification").glob("*/batch.json"))) == 7
+
+
+@pytest.mark.parametrize("change", ["caption", "content", "model", "prompt", "source", "target",
+                                   "corrupt_source", "missing_response", "wrong_source_label"])
+def test_batch_cache_tracks_pair_inputs_and_batch_provenance(example, monkeypatch, change):
+    job, evidence, notes, _ = example
+    add_batch_observations(example, 8)
+    client = Client()
+    finalize(example, client)
+    if change in {"caption", "content"}:
+        block(notes)[change] += " Новый контекст."
+    elif change == "model":
+        client.model = "other-model"
+    elif change == "prompt":
+        monkeypatch.setattr(verification, "BATCH_INSTRUCTIONS", verification.BATCH_INSTRUCTIONS + "Updated.")
+    elif change in {"source", "target"}:
+        index = 1 if change == "source" else 0
+        observation = evidence["visuals"][index]["illustrations"][0]
+        path = png(job / "illustrations" / f"{observation['id']}.png", 90)
+        observation["image_sha256"] = sha256_file(path)
+        manifest = read_json(job / "illustrations/manifest.json")
+        manifest["assets"][observation["id"]]["sha256"] = sha256_file(path)
+        write_json(job / "illustrations/manifest.json", manifest)
+    elif change == "corrupt_source":
+        path = next((job / "illustration-verification").glob("*/batch.json"))
+        png(path.parent / "source.png", 90)
+    elif change == "wrong_source_label":
+        path = next((job / "illustration-verification").glob("*/batch.json"))
+        record = read_json(path)
+        record["source_label"] = "SOURCE_01" if record["source_label"] != "SOURCE_01" else "SOURCE_02"
+        write_json(path, record)
+    else:
+        next((job / "illustration-verification/batches").glob("*/response.json")).unlink()
+    accepted, retry = finalize(example, client, "changed")
+    assert accepted == notes and not retry and len(client.calls) == 2
+    assert len(client.calls[-1][3]) == (2 if change in {
+        "source", "corrupt_source", "wrong_source_label"} else 9)
+
+
+def test_batches_keep_target_captions_separate_even_for_identical_pixels(example):
+    job, _, notes, _ = example
+    add_batch_observations(example, 16)
+    chapter = notes["chapters"][0]
+    chapter["blocks"].append({**deepcopy(block(notes)), "id": "other", "caption": "Другая часть"})
+    for coverage in chapter["illustration_coverage"][9:]:
+        coverage["block_id"] = "other"
+    client = Client()
+    accepted, retry = finalize(example, client)
+    assert accepted == notes and not retry and len(client.calls) == 2
+    contexts = [json.loads(call[1].split("Контекст: ", 1)[1]) for call in client.calls]
+    assert [context["selected_figure"] for context in contexts] == ["Связь вершин", "Другая часть"]
+    assert all(len(context["sources"]) == 8 for context in contexts)
+    assert len(list((job / "attempt/illustration-batches").iterdir())) == 2
+
+
+def test_batch_replay_retains_individual_results_and_validates_source_hashes(example):
+    from scripts.illustration_batching_benchmark import replay
+
+    job, _, _, _ = example
+    add_batch_observations(example, 8)
+    # Build a historical single-comparison archive with both passes and failures.
+    attempt = job / "handoff/verification/attempt-01/illustration-coverage"
+    for number in range(2, 10):
+        archive = attempt / f"v{number:02d}_ill01"
+        artifacts = archive / "artifacts"
+        artifacts.mkdir(parents=True)
+        source = job / "illustrations" / f"v{number:02d}_ill01.png"
+        target = job / "illustrations/v01_ill01.png"
+        (artifacts / "source.png").write_bytes(source.read_bytes())
+        (artifacts / "preview.png").write_bytes(target.read_bytes())
+        verification._compare(Client(), artifacts / "source.png", artifacts / "preview.png",
+                              json.dumps({"observation": str(number), "selected_figure": "Общий рисунок",
+                                          "selected_content": "Сравнение"}), artifacts,
+                              instructions=verification.CONSOLIDATION_INSTRUCTIONS)
+        write_json(archive / "candidate.json", {"block_id": "drawing"})
+        write_json(archive / "verdict.json", {"verdict": "fail" if number == 3 else "pass"})
+    destination = job.parent / "replay"
+    report = replay(job, destination)
+    assert report["distinct_initial_pairs"] == report["source_images"] == 8
+    assert report["packaged_requests"] == report["mixed_verdict_batches"] == 1
+    assert report["request_reduction_fraction"] == 0.875
+    assignments = read_json(destination / "pairs.json")
+    assert sum(item["recorded_verdicts"] == ["fail"] for item in assignments) == 1
+    png(attempt / "v03_ill01/artifacts/source.png", 100)
+    with pytest.raises(ValueError, match="hash mismatch"):
+        replay(job, destination)
+
+
+def test_batching_skips_cached_identical_and_excluded_sources(example):
+    job, evidence, notes, _ = example
+    add_batch_observations(example, 8)
+    client = Client()
+    observation = verification.illustration_index(evidence)["v02_ill01"]
+    verification._consolidation(observation, block(notes), job, evidence, job / "prior", client)
+    target = job / "illustrations/v01_ill01.png"
+    source = job / "illustrations/v03_ill01.png"
+    source.write_bytes(target.read_bytes())
+    evidence["visuals"][2]["illustrations"][0]["image_sha256"] = sha256_file(source)
+    manifest = read_json(job / "illustrations/manifest.json")
+    manifest["assets"]["v03_ill01"]["sha256"] = sha256_file(source)
+    write_json(job / "illustrations/manifest.json", manifest)
+    notes["chapters"][0]["illustration_coverage"][3].update(block_id="", exclusion_reason="unresolved")
+    accepted, retry = finalize(example, client)
+    assert accepted == notes and not retry and len(client.calls) == 2
+    assert len(client.calls[-1][3]) == 6  # Five pending sources plus one target.
+
+
+def test_batches_respect_encoded_byte_budget_without_resizing(example, monkeypatch):
+    job, _, notes, _ = example
+    add_batch_observations(example, 8)
+    sizes = [4 * ((path.stat().st_size + 2) // 3) for path in (job / "illustrations").glob("*.png")]
+    # Fit two sources and a target, but never three sources.
+    budget = max(sizes) * 3
+    assert min(sizes) * 4 > budget
+    monkeypatch.setitem(verification.BATCH_SETTINGS, "max_encoded_image_bytes", budget)
+    client = Client()
+    accepted, retry = finalize(example, client)
+    assert accepted == notes and not retry and len(client.calls) == 4
+    for _, _, _, images in client.calls:
+        assert len(images) == 3
+        assert sum(4 * ((path.stat().st_size + 2) // 3) for _, path in images) <= budget
+        assert all(pymupdf.Pixmap(path).width == 16 for _, path in images)
+
+
+def test_batch_records_exact_request_and_restores_plan_recorder(example):
+    job, _, notes, _ = example
+    add_batch_observations(example, 8)
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        payload = json.loads(request.content)
+        response = {key: {"verdict": "pass", "reason": key + " проверен."}
+                    for key in payload["text"]["format"]["schema"]["required"]}
+        event = {"type": "response.completed", "response": {"status": "completed", "output": [
+            {"content": [{"type": "output_text", "text": json.dumps(response)}]}]}}
+        return httpx.Response(200, text="data: " + json.dumps(event) + "\n\n")
+
+    recorder = lambda *args: pytest.fail("Batch must use its own recorder")
+    client = PlanClient(job, proxy="http://proxy.invalid:8080", transport=httpx.MockTransport(handle),
+                        token_provider=lambda: "private",
+                        request_recorder=recorder, api_key="")
+    client._available_models = [client.model]
+    accepted, retry = finalize(example, client)
+    assert accepted == notes and not retry and len(requests) == 1
+    assert client.request_recorder is recorder
+    batch = next((job / "attempt/illustration-batches").iterdir())
+    assert (batch / "http-001.body.json").read_bytes() == requests[0].content
+    images = [item for item in json.loads(requests[0].content)["input"][0]["content"]
+              if item["type"] == "input_image"]
+    assert len(images) == 9 and all(item["detail"] == "high" for item in images)
 
 
 def add_native_observations(example):

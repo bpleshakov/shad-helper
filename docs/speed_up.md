@@ -2,7 +2,7 @@
 
 Analysis date: 2026-11-12.
 
-Goal: reduce lecture-processing time while preserving the current quality of lecture notes and illustrations. This document consolidates the read-only analysis of saved artifacts in `out/` and `out_algo/`. No pipeline changes, model calls, or performance experiments were made during that analysis. The implementation and local validation of priorities 1 and 2 on 2026-11-13 are recorded below; the audit figures remain historical.
+Goal: reduce lecture-processing time while preserving the current quality of lecture notes and illustrations. This document consolidates the read-only analysis of saved artifacts in `out/` and `out_algo/`. No pipeline changes, model calls, or performance experiments were made during that analysis. The implementation and local validation of priorities 1 and 2 on 2026-11-13 and priority 3 on 2026-11-16 are recorded below; the audit figures remain historical.
 
 ## Main findings
 
@@ -253,6 +253,49 @@ Purely as an arithmetic packaging exercise, grouping the retained comparisons by
 
 Benchmark small batches before adoption, checking that difficult sources do not receive an unjustified group-wide pass.
 
+Implemented on 2026-11-16 in [`illustration_verification.py`](../shad_helper/illustration_verification.py), with **eight sources per request by default**:
+
+- Batch the independent initial coverage checks after source-state grouping. Every batch shares the exact target pixels, crop identity, caption, and content. Send that target and its context once, alongside individually labeled, full-resolution source images and descriptions. Limit the batch to eight sources and 20 MB of base64-encoded image data. Oversized pairs and singleton groups use the existing individual path; images are never resized to fit a batch.
+- Skip identical source/target images, existing completed pair-cache entries, and repeated state/target pairs before packing. Preserve existing single-pair cache keys. Native state regions and refined source crops remain the actual inputs to verification.
+- Require an independent `pass`, `fail`, or `uncertain`, with a source-specific reason, under every exact source key. Validate the whole response before caching any result; missing, extra, or malformed results invalidate the batch. Response order cannot associate a verdict with a different source. The prompt explicitly prohibits using other sources to fill in missing details or justify a group-wide pass.
+- A failed or malformed batch falls back to ordinary individual verification. An otherwise valid batch's uncertain sources are rechecked individually; its passes and failures remain cached. Existing state-member fallback, refinement, recovery, and retry behavior then applies.
+- Prefill the per-pair cache, then apply decisions in the original coverage order. Alternatives, refined comparisons, recovery, and final reconciliation remain sequential because earlier decisions can change their inputs or candidate lists. This implementation does not speculatively request conditional alternatives or add concurrency.
+- Bind cached batch results to the batch prompt/schema policy, exact pair inputs, source image hash, raw response, and source-to-pair mapping. Save shared images, labeled membership, schema, raw response, exact HTTP request when using `PlanClient`, and elapsed request-wrapper time under `illustration-verification/batches/<id>`. Initial coverage archives copy each shared batch once into `illustration-batches/<id>`; each pair retains its own source/target, verdict, and `artifacts/batch.json` reference. Existing cached batch evidence is also copied on subsequent initial-coverage attempts.
+
+Controlled complete-finalization tests produce identical notes, including fallback placement, coverage IDs, and prose references:
+
+| Controlled workload | Individual calls | Batched calls | Reduction |
+|---|---:|---:|---:|
+| 16 independently accepted sources | 16 | 2 | 87.5% |
+| 16 sources with mixed pass/fail outcomes and reuse of a newly created fallback | 17 | 3 | 82.4% |
+
+Other regression cases cover shuffled response keys, missing/extra results, invalid individual verdicts, context-limit failures, per-source uncertain retries, cache invalidation and provenance, already cached/identical/excluded sources, different target captions, exact refined pixels, byte budgets, full-resolution HTTP image attachments, and request-recorder restoration.
+
+Validation: **576 tests pass** across the illustration, notes, crop-validation, Anki-figure, chapter-LaTeX, and video-notes suites, using a writable temporary TeX cache. Ruff and `git diff --check` also pass. The full repository suite was not run for this change.
+
+A read-only packaging replay of the latest saved attempts in **18 completed jobs** (nine ML and nine algorithms jobs; one has no initial pair requests) found:
+
+| Saved jobs | Distinct archived initial pairs | Packaged requests | Reduction |
+|---|---:|---:|---:|
+| ML (`out/`) | 4,544 | 696 | 84.7% |
+| Algorithms (`out_algo/`) | 4,077 | 545 | 86.6% |
+| **Total** | **8,621** | **1,241** | **85.6%** |
+
+The replay validates the archived image hashes, collapses 27 repeated pair records from 8,648 initial records, and uses the production packer with its eight-source and byte limits. All **8,621 source images remain in the requests**. Target images fall from 8,621 to 1,241, and total PNG attachment bytes fall from **2,570,888,417 to 1,726,630,047 (32.8%)**. It finds **267 batches containing historically mixed verdicts**, preserving every recorded per-source outcome in the report; no pair has conflicting recorded verdicts. Ten historically uncertain pairs would need additional individual checks if the batched model returned the same uncertainties.
+
+Leaving all **3,953 archived conditional checks** sequential gives **12,574 → 5,194 packaged coverage requests (58.7% fewer)** before uncertainty retries. The high-pass 30 September job packages 1,478 initial pairs into 193 requests; the mixed-outcome 14 October job packages 733 into 98.
+
+**Measurement limits:** this is a cold-cache packaging replay, not an executed pipeline or a live model benchmark. It does not rerun source-state grouping, alternative selection, or finalization; it only collapses state reuse already present in archived requests. It preserves recorded single-pair verdicts as evidence rather than predicting batched verdicts. Different batch judgments, uncertainty, failures, warm caches, and later recovery can change actual request counts and final notes. No live latency, cost, batched-model accuracy, or end-to-end speedup has been measured. The local replay took **8.36 seconds**, which measures archive reading and packaging only.
+
+Reproduce with [`illustration_batching_benchmark.py`](../scripts/illustration_batching_benchmark.py):
+
+```sh
+uv run python scripts/illustration_batching_benchmark.py \
+  --out /tmp/illustration-batching-replay out/* out_algo/*
+```
+
+The script writes aggregate reports and per-pair assignments outside the source jobs. It requires historical single-pair archives and rejects already-batched attempts instead of silently excluding their checks.
+
 ### 4. Parallelize independent comparisons that remain
 
 The current coverage loop waits for each remote comparison. Bounded concurrency can preserve the same prompts, model, evidence, and verdict requirements while overlapping independent requests.
@@ -311,7 +354,7 @@ Measure:
 
 For state grouping and candidate filtering, inspect discarded distinctions against original images; final figure count alone is insufficient. For batching, check each source verdict independently. For concurrency, preserve deterministic application of decisions and reliable request archives.
 
-Acceptance means fewer calls or lower elapsed time while preserving the quality and coverage of the saved notes. The original audit did not validate an optimization; the priority 1 implementation has the local and regression evidence listed above, without an end-to-end benchmark.
+Acceptance means fewer calls or lower elapsed time while preserving the quality and coverage of the saved notes. The original audit did not validate an optimization; priorities 1–3 have the local and regression evidence listed above, without an end-to-end benchmark.
 
 ## Code and artifact references
 

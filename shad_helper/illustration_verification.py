@@ -76,6 +76,17 @@ difference, not speculative changes to points or curves caused by compression,
 rescaling or camera movement. Return uncertain when the figure itself cannot be
 read well enough to establish equivalence. Give a short specific reason in Russian.
 """
+BATCH_SETTINGS = {"max_sources": 8, "max_encoded_image_bytes": 20_000_000}
+BATCH_INSTRUCTIONS = """
+This request contains several INDEPENDENT comparisons against one RECONSTRUCTION.
+Apply the rules above separately to each labeled SOURCE_XX, using its own context.
+Inspect every source in full. Other sources are NOT evidence for that source and
+cannot supply its missing or unreadable labels, arrows, panels, or meaningful stages.
+Never give a group-wide verdict or let an easy matching source justify another pass.
+Return exactly one verdict and a short source-specific Russian reason for every
+SOURCE_XX key in the schema. A mixture of pass, fail, and uncertain is expected when
+the sources differ. If one source is unreadable, mark only that source uncertain.
+"""
 RECONCILIATION_INSTRUCTIONS = CONSOLIDATION_INSTRUCTIONS + """
 Now select a representative for two accepted figures: SOURCE is left and
 RECONSTRUCTION is right. Compare both complete figures and their captions.
@@ -238,19 +249,31 @@ def _fallback(block):
 def _cached_verdict(cache, validator=_valid_verdict):
     try:
         value = read_json(cache / "verdict.json")
+        if (isinstance(value, dict) and "batch_policy" in value
+                and (value["batch_policy"] != _batch_policy()
+                     or value.get("source_sha256") != sha256_file(cache / "source.png"))):
+            return None
+        if isinstance(value, dict) and "batch_policy" in value:
+            batch = read_json(cache / "batch.json")
+            shared = cache.parent / "batches" / batch["batch_id"]
+            response = read_json(shared / "response.json")
+            members = read_json(shared / "members.json")
+            if (response.get(batch["source_label"]) != value.get("result")
+                    or members.get(batch["source_label"]) != cache.name):
+                return None
         if (isinstance(value, dict) and validator(value.get("result"))
                 and value.get("preview_sha256") == sha256_file(cache / "preview.png")):
             return value["result"]
-    except (OSError, ValueError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
     return None
 
 
 def _compare(client, source, preview, description, folder, *, instructions=None,
-             schema=VERIFICATION_SCHEMA, validator=_valid_verdict, retry=False):
+             schema=VERIFICATION_SCHEMA, validator=_valid_verdict, retry=False, images=None):
     instructions = VERIFICATION_INSTRUCTIONS if instructions is None else instructions
     text = "Сопоставь учебные рисунки. Контекст: " + description
-    images = [("SOURCE", source), ("RECONSTRUCTION", preview)]
+    images = images if images is not None else [("SOURCE", source), ("RECONSTRUCTION", preview)]
     write_json(folder / "call.json", {
         "instructions": instructions, "text": text,
         "schema": schema, "model": getattr(client, "model", None),
@@ -287,43 +310,160 @@ def _compare(client, source, preview, description, folder, *, instructions=None,
             client.request_recorder = recorder
 
 
-def _consolidation(observation, block, job, evidence, folder, client, *, source_block=None,
-                   source_path=None):
-    """Reject unverified merges of distinct image observations."""
+def _consolidation_request(observation, block, job, evidence, client, *, source_block=None,
+                           source_path=None):
     source = source_path or resolve_crop(job, evidence, observation["id"],
                                          (source_block or {}).get("illustration_crop_id", ""))
     representative = resolve_crop(job, evidence, block["illustration_id"],
                                   block.get("illustration_crop_id", ""))
     source_hash, representative_hash = sha256_file(source), sha256_file(representative)
-    if source_hash == representative_hash:
-        verdict = {"verdict": "pass", "reason": "Исходные изображения идентичны."}
-        write_json(folder / "verdict.json", {**verdict, "retry_needed": False})
-        return verdict, False
+    figure = {key: block.get(key, "") for key in ("caption", "content")}
     signature = fingerprint({"source": source_hash,
                              "representative": representative_hash,
                              "representative_crop": block.get("illustration_crop_id", ""),
                              "description": observation["description"],
-                             "figure": {key: block.get(key, "") for key in ("caption", "content")},
+                             "figure": figure,
                              "instructions": CONSOLIDATION_INSTRUCTIONS,
                              "schema": VERIFICATION_SCHEMA,
                              "model": getattr(client, "model", None),
                              "reasoning": DEFAULT_REASONING_EFFORT,
                              "policy": VERIFICATION_POLICY_VERSION})
-    cache = Path(job) / "illustration-verification" / signature
+    return {"source": source, "representative": representative,
+            "source_hash": source_hash, "representative_hash": representative_hash,
+            "cache": Path(job) / "illustration-verification" / signature,
+            "target": fingerprint({"image": representative_hash, "figure": figure,
+                                   "crop": block.get("illustration_crop_id", "")}),
+            "description": {"observation": observation["description"],
+                            "selected_figure": figure["caption"],
+                            "selected_content": figure["content"]}}
+
+
+def _batch_policy():
+    return fingerprint({"instructions": CONSOLIDATION_INSTRUCTIONS + BATCH_INSTRUCTIONS,
+                        "verdict_schema": VERIFICATION_SCHEMA, "version": 1})
+
+
+def _consolidation_batches(requests):
+    """Pack only a common target/context, without resizing or dropping any source."""
+    grouped = {}
+    for request in requests:
+        grouped.setdefault(request["target"], []).append(request)
+    for group in grouped.values():
+        target_bytes = 4 * ((group[0]["representative"].stat().st_size + 2) // 3)
+        batch, size = [], target_bytes
+        for request in group:
+            source_bytes = 4 * ((request["source"].stat().st_size + 2) // 3)
+            if batch and (len(batch) >= BATCH_SETTINGS["max_sources"]
+                          or size + source_bytes > BATCH_SETTINGS["max_encoded_image_bytes"]):
+                yield batch
+                batch, size = [], target_bytes
+            batch.append(request)
+            size += source_bytes
+        if batch:
+            yield batch
+
+
+def _batch_consolidations(requests, job, folder, client):
+    """Prefill per-pair caches; all conditional decisions stay in the coverage loop."""
+    pending, archived = {}, set()
+
+    def archive_batch(batch_id):
+        if batch_id not in archived:
+            destination = Path(folder) / "illustration-batches" / batch_id
+            if destination.exists():
+                shutil.rmtree(destination)
+            shutil.copytree(Path(job) / "illustration-verification/batches" / batch_id,
+                            destination)
+            archived.add(batch_id)
+
+    for request in requests:
+        if request["source_hash"] == request["representative_hash"]:
+            continue
+        cache = request["cache"]
+        if _cached_verdict(cache) is None:
+            pending[cache.name] = request
+        elif (cache / "batch.json").is_file():
+            archive_batch(read_json(cache / "batch.json")["batch_id"])
+    batches = [batch for batch in _consolidation_batches(pending.values()) if len(batch) > 1]
+    for batch in tqdm(batches, desc="Illustration coverage batches", unit="batch",
+                      dynamic_ncols=True, disable=not batches):
+        policy = _batch_policy()
+        batch_id = fingerprint({"pairs": [item["cache"].name for item in batch], "policy": policy})
+        destination = Path(job) / "illustration-verification/batches" / batch_id
+        # An interrupted attempt must not leave old responses or request logs.
+        if destination.exists():
+            shutil.rmtree(destination)
+        destination.mkdir(parents=True)
+        shutil.copyfile(batch[0]["representative"], destination / "preview.png")
+        images = [("RECONSTRUCTION", destination / "preview.png")]
+        contexts, members = {}, {}
+        for index, request in enumerate(batch, 1):
+            label = f"SOURCE_{index:02d}"
+            source = destination / f"{label}.png"
+            shutil.copyfile(request["source"], source)
+            images.append((label, source))
+            contexts[label] = request["description"]["observation"]
+            members[label] = request["cache"].name
+        schema = {"type": "object", "properties": {label: VERIFICATION_SCHEMA for label in contexts},
+                  "required": list(contexts), "additionalProperties": False}
+        write_json(destination / "members.json", members)
+        description = {"selected_figure": batch[0]["description"]["selected_figure"],
+                       "selected_content": batch[0]["description"]["selected_content"],
+                       "sources": contexts}
+        started = time.perf_counter()
+        try:
+            response = _compare(client, images[1][1], images[0][1],
+                                json.dumps(description, ensure_ascii=False), destination,
+                                instructions=CONSOLIDATION_INSTRUCTIONS + BATCH_INSTRUCTIONS,
+                                schema=schema, images=images,
+                                validator=lambda value, labels=contexts: isinstance(value, dict)
+                                and value.keys() == labels.keys()
+                                and all(_valid_verdict(item) for item in value.values()))
+        except (PlanAccessError, ResponseError, OSError, ValueError, RuntimeError, httpx.HTTPError) as error:
+            write_json(destination / "error.json", {"type": type(error).__name__, "message": str(error)})
+            # Invalid/failed batches and uncertain items take the original single-pair path.
+            response = {}
+        write_json(destination / "timing.json", {"seconds": time.perf_counter() - started,
+                                                 "sources": len(batch)})
+        archive_batch(batch_id)
+        for label, request in zip(contexts, batch):
+            verdict = response.get(label)
+            if verdict is None or verdict["verdict"] == "uncertain":
+                continue
+            cache = request["cache"]
+            if cache.exists():
+                shutil.rmtree(cache)
+            cache.mkdir(parents=True)
+            shutil.copyfile(request["source"], cache / "source.png")
+            shutil.copyfile(request["representative"], cache / "preview.png")
+            write_json(cache / "batch.json", {"batch_id": batch_id, "source_label": label})
+            write_json(cache / "verdict.json", {"result": verdict, "batch_policy": policy,
+                       "source_sha256": request["source_hash"],
+                       "preview_sha256": request["representative_hash"]})
+
+
+def _consolidation(observation, block, job, evidence, folder, client, *, source_block=None,
+                   source_path=None):
+    """Reject unverified merges of distinct image observations."""
+    request = _consolidation_request(observation, block, job, evidence, client,
+                                     source_block=source_block, source_path=source_path)
+    if request["source_hash"] == request["representative_hash"]:
+        verdict = {"verdict": "pass", "reason": "Исходные изображения идентичны."}
+        write_json(folder / "verdict.json", {**verdict, "retry_needed": False})
+        return verdict, False
+    cache = request["cache"]
     cache.mkdir(parents=True, exist_ok=True)
     verdict = _cached_verdict(cache)
     transient = False
     if verdict is None:
-        for stale in [cache / "verdict.json", cache / "response.json", *cache.glob("http-*.json")]:
+        for stale in [cache / "verdict.json", cache / "response.json", cache / "batch.json",
+                      *cache.glob("http-*.json")]:
             stale.unlink(missing_ok=True)
-        shutil.copyfile(source, cache / "source.png")
-        shutil.copyfile(representative, cache / "preview.png")
+        shutil.copyfile(request["source"], cache / "source.png")
+        shutil.copyfile(request["representative"], cache / "preview.png")
         try:
             verdict = _compare(client, cache / "source.png", cache / "preview.png",
-                               json.dumps({"observation": observation["description"],
-                                           "selected_figure": block.get("caption", ""),
-                                           "selected_content": block.get("content", "")},
-                                          ensure_ascii=False), cache,
+                               json.dumps(request["description"], ensure_ascii=False), cache,
                                instructions=CONSOLIDATION_INSTRUCTIONS, retry=True)
             write_json(cache / "verdict.json", {"result": verdict,
                                                 "preview_sha256": sha256_file(cache / "preview.png")})
@@ -331,7 +471,9 @@ def _consolidation(observation, block, job, evidence, folder, client, *, source_
             transient = True
             verdict = {"verdict": "uncertain", "reason": "Проверка объединения иллюстраций недоступна."}
             write_json(folder / "error.json", {"type": type(error).__name__, "message": str(error)})
-    shutil.copytree(cache, folder / "artifacts", dirs_exist_ok=True)
+    if (folder / "artifacts").exists():
+        shutil.rmtree(folder / "artifacts")
+    shutil.copytree(cache, folder / "artifacts")
     write_json(folder / "verdict.json", {**verdict, "retry_needed": transient})
     return verdict, transient
 
@@ -429,6 +571,29 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
     state_results = {}
     state_sources = {}
 
+    def state_source(state_id):
+        if state_id not in contexts:
+            return None
+        if state_id not in state_sources:
+            state_sources[state_id] = state_folder / state_id / "source.png"
+            save_state_source(state_id, sources, contexts, state_sources[state_id])
+        return state_sources[state_id]
+
+    initial = {}
+    for _, coverage in coverage_items:
+        target_id, identifier = coverage["block_id"], coverage["illustration_id"]
+        if (not target_id or target_id in unpublished
+                or identifier == blocks[target_id]["illustration_id"]):
+            continue
+        state_id = represented_by[identifier]
+        key = state_id, target_id
+        if key not in initial:
+            initial[key] = _consolidation_request(
+                observations[state_id], blocks[target_id], job, evidence, client,
+                source_block=source_blocks[state_id],
+                source_path=state_source(state_id) if len(groups[state_id]) > 1 else None)
+    _batch_consolidations(initial.values(), job, folder, client)
+
     def consolidate(observation, target, archive):
         identifier = observation["id"]
         state_id = represented_by[identifier]
@@ -436,15 +601,9 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
             key = state_id, target["id"]
             shared = state_folder / state_id / target["id"]
             if key not in state_results:
-                source_path = None
-                if state_id in contexts:
-                    if state_id not in state_sources:
-                        state_sources[state_id] = state_folder / state_id / "source.png"
-                        save_state_source(state_id, sources, contexts, state_sources[state_id])
-                    source_path = state_sources[state_id]
                 state_results[key] = _consolidation(
                     observations[state_id], target, job, evidence, shared, client,
-                    source_block=source_blocks[state_id], source_path=source_path)
+                    source_block=source_blocks[state_id], source_path=state_source(state_id))
             verdict, transient = state_results[key]
             # An unreadable representative or a failed request is not evidence
             # about another member. Keep its original per-observation fallback.
