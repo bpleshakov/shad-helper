@@ -2,14 +2,14 @@
 
 Analysis date: 2026-11-12.
 
-Goal: reduce lecture-processing time while preserving the current quality of lecture notes and illustrations. This document consolidates the read-only analysis of saved artifacts in `out/` and `out_algo/`. No pipeline changes, model calls, or performance experiments were made during that analysis. The implementation and local validation of priorities 1 and 2 on 2026-11-13 and priority 3 on 2026-11-16 are recorded below; the audit figures remain historical.
+Goal: reduce lecture-processing time while preserving the current quality of lecture notes and illustrations. This document consolidates the read-only analysis of saved artifacts in `out/` and `out_algo/`. No pipeline changes, model calls, or performance experiments were made during that analysis. The priority sections record implementation and local validation for priority 5 (2026-11-12), priorities 1 and 2 (2026-11-13), and priority 3 (2026-11-16). The audit figures describe the original pipeline.
 
 ## Main findings
 
 - The dominant extraction cost is inference over many selected frames, not video decoding or model loading.
 - The dominant illustration-verification work is checking whether source observations can share a selected figure, not checking rendered diagrams.
 - Coverage verification makes meaningful corrections, but it repeatedly checks similar source observations against the same representative.
-- Revised priority: reduce repeated comparisons, improve candidate selection, and batch remaining checks before parallelizing them.
+- Priorities 1–3 reduce repeated comparisons, improve candidate selection and batch the remaining checks. Priority 4 overlaps chapter vision and notes generation in full video runs.
 - Existing artifacts do not establish the exact number of safely removable calls or a guaranteed end-to-end speedup.
 
 ## Scope and measurement limitations
@@ -71,7 +71,7 @@ Frame-selection reasons:
 | Settled change | 2,415 | 11.2% |
 | Other | 59 | 0.3% |
 
-The selector operates on whole-frame pixel differences. Its minimum change fraction is `0.0008`; the change-time guard is 15 seconds. Lecturer motion can retain extra frames. These counts identify where to investigate, not how many frames can safely be discarded.
+The audited selector used whole-frame pixel differences, a minimum change fraction of `0.0008`, and a 15-second change-time guard. Lecturer motion could trigger extra selections. The revised selector and its measured effect on saved candidates are described under [priority 5](#5-reduce-redundant-frame-inference-upstream).
 
 Relevant code: [`video.py`](../shad_helper/video.py), particularly `SELECTION_SETTINGS` and `_select_proxy_frames`; [`vision_worker.py`](../shad_helper/vision_worker.py), particularly `run` and `_MLXRuntime.infer`.
 
@@ -296,19 +296,45 @@ uv run python scripts/illustration_batching_benchmark.py \
 
 The script writes aggregate reports and per-pair assignments outside the source jobs. It requires historical single-pair archives and rejects already-batched attempts instead of silently excluding their checks.
 
-### 4. Parallelize independent comparisons that remain
+### 4. Overlap chapter vision and notes
 
-The current coverage loop waits for each remote comparison. Bounded concurrency can preserve the same prompts, model, evidence, and verdict requirements while overlapping independent requests.
-
-Apply results deterministically and preserve dependencies in alternative selection and recovery. Do not simply thread the existing shared client: `_compare` mutates `client.request_recorder`.
-
-Four concurrent requests have an ideal ceiling of 4× acceleration for the independent request portion, not the whole stage. Rate limits and dependencies determine actual gains; none were measured.
+The full-pipeline schedule lets Qwen inspect later chapters while one GPT worker drafts and verifies earlier chapters in order. The design covers chapter readiness, illustration repairs and cross-chapter replacements, request estimates, progress bars, and recovery when notes need manual input. [Chapter pipeline design](chapter-pipeline.md)
 
 ### 5. Reduce redundant frame inference upstream
 
-Make selection sensitive to the board or screen content rather than whole-frame motion. Track instructional regions, suppress noninstructional movement, and retain clear representatives of unchanged states. Preserve content before erasure and meaningful intermediate drawings.
+The selector still scans at 2 fps so it can capture brief writing before erasure. On three saved lectures, the revised filter retained **3,000 of 4,680 native candidates** for vision inference.
 
-As a scenario, removing 30% of inference work from a lecture spending 3.3 hours in vision would save about one hour, before downstream effects. The achievable reduction has not been measured. Simply increasing the sampling interval risks losing content.
+On 2026-11-12, the first commit added two stages before lecture-model inference. [Commit d3c668b](https://github.com/bpleshakov/shad-helper/commit/d3c668b7b3eca96667ce660a4f3db03b9ddc9796)
+
+- During the proxy scan, detect broad, bright board or screen rectangles, including multiple panels and their margins. Measure change over the union of the regions from both frames and score each candidate’s sharpness inside its own regions. Use the whole frame when either layout is ambiguous, when a change outside the surface settles, and for the final change check. Pre-erasure and pre-transition views, scroll overlap, and the 15-second change guard still guide native-frame retrieval. [Proxy selector](../shad_helper/video.py)
+- After native retrieval, mask foreground people on comparison copies up to 720 pixels wide using the pinned PPHumanSeg model with OpenCV 4. Align small camera movements and compare locally normalized detail against pixels already visible in retained views. A local check catches small annotations. Added, erased, or newly revealed writing, scene changes, and clearer views can trigger retention. The filter also keeps a candidate when estimated occlusion exceeds 45% or usable overlap falls below 40%. All native candidates stay on disk, and vision receives the selected original images with their source timestamps. [Novelty filter](../shad_helper/frame_novelty.py)
+
+The second commit refined masking for lecturers cropped at camera-pane edges, reduced false person detections on wide board diagrams, and corrected false changes at image borders after small camera shifts. It also introduced a **five-second window** for successive additions to a drawing. Before choosing a later frame to represent the group, the filter checks it against **every** earlier member for erased, recolored, hidden, or clipped marks. It requires at least 85% of each earlier view’s sharpness over their shared visible area. The first view and scroll boundaries stay separate. Combining stages can lose the order in which strokes or labels appeared. [Commit feee0fd](https://github.com/bpleshakov/shad-helper/commit/feee0fdfa449cf26e58af9dc2727323211e9521a)
+
+`checkpoints/video/selection.json` records selected timestamps, reasons, and detected `content_regions` in proxy-pixel coordinates. `checkpoints/video/novelty.json` records every candidate decision and the final `represented_by` frame ID for merged stages. Its cache key includes native image hashes, policy settings, the person-model revision and checksum, and the OpenCV version. A policy change reruns filtering while matching per-frame vision results stay reusable. In `extraction-diagnostics.json`, `region_frames` and `full_frame_frames` count proxy samples under `selection`. The `selection.novelty` fields report candidate, suppressed, and merged counts, filtering time, and whether the checkpoint was reused.
+
+The saved replay applied both filters to the same native candidates from three lectures. The local archive at `.cache/frame-selection-benchmark/novelty-v4/comparison.json` records the filter checksum for `feee0fd`. The reduction column uses each lecture’s original candidate count.
+
+| Saved lecture | Native candidates | Retained by `d3c668b` | Retained by `feee0fd` | Revised reduction |
+|---|---:|---:|---:|---:|
+| 6 October, regularization | 1,624 | 1,450 | 1,307 | 19.5% |
+| 14 October, sorting and heaps | 1,476 | 774 | 701 | 52.5% |
+| 30 September, sorting seminar | 1,580 | 1,127 | 992 | 37.2% |
+| **Total** | **4,680** | **3,351** | **3,000** | **35.9%** |
+
+The first filter suppressed 1,329 candidates (28.4%). The revision dropped 370 frames the first filter kept and restored 19, leaving 351 fewer frames for inference. Of the **1,680** candidates suppressed by the revision, 30 were merged writing stages. Local filtering took 246.83 seconds for the first policy and 345.70 seconds for the revision.
+
+The replay starts after native retrieval and stops before lecture-model inference. The original audit’s estimate of about one hour saved on a 3.3-hour vision stage assumed 30% less inference work. Measuring the proxy selector’s contribution, actual time savings, and final note and illustration quality requires runs on the source recordings.
+
+On 2026-11-19, all 92 tests in the frame-novelty, proxy-selection, and video-pipeline suites passed. In one controlled extraction test, 80 proxy samples show a lecturer moving across an unchanged board. The pipeline makes one mocked vision call and reuses the result on resume. Other cases cover brief labels and their erasure, faint marks, multiple panels, occlusion, scrolling, and cache invalidation. [Novelty tests](../tests/test_frame_novelty.py) · [Selector tests](../tests/test_video.py) · [Pipeline tests](../tests/test_video_pipeline.py)
+
+To reproduce the revised replay, run the benchmark from the repository root with the local dependencies installed. It checks each job’s evidence fingerprint and writes per-job checkpoints and `report.json` under `--out`. [Replay script](../scripts/frame_selection_benchmark.py)
+
+```sh
+.venv/bin/python -m scripts.frame_selection_benchmark \
+  --out /tmp/frame-selection-replay \
+  out/06-10-* out_algo/14-10-* out_algo/30-09-*
+```
 
 ### 6. Retry failed operations rather than replaying full finalization
 
@@ -354,11 +380,12 @@ Measure:
 
 For state grouping and candidate filtering, inspect discarded distinctions against original images; final figure count alone is insufficient. For batching, check each source verdict independently. For concurrency, preserve deterministic application of decisions and reliable request archives.
 
-Acceptance means fewer calls or lower elapsed time while preserving the quality and coverage of the saved notes. The original audit did not validate an optimization; priorities 1–3 have the local and regression evidence listed above, without an end-to-end benchmark.
+Acceptance means fewer calls or lower elapsed time while preserving the quality and coverage of the saved notes. Priorities 1–3 and 5 have the local replay and regression evidence listed above. End-to-end gains still require a full lecture benchmark.
 
 ## Code and artifact references
 
 - [`video.py`](../shad_helper/video.py): selection settings, proxy-frame selection, native retrieval.
+- The person mask, visible-content comparison, five-second merge window, and per-frame decision checkpoint are implemented in [`frame_novelty.py`](../shad_helper/frame_novelty.py).
 - [`vision_worker.py`](../shad_helper/vision_worker.py): sequential inference, schema parsing, retries, frame checkpoints.
 - [`illustrations.py`](../shad_helper/illustrations.py): illustration-observation validation and source assets.
 - [`illustration_states.py`](../shad_helper/illustration_states.py): conservative local source-state grouping and fixed representative selection.

@@ -3,6 +3,7 @@
 import argparse
 import copy
 import json
+import os
 import re
 import time
 from importlib.metadata import PackageNotFoundError, version
@@ -167,7 +168,7 @@ class _InvalidOutput(ValueError):
         self.attempts = attempts
 
 
-def run(request: dict) -> dict:
+def run(request: dict, *, emit=None, notify=None) -> dict:
     mode = request.get("mode", "frames")
     if mode not in ("frames", "video"):
         raise ValueError("Vision mode must be frames or video")
@@ -253,6 +254,8 @@ def run(request: dict) -> dict:
                 except (ValueError, TypeError) as error:
                     attempt["error"] = str(error)
                     persist_attempts("incomplete" if attempt_index else "retry_pending", attempts)
+                    if not attempt_index and notify:
+                        notify("retry", item_id)
             raise _InvalidOutput(attempts)
 
         try:
@@ -275,10 +278,27 @@ def run(request: dict) -> dict:
                 for frame, content in zip(batch, result["content"], strict=True)]
         return [{**item, **result}]
 
-    batches = group_frames(request["items"]) if video_mode else [[item] for item in request["items"]]
+    if video_mode and "batch_sizes" in request:
+        sizes = request["batch_sizes"]
+        if (any(type(size) is not int or not 1 <= size <= MAX_FRAMES for size in sizes)
+                or sum(sizes) != len(request["items"])):
+            raise ValueError("Video batch plan does not cover the selection")
+        frames = iter(request["items"])
+        batches = [[next(frames) for _ in range(size)] for size in sizes]
+    else:
+        batches = group_frames(request["items"]) if video_mode else [[item] for item in request["items"]]
     with tqdm(batches, desc="Video vision" if video_mode else "Vision",
-              unit="batch" if video_mode else "frame", dynamic_ncols=True) as progress:
-        items = [item for batch in progress for item in process(batch)]
+              unit="batch" if video_mode else "frame", dynamic_ncols=True,
+              disable=emit is not None) as progress:
+        items = []
+        for batch in progress:
+            fresh_before = fresh_items
+            results = process(batch)
+            if notify and fresh_before == fresh_items:
+                notify("cached", batch[0]["id"])
+            items.extend(results)
+            if emit is not None:
+                emit(results)
     return {"items": items, "diagnostics": {
         "model": model_id, "revision": revision, "settings": settings, "packages": packages,
         "seconds": time.monotonic() - started, "model_load_seconds": model_load_seconds,
@@ -291,8 +311,24 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--request", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--events-fd", type=int)
     args = parser.parse_args()
-    write_json(args.output, run(read_json(args.request)))
+    request = read_json(args.request)
+    if args.events_fd is None:
+        result = run(request)
+    else:
+        with os.fdopen(args.events_fd, "w", encoding="utf-8") as events:
+            def publish(batch):
+                # Detailed attempts are already archived and travel in the final response.
+                payload = [{**item, "diagnostics": {"status": item["diagnostics"]["status"]}}
+                           for item in batch]
+                print(json.dumps(payload, ensure_ascii=False), file=events, flush=True)
+
+            def status(phase, frame):
+                print(json.dumps({"phase": phase, "frame": frame}), file=events, flush=True)
+
+            result = run(request, emit=publish, notify=status)
+    write_json(args.output, result)
 
 
 if __name__ == "__main__":

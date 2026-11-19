@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 
 from shad_helper.auth import RESOURCE, PlanAccessError, access_token, http_error
+from shad_helper.chapter_progress import check_cancelled, notes_connection
 from shad_helper.network import openai_http_client, resolve_openai_proxy
 from shad_helper.openai_config import load_api_key
 from shad_helper.openai_usage import track_request
@@ -81,6 +82,7 @@ def _serialize(value):
 def _events(response):
     data = []
     for line in response.iter_lines():
+        check_cancelled()
         if line.startswith("data:"):
             data.append(line[5:].lstrip())
         elif not line and data:
@@ -178,7 +180,8 @@ class PlanClient:
         if self.request_recorder is not None:
             self.request_recorder("GET", url, None)
         try:
-            with openai_http_client(proxy=self.proxy, transport=self.transport, timeout=30) as client:
+            with (openai_http_client(proxy=self.proxy, transport=self.transport, timeout=30) as client,
+                  notes_connection(client)):
                 response = client.get(url, headers=headers)
             if not response.is_success:
                 raise http_error(response, api_key=bool(self._api_key))
@@ -238,6 +241,7 @@ class PlanClient:
             with (
                 openai_http_client(proxy=self.proxy, transport=self.transport,
                                    timeout=httpx.Timeout(600, connect=30)) as client,
+                notes_connection(client),
                 track_request(api_key=bool(self._api_key), model=self.model) as usage_recorder,
                 client.stream("POST", url, headers=headers, content=payload) as response,
             ):

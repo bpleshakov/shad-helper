@@ -5,7 +5,7 @@ import sqlite3
 import subprocess
 import zipfile
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import ANY, Mock, call
 
 import pymupdf
 import pytest
@@ -53,7 +53,7 @@ def test_runs_all_stages_for_each_file_and_forwards_options(media, stages, tmp_p
     for index, (source, job) in enumerate(zip(media, jobs)):
         expected.extend([
             call.extract(source, job, language="en", start=10, duration=30,
-                         vision_model="35b", vision_mode=mode),
+                         vision_model="35b", vision_mode=mode, chapters=ANY),
             call.generate_notes(job, state, rebuild=True, proxy="http://localhost:8080"),
             call.render(job, rebuild=True),
             call.generate_anki(job, state, pdf=job / "notes" / "main.pdf", rebuild=True,

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pymupdf
 
-from .illustrations import illustration_index
+from .illustrations import illustration_index, native_frames
 from .jobs import fingerprint, sha256_file, write_json
 
 MAX_FRAME_SECONDS = 90
@@ -99,7 +99,7 @@ def validate_stitched_source(job: Path, evidence: dict, metadata: dict, path: Pa
     try:
         provenance = metadata["stitch"]
         observation = illustration_index(evidence)[provenance["illustration_id"]]
-        visuals = {item["id"]: item for item in evidence["visuals"]}
+        visuals = {item["id"]: item for item in native_frames(job, evidence)}
         sources = provenance["sources"]
         if provenance["version"] != 1 or len(sources) != 2:
             raise ValueError("Invalid scroll source provenance")
@@ -156,7 +156,7 @@ def stitched_sources(job: Path, evidence: dict, observation: dict,
     left, right = math.floor(x0 * reference.width), math.ceil(x1 * reference.width)
     if right - left < 128 or reference.height < 128:
         return []
-    candidates = sorted((visual for visual in evidence.get("visuals", [])
+    candidates = sorted((visual for visual in native_frames(job, evidence)
                          if 0 < abs(visual["timestamp"] - observation["timestamp"])
                          <= MAX_FRAME_SECONDS),
                         key=lambda visual: (abs(visual["timestamp"] - observation["timestamp"]),

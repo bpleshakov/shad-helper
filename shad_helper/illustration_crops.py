@@ -10,10 +10,10 @@ import pymupdf
 
 from . import crop_validation, illustration_stitching
 from .auth import PlanAccessError
-from .illustrations import illustration_index, resolve_illustration
+from .illustrations import illustration_index, native_frames, resolve_illustration
 from .jobs import fingerprint, read_json, sha256_file, write_json
 from .openai_client import DEFAULT_REASONING_EFFORT, PlanClient, ResponseError
-from .run_diagnostics import timed_step
+from .run_diagnostics import request_operation, timed_step
 
 CROP_POLICY_VERSION = 4
 MAX_CROP_REPAIRS = 2
@@ -234,7 +234,7 @@ def _native_frame(job, media_hash, visual):
 
 def _nearby_frames(job, evidence, media_hash, reference):
     """Sample distinct available frames near, midway and far on each side."""
-    candidates = sorted((visual for visual in evidence.get("visuals", [])
+    candidates = sorted((visual for visual in native_frames(job, evidence)
                          if 0 < abs(visual["timestamp"] - reference["timestamp"])
                          <= NEARBY_FRAME_SECONDS),
                         key=lambda visual: (abs(visual["timestamp"] - reference["timestamp"]),
@@ -478,6 +478,7 @@ def _save_crop(job, evidence, identifier, inputs, frame, response, verdict,
 
 
 @timed_step("crop_refinement")
+@request_operation("repairs")
 def refine_crop(job: Path, evidence: dict, block: dict, client,
                 folder: Path) -> tuple[str, bool, str, bool]:
     """Return crop ID, retry flag, review reason, and explicit lack of usable content."""

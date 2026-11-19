@@ -7,6 +7,8 @@ import os
 import re
 import shutil
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable
 
@@ -124,8 +126,39 @@ def validate_evidence(evidence: dict) -> dict:
     return evidence
 
 
+_verification_files = ContextVar("chapter_verification_files", default=None)
+
+
+@contextmanager
+def verification_files(job):
+    """Collect the managed inputs actually used by a verified chapter checkpoint."""
+    files = set()
+    token = _verification_files.set((job, files))
+    try:
+        yield files
+    finally:
+        _verification_files.reset(token)
+
+
+def _record_file(path):
+    active = _verification_files.get()
+    if active is not None:
+        relative = Path(path).relative_to(active[0], walk_up=True)
+        if relative.parts and relative.parts[0] in {"illustration-crops", "illustration-verification",
+                                                   "illustration-stitches"}:
+            if not relative.name.startswith("http-") and relative.name not in {"call.json", "status.json"}:
+                active[1].add(relative)
+            if relative.name in {"verdict.json", "crop.json"}:
+                for name in ("preview.png", "source.png") if relative.name == "verdict.json" else ("crop.png",):
+                    sibling = relative.with_name(name)
+                    if (active[0] / sibling).is_file():
+                        active[1].add(sibling)
+
+
 def read_json(path: Path) -> Any:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    _record_file(path)
+    return value
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -137,6 +170,7 @@ def write_json(path: Path, value: Any) -> None:
             json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
         temporary.replace(path)
+        _record_file(path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -171,6 +205,7 @@ def sha256_file(path: Path) -> str:
     with Path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
+    _record_file(path)
     return digest.hexdigest()
 
 

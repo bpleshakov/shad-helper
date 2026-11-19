@@ -3,6 +3,8 @@
 import math
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from .jobs import read_json, sha256_file, write_json
@@ -34,7 +36,26 @@ def illustration_index(evidence: dict) -> dict[str, dict]:
             for item in visual.get("illustrations", [])}
 
 
-def materialize_illustrations(job: Path, items: list[dict]) -> dict[str, list[dict]]:
+_snapshot = ContextVar("chapter_evidence_assets", default=None)
+
+
+@contextmanager
+def chapter_assets(job, manifest, frames):
+    """Resolve original crops and native neighbors from this ready chapter."""
+    token = _snapshot.set((job, manifest, frames))
+    try:
+        yield
+    finally:
+        _snapshot.reset(token)
+
+
+def native_frames(job, evidence):
+    snapshot = _snapshot.get()
+    return snapshot[2] if snapshot and snapshot[0] == job else evidence.get("visuals", [])
+
+
+def materialize_illustrations(job: Path, items: list[dict], *,
+                            assets: dict | None = None) -> dict[str, list[dict]]:
     """Crop native frames and publish the manifest only after every crop is saved."""
     from PIL import Image
 
@@ -43,7 +64,9 @@ def materialize_illustrations(job: Path, items: list[dict]) -> dict[str, list[di
     root.mkdir(parents=True, exist_ok=True)
     if root.resolve() != root:
         raise ValueError("Illustration directory must not be a symlink")
-    assets, result = {}, {}
+    publish = assets is None
+    assets = {} if publish else assets
+    result = {}
     for item in items:
         frame_id = item["id"]
         if (not isinstance(frame_id, str)
@@ -83,7 +106,8 @@ def materialize_illustrations(job: Path, items: list[dict]) -> dict[str, list[di
                                                  pixels[2] / width, pixels[3] / height],
                                          "image_sha256": digest})
                 assets[identifier] = {"path": path.relative_to(job).as_posix(), "sha256": digest}
-    write_json(root / "manifest.json", {"version": 1, "assets": assets})
+    if publish:
+        write_json(root / "manifest.json", {"version": 1, "assets": assets})
     return result
 
 
@@ -102,7 +126,8 @@ def resolve_illustration(job: Path, evidence: dict, identifier: str) -> Path:
         manifest_path = root / "manifest.json"
         if manifest_path.resolve().parent != root:
             raise ValueError("Illustration manifest escapes the managed directory")
-        manifest = read_json(manifest_path)
+        snapshot = _snapshot.get()
+        manifest = snapshot[1] if snapshot and snapshot[0] == job else read_json(manifest_path)
         if (not isinstance(manifest, dict) or set(manifest) != {"version", "assets"}
                 or manifest["version"] != 1 or not isinstance(manifest["assets"], dict)):
             raise ValueError("Invalid illustration manifest")

@@ -122,7 +122,7 @@ Existing time splitting and complete manual handoff handle oversized contexts.
 | Transcribe audio | Local worker started by `extract` when the clip overlaps audio | Worker request, WAV chunks, ASR checkpoints | Worker response, ASR checkpoints | Worker exits successfully and returns all requested items, or is skipped for an empty audio intersection |
 | Extract video | Local selection and vision worker started by `extract`, after ASR exits or is skipped | Original recording, selected frames, vision checkpoints | Frame images, recognized content, separate local diagnostics | Every selected frame has complete or incomplete extraction status |
 | Assemble evidence | Internal part of `extract` | Raw worker responses | Clean evidence, separate diagnostics, transcript copies, extraction timings | `extract` returns the path to `evidence.json` |
-| Prepare chapters | Internal part of `notes` | Evidence, optional saved outline | Saved outline and in-memory chapter contexts | A consecutive outline covers the extracted interval |
+| Prepare chapters | Before vision in a full video run, or during standalone `notes` | Evidence, optional saved outline | Saved outline and in-memory chapter contexts | A consecutive outline covers the extracted interval |
 | Synthesize or import | `notes`, optionally `--manual` or `--import` | Chapter contexts, schema, optional replies and resolutions | Current handoff and diagnostics replaced on every run; notes, review summary, and LaTeX project on success | A project path means notes were generated; a handoff path means replies are still required |
 | Review | `review`, optionally `--resolve` | Clean evidence, notes, review files and project | Resolution ledger, updated note issues and review metadata | A named note issue has an explicit correction recorded |
 | Render | `render` | Existing LaTeX project, manifest, current evidence | PDF, page previews, report and compiler files | PDF compilation and page preview generation both complete |
@@ -131,6 +131,11 @@ The main stage boundary is `evidence.json` → `notes.json` → the files declar
 by `notes/project.json` → `notes/main.pdf`. The worker files and checkpoints
 support extraction and resume. Transcript copies support inspection. The handoff
 files provide an alternative way to obtain the same note response format.
+
+Full video runs also publish chapter readiness under `checkpoints/chapter-pipeline/ready/`.
+The notes thread can read those snapshots during extraction. Publication of the combined
+LaTeX project requires the completed extraction and a verified checkpoint for every
+notes chapter. [Chapter pipeline](chapter-pipeline.md)
 
 Review is optional in the command sequence. Open issues do not prevent rendering;
 they produce a draft footer and remain available in the review JSON files and

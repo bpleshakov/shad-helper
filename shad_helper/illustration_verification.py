@@ -4,14 +4,15 @@ import json
 import re
 import shutil
 import time
+from contextlib import closing
 from copy import deepcopy
 from pathlib import Path
 
 import httpx
-from tqdm import tqdm
 
 from . import rendering
 from .auth import PlanAccessError
+from .chapter_progress import notes_phase, progress_items, retry_delay
 from .illustration_crops import refine_crop, resolve_crop
 from .illustration_matching import (
     MATCHING_SETTINGS,
@@ -28,7 +29,7 @@ from .illustration_states import (
 from .illustrations import illustration_index
 from .jobs import fingerprint, read_json, sha256_file, write_json
 from .openai_client import DEFAULT_REASONING_EFFORT, PlanClient, ResponseError
-from .run_diagnostics import timed_step
+from .run_diagnostics import request_operation, timed_step
 
 VERIFICATION_POLICY_VERSION = 2
 VERIFICATION_INSTRUCTIONS = """Compare a lecture illustration with its LaTeX reconstruction.
@@ -164,6 +165,7 @@ def _unpublish(notes, block, reason, *, unusable=False, accepted_ids=None):
         chapter["blocks"] = [item for item in chapter["blocks"] if item["id"] != identifier]
 
 
+@request_operation("repairs")
 def _repair_reconstruction(block, source, verdict, cache, client):
     """One correction, independently rendered and judged; cache only complete attempts."""
     folder = cache / "repair"
@@ -305,8 +307,9 @@ def _compare(client, source, preview, description, folder, *, instructions=None,
                         or getattr(error, "code", None) in ("model_unavailable", "context_length_exceeded")):
                     raise
                 delay = 5 * 2 ** attempt
+                notes_phase("retrying illustration comparison")
                 print(f"Retrying illustration comparison ({attempt + 1}/3) in {delay} seconds.", flush=True)
-                time.sleep(delay)
+                retry_delay(delay, time.sleep)
     finally:
         if isinstance(client, PlanClient):
             client.request_recorder = recorder
@@ -388,7 +391,7 @@ def _batch_consolidations(requests, job, folder, client):
         elif (cache / "batch.json").is_file():
             archive_batch(read_json(cache / "batch.json")["batch_id"])
     batches = [batch for batch in _consolidation_batches(pending.values()) if len(batch) > 1]
-    for batch in tqdm(batches, desc="Illustration coverage batches", unit="batch",
+    for batch in progress_items(batches, desc="Illustration coverage batches", unit="batch",
                       dynamic_ncols=True, disable=not batches):
         policy = _batch_policy()
         batch_id = fingerprint({"pairs": [item["cache"].name for item in batch], "policy": policy})
@@ -536,7 +539,9 @@ def _matching_figures(current, retained, observations, *, matcher=None, archive=
 
 
 @timed_step("illustration_coverage")
-def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublished):
+@request_operation("coverage")
+def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublished, matcher=None):
+    matcher = matcher or figure_matcher(job, evidence)
     observations = illustration_index(evidence)
     blocks = {block["id"]: block for part in [*previous, notes]
               for chapter in part["chapters"] for block in chapter["blocks"]}
@@ -545,7 +550,6 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
              **{identifier: item["timestamp"] for identifier, item in observations.items()}}
     retry_needed = False
     alternatives = {}
-    matcher = VisualMatcher(lambda identifier, crop_id: resolve_crop(job, evidence, identifier, crop_id))
     coverage_items = [(chapter, coverage) for chapter in notes["chapters"]
                       for coverage in chapter.get("illustration_coverage", [])]
     checked_ids = {coverage["illustration_id"] for _, coverage in coverage_items
@@ -623,8 +627,8 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
         return _consolidation(observation, target, job, evidence, archive, client,
                               source_block=source_blocks[identifier])
 
-    with tqdm(coverage_items, desc="Illustration coverage", unit="observation",
-              dynamic_ncols=True, disable=not coverage_items) as progress:
+    with closing(progress_items(coverage_items, desc="Illustration coverage", unit="observation",
+              dynamic_ncols=True, disable=not coverage_items)) as progress:
         for chapter, coverage in progress:
             original_id = coverage["block_id"]
             if not original_id:
@@ -730,14 +734,14 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
     return retry_needed
 
 
-def _recover_coverage(notes, evidence, job, folder, client, previous, unpublished):
+@request_operation("recovery")
+def _recover_coverage(notes, evidence, job, folder, client, previous, unpublished, matcher):
     """Let complete figures recovered later represent earlier failed observations."""
     observations = illustration_index(evidence)
     accepted = [block for part in [*previous, notes] for chapter in part["chapters"]
                 for block in chapter["blocks"]
                 if block.get("illustration_id") and block["id"] not in unpublished]
     retry_needed = False
-    matcher = VisualMatcher(lambda identifier, crop_id: resolve_crop(job, evidence, identifier, crop_id))
     for chapter in notes["chapters"]:
         for coverage in chapter.get("illustration_coverage", []):
             failed = unpublished.get(coverage["block_id"])
@@ -764,21 +768,23 @@ def _recover_coverage(notes, evidence, job, folder, client, previous, unpublishe
 
 
 @timed_step("illustration_verification")
+@request_operation("verification")
 def finalize_illustrations(notes: dict, evidence: dict, job: Path, folder: Path,
-                           client, *, previous: list[dict] | None = None) -> tuple[dict, bool]:
+                           client, *, previous: list[dict] | None = None, pending=None, matcher=None) -> tuple[dict, bool]:
     """Return accepted notes and whether unavailable verification should be retried.
 
     Call on the original candidate on each rerun; only completed visual verdicts are
     cached. Every request archive receives its source, candidate, preview, and outcome.
     """
     result = deepcopy(notes)
+    matcher = matcher or figure_matcher(job, evidence)
     observations = illustration_index(evidence)
     retry_needed = False
     unpublished = {}
     figures = [block for chapter in result["chapters"] for block in chapter["blocks"]
                if block.get("illustration_id") and block["kind"] in {"diagram", "screenshot"}]
-    with tqdm(figures, desc="Illustration verification", unit="figure",
-              dynamic_ncols=True, disable=not figures) as progress:
+    with closing(progress_items(figures, desc="Illustration verification", unit="figure",
+              dynamic_ncols=True, disable=not figures)) as progress:
         for block in progress:
             identifier = block["illustration_id"]
             observation = observations[identifier]
@@ -871,13 +877,22 @@ def finalize_illustrations(notes: dict, evidence: dict, job: Path, folder: Path,
             write_json(archive / "accepted.json", block)
             retry_needed |= transient
     retry_needed |= _finalize_coverage(result, evidence, job, folder, client, previous or [],
-                                      unpublished)
+                                      unpublished, matcher)
     retry_needed |= _recover_coverage(result, evidence, job, folder, client, previous or [],
-                                     unpublished)
+                                     unpublished, matcher)
     accepted_ids = {block["id"] for part in [*(previous or []), result]
                     for chapter in part["chapters"] for block in chapter["blocks"]
                     if block.get("illustration_id") and block["id"] not in unpublished}
     for block, reason, unusable in unpublished.values():
+        if pending is not None:
+            for chapter in result["chapters"]:
+                refs = [item["id"] for item in chapter["blocks"]
+                        if block["id"] in item.get("figure_refs", [])]
+                for item in chapter.get("illustration_coverage", []):
+                    if item["block_id"] == block["id"]:
+                        pending[item["illustration_id"]] = {"source": block, "refs": refs,
+                            "issue": "illustration_review_" + fingerprint(
+                                (block["id"], block["illustration_id"]))[:24]}
         _unpublish(result, block, reason, unusable=unusable, accepted_ids=accepted_ids)
         archive = Path(folder) / "illustration-verification" / block["id"]
         unresolved = any(item["illustration_id"] == block["illustration_id"]
@@ -890,19 +905,92 @@ def finalize_illustrations(notes: dict, evidence: dict, job: Path, folder: Path,
     return result, retry_needed
 
 
-def _reconcile_pair(left, right, observations, job, evidence, folder, client):
+def figure_matcher(job, evidence, examples=()):
+    matcher = VisualMatcher(lambda identifier, crop: resolve_crop(job, evidence, identifier, crop))
+    matcher.examples = {tuple(target): list(map(tuple, sources)) for target, sources in examples}
+    return matcher
+
+
+@request_operation("recovery")
+def recover_later(parts, new_part, pending, evidence, job, folder, client, matcher):
+    """Reopen only unresolved observations for candidates introduced by this chapter."""
+    observations = illustration_index(evidence)
+    candidates = [b for ch in new_part["chapters"] for b in ch["blocks"] if b.get("illustration_id")]
+    if not candidates:
+        return False
+    retry = False
+    for part in parts:
+        for chapter in part["chapters"]:
+            for item in chapter.get("illustration_coverage", []):
+                if item.get("exclusion_reason") != "unresolved":
+                    continue
+                identifier = item["illustration_id"]
+                record = pending.get(identifier, {})
+                source = record.get("source", {})
+                observation = observations[identifier]
+                search = {**source, "id": identifier, "illustration_id": identifier}
+                if source.get("illustration_id") != identifier:
+                    source = None
+                    search.pop("illustration_crop_id", None)
+                archive = folder / identifier
+                for target in _matching_figures(search, candidates, observations, matcher=matcher,
+                                                archive=archive, broad=True):
+                    verdict, transient = _consolidation(observation, target, job, evidence,
+                        archive / target["id"], client, source_block=source)
+                    retry |= transient
+                    if verdict["verdict"] != "pass":
+                        continue
+                    matcher.remember(search, target)
+                    item.update(block_id=target["id"], exclusion_reason="")
+                    for prose in chapter["blocks"]:
+                        if prose["id"] in record.get("refs", []) and target["id"] not in prose["figure_refs"]:
+                            prose["figure_refs"].append(target["id"])
+                    for issue in list(part["issues"]):
+                        if issue["id"] == record.get("issue") and identifier in issue["evidence_ids"]:
+                            issue["evidence_ids"].remove(identifier)
+                            if not issue["evidence_ids"]:
+                                part["issues"].remove(issue)
+                    pending.pop(identifier, None)
+                    break
+    return retry
+
+
+def _publication_preview(job, block):
+    key = fingerprint((rendering.diagram_preview_fingerprint(), block["content"]))
+    folder = job / "illustration-verification" / "publication" / key
+    preview, record = folder / "preview.png", folder / "publication.json"
+    if record.is_file() and preview.is_file() and read_json(record) == sha256_file(preview):
+        return preview
+    rendered = rendering.render_diagram_preview(block["content"], folder / "render")
+    shutil.copyfile(rendered, preview)
+    write_json(record, sha256_file(preview))
+    return preview
+
+
+def _reconcile_pair(left, right, observations, job, evidence, folder, client, *, direct=False):
     source = resolve_crop(job, evidence, left["illustration_id"], left.get("illustration_crop_id", ""))
     preview = resolve_crop(job, evidence, right["illustration_id"], right.get("illustration_crop_id", ""))
+    if direct and right["kind"] == "diagram":
+        try:
+            preview = _publication_preview(job, right)
+        except (rendering.RenderError, OSError, ValueError) as error:
+            verdict = {"relation": "uncertain", "preferred": "neither", "reason": str(error)}
+            write_json(folder / "verdict.json", {**verdict, "retry_needed": True})
+            return verdict, True
     source_hash, preview_hash = sha256_file(source), sha256_file(preview)
-    same_crop = (left["illustration_id"] == right["illustration_id"]
-                 and left.get("illustration_crop_id", "") == right.get("illustration_crop_id", ""))
-    if same_crop or source_hash == preview_hash:
+    same_intent = (left.get("caption") == right.get("caption") and
+                   (left["illustration_id"] == right["illustration_id"] or
+                    observations[left["illustration_id"]]["description"]
+                    == observations[right["illustration_id"]]["description"]))
+    same_representation = (left["kind"] == right["kind"] == "screenshot" or
+                           left["kind"] == right["kind"] == "diagram" and left["content"] == right["content"])
+    if same_intent and same_representation and source_hash == preview_hash:
         prefer_right = (right["kind"] == "diagram" and left["kind"] != "diagram"
                         or right.get("illustration_crop_id") and not left.get("illustration_crop_id"))
         verdict = {"relation": "same", "preferred": "right" if prefer_right else "left",
                    "reason": "Один выбранный фрагмент или идентичные изображения."}
         write_json(folder / "verdict.json", {**verdict, "retry_needed": False})
-        return verdict, False
+        return {**verdict, "identical": True}, False
     figures = {side: {"caption": block.get("caption", ""), "kind": block["kind"],
                       "content": block["content"],
                       "description": observations[block["illustration_id"]]["description"]}
@@ -935,63 +1023,112 @@ def _reconcile_pair(left, right, observations, job, evidence, folder, client):
 
 
 @timed_step("figure_reconciliation")
+@request_operation("reconciliation")
 def reconcile_illustrations(notes: dict, evidence: dict, job: Path, folder: Path,
-                           client) -> tuple[dict, bool]:
-    """Keep a verified representative of neighboring figures on each lecture topic.
-
-    Retained figures and prose stay in their original chronology. Coverage and figure
-    references may point to a later, more complete representative after this pass.
-    """
+                           client, *, state=None, matcher=None, publish=True) -> tuple[dict, bool]:
+    """Compare new figures in order and keep a direct verdict for every replacement."""
     result = deepcopy(notes)
     observations = illustration_index(evidence)
-    figures = [block for chapter in result["chapters"] for block in chapter["blocks"]
-               if block.get("illustration_id") in observations]
-    retained, replacements = [], {}
+    figures = {block["id"]: block for chapter in result["chapters"] for block in chapter["blocks"]
+               if block.get("illustration_id") in observations}
+    originals = deepcopy(figures)
+    state = {} if state is None else state
+    replacements = state.setdefault("replacements", {})
+    coverage_targets = state.setdefault("coverage_targets", {})
+    active = state.setdefault("active", [])
+    captions = state.setdefault("captions", {})
+    seen = set(state.get("seen", []))
+    for identifier, changes in captions.items():
+        figures[identifier].update(changes)
+    matcher = matcher or figure_matcher(job, evidence, state.get("examples", []))
     retry_needed = False
-    matcher = VisualMatcher(lambda identifier, crop_id: resolve_crop(job, evidence, identifier, crop_id))
-    for current in figures:
-        for left in _matching_figures(current, retained, observations, matcher=matcher,
-                                     archive=Path(folder) / current["id"], broad=True):
-            verdict, transient = _reconcile_pair(
-                left, current, observations, job, evidence,
-                Path(folder) / f"{left['id']}--{current['id']}", client)
+
+    def preserves(source, winner):
+        nonlocal retry_needed
+        archive = folder / "direct" / f"{source['id']}--{winner['id']}"
+        with timed_step("direct_replacement"), request_operation("direct_replacement"):
+            try:
+                verdict, transient = _reconcile_pair(source, winner, observations, job, evidence,
+                                                     archive, client, direct=True)
+            except (OSError, ValueError, rendering.RenderError) as error:
+                write_json(archive / "error.json", {"message": str(error)})
+                retry_needed = True
+                return False
+        retry_needed |= transient
+        if verdict["relation"] in {"same", "right_contains_left"}:
+            matcher.remember(source, winner)
+            return True
+        return False
+
+    def replace(loser, winner, verdict):
+        old, new = loser["id"], winner["id"]
+        same_publication = (verdict.get("identical") and loser["kind"] == winner["kind"] and
+                            (winner["kind"] == "screenshot" or loser["content"] == winner["content"]))
+        caption = winner.get("caption", "")
+        other = loser.get("caption", "")
+        if ((not caption or caption == "Иллюстрация из лекции" or caption.startswith("Иллюстрация к теме «"))
+                and other and other != "Иллюстрация из лекции" and not other.startswith("Иллюстрация к теме «")):
+            changes = {"caption": other}
+            if winner["kind"] == "screenshot" and winner["content"] == caption:
+                changes["content"] = loser["content"] if loser["kind"] == "screenshot" else other
+            captions[new] = changes
+            winner.update(changes)
+        prior_targets = replacements.copy()
+        # Remap each original independently. A refused link pins its last valid target.
+        for identifier, target in list(replacements.items()):
+            if target == old and (same_publication or preserves(originals[identifier], winner)):
+                replacements[identifier] = new
+        for chapter in result["chapters"]:
+            for item in chapter.get("illustration_coverage", []):
+                source, block = item["illustration_id"], item["block_id"]
+                if not block or source == originals[block]["illustration_id"]:
+                    continue
+                if coverage_targets.get(source, prior_targets.get(block, block)) != old:
+                    continue
+                if same_publication or source == winner["illustration_id"]:
+                    coverage_targets[source] = new
+                    continue
+                observation = observations[source]
+                original = {"id": source, "kind": "screenshot", "illustration_id": source,
+                            "content": observation["description"], "caption": observation["description"]}
+                coverage_targets[source] = new if preserves(original, winner) else old
+        replacements[old] = new
+        matcher.remember(loser, winner)
+
+    for identifier, current in figures.items():
+        if identifier in seen:
+            continue
+        for left in _matching_figures(current, [figures[key] for key in active], observations,
+                                     matcher=matcher, archive=folder / identifier, broad=True):
+            verdict, transient = _reconcile_pair(left, current, observations, job, evidence,
+                                                 folder / f"{left['id']}--{identifier}", client)
             retry_needed |= transient
             if verdict["preferred"] == "left":
-                replacements[current["id"]] = left["id"]
-                winner, loser = left, current
-            elif verdict["preferred"] == "right":
-                replacements[left["id"]] = current["id"]
-                retained.remove(left)
-                winner, loser = current, left
-            else:
-                continue
-            matcher.remember(loser, winner)
-            old_caption, caption = winner.get("caption", ""), loser.get("caption", "")
-            def generic(text):
-                return not text or text == "Иллюстрация из лекции" or text.startswith("Иллюстрация к теме «")
-            if generic(old_caption) and not generic(caption):
-                winner["caption"] = caption
-                if winner["kind"] == "screenshot" and winner["content"] == old_caption:
-                    winner["content"] = loser["content"] if loser["kind"] == "screenshot" else caption
-            if verdict["preferred"] == "left":
+                replace(current, left, verdict)
                 break
-        if current["id"] not in replacements:
-            retained.append(current)
-
-    def target(identifier):
-        while identifier in replacements:
-            identifier = replacements[identifier]
-        return identifier
-
+            if verdict["preferred"] == "right":
+                replace(left, current, verdict)
+                active.remove(left["id"])
+        if identifier not in replacements:
+            active.append(identifier)
+    state.update(seen=list(figures), examples=list(matcher.examples.items()))
+    removed = replacements.keys() - set(replacements.values()) - set(coverage_targets.values())
     for chapter in result["chapters"]:
-        chapter["blocks"] = [block for block in chapter["blocks"] if block["id"] not in replacements]
-        for coverage in chapter.get("illustration_coverage", []):
-            coverage["block_id"] = target(coverage["block_id"])
+        chapter["blocks"] = [block for block in chapter["blocks"] if block["id"] not in removed]
+        extra_refs = {}
+        for item in chapter.get("illustration_coverage", []):
+            block = item["block_id"]
+            target = coverage_targets.get(item["illustration_id"], replacements.get(block, block))
+            item["block_id"] = target
+            if target != replacements.get(block, block):
+                extra_refs.setdefault(block, []).append(target)
         for block in chapter["blocks"]:
             if "figure_refs" in block:
-                block["figure_refs"] = list(dict.fromkeys(target(ref) for ref in block["figure_refs"]))
-    removed_issues = {"illustration_review_" + fingerprint((block["id"], block["illustration_id"]))[:24]
-                      for block in figures if block["id"] in replacements}
+                block["figure_refs"] = list(dict.fromkeys(target for ref in block["figure_refs"]
+                    for target in [replacements.get(ref, ref), *extra_refs.get(ref, [])]))
+    removed_issues = {"illustration_review_" + fingerprint((key, figures[key]["illustration_id"]))[:24]
+                      for key in removed}
     result["issues"] = [issue for issue in result.get("issues", []) if issue["id"] not in removed_issues]
-    write_json(Path(folder) / "replacements.json", {key: target(key) for key in replacements})
+    if publish:
+        write_json(folder / "replacements.json", replacements)
     return result, retry_needed

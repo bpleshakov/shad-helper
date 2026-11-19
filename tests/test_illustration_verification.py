@@ -1504,7 +1504,8 @@ def test_reconciliation_same_source_preserves_prose_references_without_model_cal
     job, evidence, _, _ = example
     notes = paired_figures(example)
     chapter = notes["chapters"][0]
-    chapter["blocks"][-1].update(illustration_id="v01_ill01", evidence_ids=["v01_ill01"])
+    chapter["blocks"][-1].update(illustration_id="v01_ill01", evidence_ids=["v01_ill01"],
+                                 caption=chapter["blocks"][1]["caption"])
     chapter["blocks"].append({"id": "later_explanation", "kind": "text", "content": "Продолжение.",
                               "evidence_ids": ["v02"], "figure_refs": ["later"]})
     client = Client(OSError("Offline"))
@@ -1523,6 +1524,7 @@ def test_reconciliation_compares_different_crops_of_same_source(example, monkeyp
     first, second = notes["chapters"][0]["blocks"][1:]
     first["illustration_crop_id"] = "a" * 64
     second.update(illustration_id=first["illustration_id"], illustration_crop_id="b" * 64,
+                  caption=first["caption"],
                   evidence_ids=first["evidence_ids"])
     crops = {first["illustration_crop_id"]: png(job / "left.png", 220),
              second["illustration_crop_id"]: png(job / "right.png", 220 if identical_pixels else 50)}
@@ -1541,7 +1543,7 @@ def test_reconciliation_compares_different_crops_of_same_source(example, monkeyp
             crops[second["illustration_crop_id"]].read_bytes()]
 
 
-def test_reconciliation_remaps_chain_and_keeps_meaningful_caption_for_better_fallback(example):
+def three_revisions(example):
     job, evidence, _, _ = example
     notes = paired_figures(example, across_chapters=True)
     later = notes["chapters"][1]["blocks"][0]
@@ -1561,15 +1563,95 @@ def test_reconciliation_remaps_chain_and_keeps_meaningful_caption_for_better_fal
     notes["chapters"][1]["blocks"].append(final)
     notes["chapters"][1]["illustration_coverage"].append({
         "illustration_id": "v03_ill01", "block_id": "best"})
+    return job, evidence, notes, later
+
+
+def test_reconciliation_remaps_chain_and_keeps_meaningful_caption_for_better_fallback(example):
+    job, evidence, notes, later = three_revisions(example)
     client = Client({"relation": "right_contains_left", "preferred": "right", "reason": "Полнее."})
     accepted, retry = verification.reconcile_illustrations(notes, evidence, job, job / "reconcile", client)
-    assert not retry and len(client.calls) == 2
+    assert not retry and len(client.calls) == 3  # Includes the direct drawing-to-best comparison.
     [kept] = accepted["chapters"][1]["blocks"]
     assert kept["id"] == "best" and kept["illustration_id"] == "v03_ill01"
     assert kept["caption"] == later["caption"] and kept["content"] == later["content"]
     assert accepted["chapters"][0]["blocks"][0]["figure_refs"] == ["best"]
     assert all(item["block_id"] == "best" for chapter in accepted["chapters"]
                for item in chapter["illustration_coverage"])
+
+
+@pytest.mark.parametrize("direct", ["distinct", "uncertain", "offline"])
+def test_quicksort_tree_keeps_verified_board_when_lomuto_drops_it(example, direct):
+    job, evidence, notes, later = three_revisions(example)
+    tree = notes["chapters"][0]["blocks"][1]
+    tree["caption"] = "Quicksort recursion tree"
+    notes["chapters"][0]["blocks"][0]["figure_refs"] = [tree["id"]]
+    later["caption"] = "Board with recursion tree and Lomuto partition"
+    last = notes["chapters"][1]["blocks"].pop()
+    last.update(kind="diagram", content=r"\draw (0,0)--(1,1);", caption="Lomuto partition")
+    notes["chapters"][1]["end"] = 5.5
+    coverage = notes["chapters"][1]["illustration_coverage"].pop()
+    state = {}
+    class Verifier(Client):
+        def complete(self, instructions, text, schema, *, images):
+            self.calls.append((text, images))
+            pair = json.loads(text[text.index("{"):])
+            if pair["left"]["caption"] == tree["caption"] and pair["right"]["caption"] == last["caption"]:
+                if direct == "offline":
+                    raise OSError("offline")
+                return {"relation": direct, "preferred": "neither", "reason": "Missing recursion tree"}
+            return {"relation": "right_contains_left", "preferred": "right", "reason": "More complete"}
+    client = Verifier()
+    archive = job / "reconciliation"
+    first, _ = verification.reconcile_illustrations(notes, evidence, job, archive, client, state=state)
+    assert first["chapters"][0]["blocks"][0]["figure_refs"] == ["later"]
+    notes["chapters"].append({"id": "c03", "title": "Partition", "start": 5.5, "end": 10,
+                              "blocks": [last], "illustration_coverage": [coverage]})
+    accepted, retry = verification.reconcile_illustrations(notes, evidence, job, archive, client,
+                                                           state=json.loads(json.dumps(state)))
+    assert retry == (direct == "offline")
+    assert {b["id"] for ch in accepted["chapters"] for b in ch["blocks"]
+            if b.get("illustration_id")} == {"later", "best"}
+    assert accepted["chapters"][0]["blocks"][0]["figure_refs"] == ["later"]
+    assert [c["illustration_coverage"][0]["block_id"] for c in accepted["chapters"]] == [
+        "later", "best", "best"]
+    assert read_json(archive / "replacements.json") == {"drawing": "later", "later": "best"}
+    text, images = client.calls[-1]
+    assert tree["caption"] in text and last["caption"] in text
+    assert images[1][1].read_bytes() == png(job / "expected-preview.png").read_bytes()
+    if direct != "offline":
+        calls = len(client.calls)
+        replay, _ = verification.reconcile_illustrations(notes, evidence, job, archive, client)
+        assert replay == accepted and len(client.calls) == calls
+
+
+def test_identical_pixels_with_distinct_intended_figures_need_a_verdict(example):
+    job, evidence, _, _ = example
+    notes = paired_figures(example)
+    first, second = notes["chapters"][0]["blocks"][1:]
+    second.update(illustration_id=first["illustration_id"], caption="Different panel")
+    client = Client({"relation": "distinct", "preferred": "neither", "reason": "Independent panels"})
+    accepted, retry = verification.reconcile_illustrations(notes, evidence, job, job / "pairs", client)
+    assert accepted == notes and len(client.calls) == 1 and not retry
+
+
+def test_later_chapter_recovers_unpublished_source_prose_and_review(example, monkeypatch):
+    job, evidence, notes, _ = example
+    source_notes = paired_figures(example, across_chapters=True)
+    first, second = [dict(source_notes, chapters=[ch]) for ch in source_notes["chapters"]]
+    first["chapters"][0]["blocks"][0]["figure_refs"] = ["drawing"]
+    monkeypatch.setattr(verification, "refine_crop", lambda *args: ("", False, "occluded", False))
+    pending = {}
+    old, _ = verification.finalize_illustrations(first, evidence, job, job / "old", Client(),
+                                                 pending=pending)
+    assert old["issues"] and old["chapters"][0]["illustration_coverage"][0]["exclusion_reason"] == "unresolved"
+    matcher = verification.figure_matcher(job, evidence)
+    client = Client()
+    verification.recover_later([old], second, pending, evidence, job, job / "later", client, matcher)
+    assert not pending and not old["issues"] and len(client.calls) == 1
+    assert old["chapters"][0]["blocks"][0]["figure_refs"] == ["later"]
+    assert old["chapters"][0]["illustration_coverage"][0]["block_id"] == "later"
+    verification.recover_later([old], second, pending, evidence, job, job / "again", client, matcher)
+    assert len(client.calls) == 1
 
 
 def test_one_tikz_correction_is_rendered_verified_and_reused(example):

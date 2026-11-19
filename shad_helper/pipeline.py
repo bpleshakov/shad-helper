@@ -7,11 +7,12 @@ import sys
 from pathlib import Path
 
 from .anki import generate_anki
+from .chapter_pipeline import ChapterPipeline
 from .extraction import extract
 from .jobs import read_json
 from .notes import generate_notes
 from .rendering import render
-from .run_diagnostics import diagnostic_run
+from .run_diagnostics import chapter_overlap_seconds, diagnostic_run
 from .vision_config import DEFAULT_VISION_MODEL
 
 
@@ -48,13 +49,18 @@ def run_pipeline(media: list[Path], out: Path, state_dir: Path, *, language: str
         label = f"[{number}/{len(jobs)}] {source} (job {job})"
         stage = "extract"
         try:
-            with diagnostic_run(job, "run"):
+            with diagnostic_run(job, "run") as report:
                 print(f"{label}: {stage}", flush=True)
-                extract(source, job, language=language, start=start, duration=duration,
-                        vision_model=vision_model, vision_mode=vision_mode)
-                stage = "notes"
-                print(f"{label}: {stage}", flush=True)
-                result = generate_notes(job, state_dir, rebuild=rebuild, proxy=proxy)
+                with ChapterPipeline(job, state_dir, rebuild=rebuild, proxy=proxy) as chapters:
+                    extract(source, job, language=language, start=start, duration=duration,
+                            vision_model=vision_model, vision_mode=vision_mode, chapters=chapters)
+                    stage = "notes"
+                if chapters.worker is None:
+                    print(f"{label}: {stage}", flush=True)
+                    result = generate_notes(job, state_dir, rebuild=rebuild, proxy=proxy)
+                else:
+                    report["chapter_worker_overlap_seconds"] = chapter_overlap_seconds(report)
+                    result = chapters.result
                 if result.resolve() != job / "notes" / "main.tex":
                     raise RuntimeError(f"Notes require manual completion: {result}")
                 stage = "render"

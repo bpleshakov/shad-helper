@@ -79,6 +79,9 @@ def command_usage(command):
 @contextmanager
 def track_request(*, api_key, model):
     """Count each sent generation attempt, including retries and interrupted streams."""
+    from .run_diagnostics import record_generation_request
+
+    record_generation_request()
     usage = _command_usage.get()
     if usage is None:
         yield None

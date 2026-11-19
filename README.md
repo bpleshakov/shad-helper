@@ -57,13 +57,18 @@ files and output directory reuses the same jobs, regardless of input order.
 Repeated paths or symlink aliases in one invocation are rejected before work starts.
 Audio files are also supported.
 
-Files run in the supplied order. For each file, `run` completes **extract → notes
-→ render → anki** before starting the next file. It prints the job directory and
-current stage; outputs include `JOB/notes/main.pdf` and `JOB/anki/deck.apkg`.
-An error stops that file's remaining stages and processing continues with the next
-file. A manual notes handoff also counts as an incomplete job, so an older PDF is
-never used in its place. The final summary reports completed/failed jobs, and the
-command exits with status 1 if any job failed.
+Files run in the supplied order. For video, one Qwen worker inspects selected frames
+while one GPT worker drafts and verifies ready chapters in lecture order. Each chapter
+includes its neighboring evidence. For a first chapter ending at 15:00, notes can start
+when the selected frames through 16:00 and their crops are ready. Interactive terminals
+show one row per worker with the current chapter and activity. Redirected output records
+chapter and phase transitions. Audio-only runs proceed from transcription to notes.
+
+Once all chapters and extraction finish, the pipeline renders `JOB/notes/main.pdf` and
+generates `JOB/anki/deck.apkg`. If a notes chapter needs manual input, Qwen finishes the
+lecture and the job saves a complete handoff. The batch then advances to the next input.
+The final summary reports completed and failed jobs. Any failure sets exit status 1.
+[Chapter scheduling, progress and resume](docs/chapter-pipeline.md)
 
 The extraction options `--start`, `--duration`, `--language`, `--vision-model`, and `--vision-mode`
 apply to every input. `--rebuild` clears each notes/Anki stage's generated files,
@@ -89,7 +94,12 @@ changes, UTC start/end timestamps, and total `elapsed_seconds`. Git fields are
 The ordered `steps` tree records elapsed seconds and status for each executed stage
 and its substeps, including chapter checkpoints, illustration verification and
 reconciliation, LaTeX compilation, and Anki generation.
-Times include nested work: compare siblings, rather than adding parents to children.
+Each step also records its `start_offset_seconds`. In video runs, the extraction and
+notes intervals overlap. `chapter_worker_overlap_seconds` measures the time spent in
+chapter notes jobs while the vision subprocess was active. Use the top-level elapsed
+time for wall-clock comparisons.
+`generation_requests` counts fresh notes requests by operation, including retries and
+direct comparisons of original figures with their proposed final replacements.
 Cached checkpoints record this run's lookup time with status `cached`; they do not
 reuse the original generation duration. Failed/interrupted steps retain elapsed time.
 The report updates as steps finish and replaces the previous invocation's report;
@@ -436,8 +446,10 @@ Failed matches try already retained alternatives before adding another screensho
 An automatic fallback is excluded only when native-frame inspection explicitly
 finds no meaningful figure content, such as plot headings with only a thin edge.
 The observation stays in the evidence, with an exclusion decision and a review
-issue. All chapter candidates are finalized together, so complete figures from
-later chapters can rescue earlier observations. Repaired crops are compared again
+issue. A later chapter can rescue an earlier unresolved observation and restore its
+prose references. When a figure already represents another figure, redirecting that
+original requires a direct comparison with the new target. An uncertain result
+keeps its last verified target in the notes. Repaired crops are compared again
 against accepted alternatives before adding a screenshot. Unavailable verification
 is retried automatically from the original candidates. If bounded recovery still
 fails, source assets and diagnostics retain `unresolved` coverage and an open

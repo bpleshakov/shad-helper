@@ -92,6 +92,7 @@ def _client_module():
         http_error=lambda _, **kwargs: module.PlanAccessError("offline HTTP error"),
         load_api_key=lambda: None,
         track_request=lambda **kwargs: nullcontext(None),
+        notes_connection=lambda _: nullcontext(), check_cancelled=lambda: None,
         httpx=SimpleNamespace(Client=Client, Timeout=lambda *args, **kwargs: None, HTTPError=OSError))
     source_path = Path(__file__).parents[1] / "shad_helper" / "openai_client.py"
     source_tree = ast.parse(source_path.read_text())

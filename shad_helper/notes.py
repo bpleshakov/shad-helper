@@ -6,6 +6,7 @@ import shutil
 import time
 from pathlib import Path
 
+from .chapter_progress import notes_phase, retry_delay
 from .jobs import (
     check_job,
     checkpoint,
@@ -18,7 +19,7 @@ from .jobs import (
     validate_evidence,
     write_json,
 )
-from .run_diagnostics import record_run, timed_step
+from .run_diagnostics import record_run, request_operation, timed_step
 
 INSTRUCTIONS = r"""Ты составляешь компактный русский учебный конспект университетской лекции.
 Данные лекции переданы отдельным JSON-контекстом; схема задает формат ответа.
@@ -477,29 +478,12 @@ def _chapter_prompt(context: dict, outline: dict, glossary: list[dict],
                       ensure_ascii=False, separators=(",", ":"))
 
 
-@timed_step("handoff_export")
-def export_handoff(job: Path, evidence: dict, outline: dict, *, contexts: dict | None = None) -> Path:
+def prepare_handoff(job, outline):
     from .schemas import LectureNotes
 
-    check_job(job)
-    validate_evidence(evidence)
     folder = job / "handoff"
-    folder.mkdir(exist_ok=True)
     write_json(folder / "outline.json", outline)
-    inputs = folder / "inputs"
-    if inputs.exists():
-        shutil.rmtree(inputs)
-    write_json(inputs / "response-schema.json", LectureNotes.model_json_schema())
-    for chapter in outline["chapters"]:
-        part = inputs / chapter["id"]
-        part.mkdir(exist_ok=True)
-        context = chapter_context(evidence, chapter)
-        payload = (contexts or {}).get(chapter["id"])
-        if payload is None:
-            payload = _model_context(context, outline, outline["glossary"])
-        write_json(part / "context.json", payload)
-        (part / "prompt.txt").write_text(INSTRUCTIONS, encoding="utf-8")
-        _export_images(job, evidence, payload, part)
+    write_json(folder / "inputs" / "response-schema.json", LectureNotes.model_json_schema())
     (folder / "README.txt").write_text(
         f"For each chapter listed in {job / 'outline.json'}, use these text inputs:\n"
         "inputs/CHAPTER_ID/context.json, inputs/response-schema.json, and\n"
@@ -513,6 +497,27 @@ def export_handoff(job: Path, evidence: dict, outline: dict, *, contexts: dict |
         "Save its JSON response as CHAPTER_ID.json in a replies directory.\n"
         f"Import using: shad-helper notes {job} --import replies/\n",
         encoding="utf-8")
+    return folder
+
+
+@timed_step("handoff_export")
+def export_handoff(job: Path, evidence: dict, outline: dict, *, contexts: dict | None = None) -> Path:
+    check_job(job)
+    validate_evidence(evidence)
+    inputs = job / "handoff" / "inputs"
+    if inputs.exists():
+        shutil.rmtree(inputs)
+    folder = prepare_handoff(job, outline)
+    for chapter in outline["chapters"]:
+        part = inputs / chapter["id"]
+        part.mkdir(exist_ok=True)
+        context = chapter_context(evidence, chapter)
+        payload = (contexts or {}).get(chapter["id"])
+        if payload is None:
+            payload = _model_context(context, outline, outline["glossary"])
+        write_json(part / "context.json", payload)
+        (part / "prompt.txt").write_text(INSTRUCTIONS, encoding="utf-8")
+        _export_images(job, evidence, payload, part)
     return folder
 
 
@@ -538,6 +543,7 @@ def _validate_chapter_reply(reply: dict, evidence: dict, chapter: dict,
     return notes
 
 
+@request_operation("drafting")
 def _generate_chapter(client, text: str, evidence: dict, chapter: dict,
                       resolutions: dict, requests: Path, *, job: Path | None = None,
                       previous: list[dict] | None = None) -> dict:
@@ -579,9 +585,10 @@ def _generate_chapter(client, text: str, evidence: dict, chapter: dict,
                     or isinstance(exc, RenderError) and not isinstance(exc, LatexCompilationError)):
                 raise
             delay = 5 * 2 ** attempt
+            notes_phase(f"retry {attempt + 1}/3")
             print(f"Notes chapter {chapter['id']} failed: {exc}\n"
                   f"Retrying {chapter['id']} ({attempt + 1}/3) in {delay} seconds.", flush=True)
-            time.sleep(delay)
+            retry_delay(delay, time.sleep)
         finally:
             if isinstance(client, PlanClient):
                 client.request_recorder = recorder
@@ -694,17 +701,141 @@ def _bounded_outline(evidence: dict, outline: dict, *, job: Path | None = None) 
     return validate_outline(dict(outline, chapters=chapters), evidence)
 
 
+def reset_notes(job):
+    remove_artifacts(job, (
+        "checkpoints/chapter-pipeline", "checkpoints/notes", "checkpoints/notes_candidates",
+        "checkpoints/notes_final",
+        "handoff", "notes", "notes.json", "review.json", "outline.json",
+        "illustration-crops", "illustration-verification", "illustration-stitches",
+    ))
+
+
+def require_content(evidence):
+    from .illustrations import illustration_index
+
+    speech = any(segment["text"].strip() for segment in evidence["segments"])
+    visual_content = any(
+        visual["status"] == "complete" and (
+            visual["text"].strip() or any(formula.strip() for formula in visual["formulas"])
+            or any(diagram["description"].strip()
+                   or any(label.strip() for label in diagram["labels"])
+                   or any(relation.strip() for relation in diagram["relationships"])
+                   for diagram in visual["diagrams"]))
+        for visual in evidence.get("visuals", []))
+    if not speech and not visual_content and not illustration_index(evidence):
+        raise ValueError("No speech or readable visual content was extracted; inspect the sources before generating notes.")
+
+
+def load_outline(job, evidence):
+    outline_file = job / "outline.json"
+    if outline_file.exists():
+        saved_outline = read_json(outline_file)
+        chapters = saved_outline.get("chapters", [])
+        start, end = lecture_bounds(evidence)
+        if (chapters and (chapters[0].get("start") != start
+                          or chapters[-1].get("end") != end)):
+            print("Extracted interval changed; rebuilding the outline for current evidence.")
+            outline = default_outline(evidence)
+        else:
+            outline = validate_outline(saved_outline, evidence)
+    else:
+        outline = default_outline(evidence)
+    return outline
+
+
+def clear_handoff(handoff):
+    for name in ("inputs", "requests", "verification", "figure-reconciliation"):
+        folder = handoff / name
+        if folder.exists():
+            shutil.rmtree(folder)
+    for name in ("chapters.json", "outline.json", "status.json", "README.txt"):
+        (handoff / name).unlink(missing_ok=True)
+
+
+class ChapterDrafts:
+    def __init__(self, job, outline, client, resolutions, contexts):
+        self.job = job
+        self.outline = outline
+        self.client = client
+        self.resolutions = resolutions
+        self.contexts = contexts
+        self.glossary = list(outline["glossary"])
+        self.topics = {}
+        self.status = {}
+
+    def generate(self, evidence, chapter, *, previous):
+        """Return the accepted draft, or persist two children for the caller to visit."""
+        from .auth import PlanAccessError
+        from .illustrations import illustration_index
+        from .openai_client import DEFAULT_REASONING_EFFORT, ResponseError
+        from .schemas import LectureNotes
+
+        job, outline, client = self.job, self.outline, self.client
+        handoff = job / "handoff"
+        context = chapter_context(evidence, chapter)
+        if illustration_index(context):
+            context["prior_illustrations"] = _prior_illustrations(previous, evidence)
+        topics = list(self.topics.values())
+        reason = _chapter_budget_error(context, outline, self.glossary, topics,
+                                      job=job, evidence=evidence)
+        if reason:
+            return self.split(chapter, reason)
+        text = _chapter_prompt(context, outline, self.glossary, topics)
+        self.contexts[chapter["id"]] = json.loads(text)
+        inputs = handoff / "inputs" / chapter["id"]
+        write_json(inputs / "context.json", self.contexts[chapter["id"]])
+        (inputs / "prompt.txt").write_text(INSTRUCTIONS, encoding="utf-8")
+        _export_images(job, evidence, context, inputs)
+        requests = handoff / "requests" / chapter["id"]
+        stage = "notes_candidates" if _context_illustrations(context) else "notes"
+        try:
+            part = checkpoint(job, f"{stage}/{chapter['id']}", {
+                "context": context, "prompt": text, "instructions": INSTRUCTIONS,
+                "model": client.model, "reasoning_effort": DEFAULT_REASONING_EFFORT,
+                "latex_validation": 1, "illustration_policy": 2,
+                "images": [{"label": label, "sha256": sha256_file(path)}
+                           for label, path in _chapter_images(job, evidence, context)],
+                "schema": LectureNotes.model_json_schema()},
+                lambda: _generate_chapter(client, text, evidence, chapter, self.resolutions,
+                                          requests, job=job, previous=previous))
+        except (PlanAccessError, ResponseError) as exc:
+            if getattr(exc, "code", None) != "context_length_exceeded":
+                raise
+            return self.split(chapter, "model context limit reached")
+        self.status[chapter["id"]] = "generated" if requests.exists() else "cached"
+        write_json(handoff / "chapters.json", self.status)
+        terms = {entry["term"]: entry for entry in self.glossary}
+        terms.update({entry["term"]: entry for entry in part["glossary"]})
+        self.glossary = list(terms.values())
+        for block in part["chapters"][0]["blocks"]:
+            topic = " ".join(block.get("topic", "").split())
+            if topic:
+                self.topics.setdefault(topic.casefold(), topic)
+        return part
+
+    def split(self, chapter, reason):
+        children = _split_chapter(chapter)
+        if not children:
+            raise ValueError(f"Chapter {chapter['id']}: {reason}; further time splitting "
+                             "cannot safely reduce this evidence. No evidence was omitted.")
+        print(f"Splitting notes chapter {chapter['id']}: {reason}.")
+        chapters = self.outline["chapters"]
+        position = chapters.index(chapter)
+        chapters[position:position + 1] = children
+        write_json(self.job / "outline.json", self.outline)
+        write_json(self.job / "handoff" / "outline.json", self.outline)
+        parent_inputs = self.job / "handoff" / "inputs" / chapter["id"]
+        if parent_inputs.exists():
+            shutil.rmtree(parent_inputs)
+
+
 @record_run("notes")
 def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
                    manual: bool = False, client=None, rebuild: bool = False,
                    proxy: str | None = None) -> Path:
     job = Path(job).resolve()
     if rebuild:
-        remove_artifacts(job, (
-            "checkpoints/notes", "checkpoints/notes_candidates", "checkpoints/notes_final",
-            "handoff", "notes", "notes.json", "review.json", "outline.json",
-            "illustration-crops", "illustration-verification", "illustration-stitches",
-        ))
+        reset_notes(job)
     check_job(job)
     handoff = job / "handoff"
     info = {"mode": "manual" if manual else "import" if imported else "automatic",
@@ -725,8 +856,7 @@ def generate_notes(job: Path, state_dir: Path, *, imported: Path | None = None,
 
 def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
                manual: bool, client, proxy: str | None) -> Path:
-    from .rendering import RenderError, write_project
-    from .schemas import LectureNotes
+    from .rendering import RenderError
 
     evidence = validate_evidence(read_json(job / "evidence.json"))
     from .extraction import assert_extraction_complete
@@ -736,32 +866,11 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
 
     if evidence["schema_version"] == 4:
         print("Legacy video evidence has no illustration crops; re-extract to enable illustration coverage.")
-    speech = any(segment["text"].strip() for segment in evidence["segments"])
-    visual_content = any(
-        visual["status"] == "complete" and (
-            visual["text"].strip() or any(formula.strip() for formula in visual["formulas"])
-            or any(diagram["description"].strip()
-                   or any(label.strip() for label in diagram["labels"])
-                   or any(relation.strip() for relation in diagram["relationships"])
-                   for diagram in visual["diagrams"]))
-        for visual in evidence.get("visuals", []))
-    if not speech and not visual_content and not illustration_index(evidence):
-        raise ValueError("No speech or readable visual content was extracted; inspect the sources before generating notes.")
+    require_content(evidence)
     resolutions_file = job / "review-resolutions.json"
     resolutions = read_json(resolutions_file) if resolutions_file.exists() else {}
     outline_file = job / "outline.json"
-    if outline_file.exists():
-        saved_outline = read_json(outline_file)
-        chapters = saved_outline.get("chapters", [])
-        start, end = lecture_bounds(evidence)
-        if (chapters and (chapters[0].get("start") != start
-                          or chapters[-1].get("end") != end)):
-            print("Extracted interval changed; rebuilding the outline for current evidence.")
-            outline = default_outline(evidence)
-        else:
-            outline = validate_outline(saved_outline, evidence)
-    else:
-        outline = default_outline(evidence)
+    outline = load_outline(job, evidence)
     if not imported:
         outline = _bounded_outline(evidence, outline, job=job)
     write_json(outline_file, outline)
@@ -772,12 +881,7 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
         # Imported replies can be previous request diagnostics that cleanup replaces.
         replies = ([read_json(imported)] if complete_import else
                    [read_json(imported / f"{c['id']}.json") for c in outline["chapters"]])
-    for name in ("inputs", "requests", "verification", "figure-reconciliation"):
-        folder = handoff / name
-        if folder.exists():
-            shutil.rmtree(folder)
-    for name in ("chapters.json", "outline.json", "status.json", "README.txt"):
-        (handoff / name).unlink(missing_ok=True)
+    clear_handoff(handoff)
     contexts = {}
     if not imported:
         handoff = export_handoff(job, evidence, outline, contexts=contexts)
@@ -831,75 +935,20 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
         export_handoff(job, evidence, outline, contexts=contexts)
     else:
         from .auth import PlanAccessError
-        from .openai_client import DEFAULT_REASONING_EFFORT, PlanClient, ResponseError
+        from .openai_client import PlanClient, ResponseError
 
         try:
             client = client or PlanClient(state_dir, proxy=proxy)
+            drafts = ChapterDrafts(job, outline, client, resolutions, contexts)
             parts = []
-            chapter_status = {}
-            glossary = list(outline["glossary"])
-            topics = {}
             position = 0
             while position < len(outline["chapters"]):
                 chapter = outline["chapters"][position]
-                context = chapter_context(evidence, chapter)
-                if illustration_index(context):
-                    context["prior_illustrations"] = _prior_illustrations(parts, evidence)
-                reason = _chapter_budget_error(context, outline, glossary, list(topics.values()),
-                                              job=job, evidence=evidence)
-                if reason:
-                    split = _split_chapter(chapter)
-                    if not split:
-                        raise ValueError(f"Chapter {chapter['id']}: {reason}; further time splitting "
-                                         "cannot safely reduce this evidence. No evidence was omitted.")
-                    outline["chapters"][position:position + 1] = split
-                    write_json(outline_file, outline)
+                part = drafts.generate(evidence, chapter, previous=parts)
+                if part is None:
                     export_handoff(job, evidence, outline, contexts=contexts)
                     continue
-                text = _chapter_prompt(context, outline, glossary, list(topics.values()))
-                contexts[chapter["id"]] = json.loads(text)
-                inputs = handoff / "inputs"
-                write_json(inputs / chapter["id"] / "context.json", contexts[chapter["id"]])
-                _export_images(job, evidence, context, inputs / chapter["id"])
-                requests = handoff / "requests" / chapter["id"]
-                illustrated = bool(_context_illustrations(context))
-                try:
-                    stage = "notes_candidates" if illustrated else "notes"
-                    part = checkpoint(job, f"{stage}/{chapter['id']}",
-                        {"context": context, "prompt": text, "instructions": INSTRUCTIONS,
-                         "model": client.model,
-                         "reasoning_effort": DEFAULT_REASONING_EFFORT,
-                         "latex_validation": 1,
-                         "illustration_policy": 2,
-                         "images": [{"label": label, "sha256": sha256_file(path)}
-                                    for label, path in _chapter_images(job, evidence, context)],
-                         "schema": LectureNotes.model_json_schema()},
-                        lambda requests=requests, text=text, chapter=chapter: _generate_chapter(
-                            client, text, evidence, chapter, resolutions, requests,
-                            job=job, previous=parts))
-                except (PlanAccessError, ResponseError) as exc:
-                    if getattr(exc, "code", None) != "context_length_exceeded":
-                        raise
-                    split = _split_chapter(chapter)
-                    if not split:
-                        raise ValueError(f"Chapter {chapter['id']} still exceeds the model context "
-                                         "at the minimum split duration. No evidence was omitted.") from exc
-                    print(f"Context limit reached; splitting notes chapter {chapter['id']}.", flush=True)
-                    outline["chapters"][position:position + 1] = split
-                    write_json(outline_file, outline)
-                    export_handoff(job, evidence, outline, contexts=contexts)
-                    continue
-                chapter_status[chapter["id"]] = "generated" if requests.exists() else "cached"
-                write_json(handoff / "chapters.json", chapter_status)
                 parts.append(part)
-                terms = {g["term"]: g for g in glossary}
-                terms.update({g["term"]: g for g in part["glossary"]})
-                glossary = list(terms.values())
-                for result_chapter in part["chapters"]:
-                    for block in result_chapter["blocks"]:
-                        topic = " ".join(block.get("topic", "").split())
-                        if topic:
-                            topics.setdefault(topic.casefold(), topic)
                 position += 1
             notes = _merge_chapters(parts, outline, evidence, resolutions)
             if illustration_index(evidence):
@@ -921,8 +970,15 @@ def _run_notes(job: Path, state_dir: Path, *, imported: Path | None,
     notes = validate_notes(notes, evidence, resolutions, finalized=True)
     write_json(handoff / "figure-reconciliation" / "status.json", {
         "attempts": attempt + 1, "retry_needed": retry_needed})
+    return publish_notes(job, outline, notes)
+
+
+def publish_notes(job, outline, notes):
+    from .rendering import write_project
+
+    handoff = job / "handoff"
     (handoff / "status.json").unlink(missing_ok=True)
-    write_json(outline_file, outline)
+    write_json(job / "outline.json", outline)
     write_json(job / "notes.json", notes)
     write_json(job / "review.json", {"issues": notes["issues"], "ready": review_ready(notes)})
     return write_project(job, notes)

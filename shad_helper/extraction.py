@@ -1,6 +1,8 @@
 """Resumable local speech and video extraction in sequential model processes."""
 
+import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -8,6 +10,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+from threading import Thread
 
 from .illustrations import materialize_illustrations
 from .jobs import (
@@ -176,14 +179,57 @@ def _worker(out: Path, request: dict) -> dict:
 
 
 @timed_step("visual_extraction")
-def _vision_worker(out: Path, request: dict) -> dict:
+def _vision_worker(out: Path, request: dict, *, on_batch=None, log=None, on_status=None) -> dict:
     request = {"job": str(out.resolve()), **request}
     request_path = out / "workers" / "vision.request.json"
     response_path = out / "workers" / "vision.response.json"
     write_json(request_path, request)
-    subprocess.run([sys.executable, "-m", "shad_helper.vision_worker",
-                    "--request", str(request_path), "--output", str(response_path)], check=True)
+    command = [sys.executable, "-m", "shad_helper.vision_worker",
+               "--request", str(request_path), "--output", str(response_path)]
+    if on_batch is None:
+        subprocess.run(command, check=True)
+    else:
+        _stream_vision(command, on_batch, log, on_status)
     return read_json(response_path)
+
+
+def _stream_vision(command, on_batch, log, on_status=None):
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, encoding="utf-8") as events:
+        try:
+            process = subprocess.Popen([*command, "--events-fd", str(write_fd)],
+                                       pass_fds=(write_fd,), stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True, errors="replace",
+                                       env={**os.environ, "PYTHONUNBUFFERED": "1", "TQDM_DISABLE": "1",
+                                            "HF_HUB_DISABLE_PROGRESS_BARS": "1"})
+        finally:
+            os.close(write_fd)
+
+        def drain_logs():
+            for line in process.stdout:
+                log(line.rstrip("\r\n"))
+
+        logs = Thread(target=drain_logs, name="vision-output")
+        logs.start()
+        try:
+            for line in events:
+                event = json.loads(line)
+                if isinstance(event, list):
+                    on_batch(event)
+                elif on_status:
+                    on_status(event["phase"], event["frame"])
+            if code := process.wait():
+                raise subprocess.CalledProcessError(code, command)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            logs.join()
+            process.stdout.close()
 
 
 @timed_step("audio_preparation")
@@ -212,7 +258,8 @@ def _audio_chunks(media: Path, out: Path, start: float, end: float, media_hash: 
 @record_run("extract", job_argument="out")
 def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
             duration: float | None = None, asr_model: str = ASR_MODEL,
-            vision_model: str = DEFAULT_VISION_MODEL, vision_mode: str = "frames") -> Path:
+            vision_model: str = DEFAULT_VISION_MODEL, vision_mode: str = "frames",
+            chapters=None) -> Path:
     total_started = time.monotonic()
     media, out = Path(media).resolve(), Path(out).resolve()
     if vision_model != "off" and vision_model not in VISION_MODELS:
@@ -285,35 +332,50 @@ def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
         try:
             selection = select_frames(media, out, start, end, media_hash, metadata=video_metadata)
             diagnostics["selection"] = selection["diagnostics"]
-            visual_result = (_vision_worker(out, {**model, "mode": vision_mode,
-                                                 "items": selection["items"]})
-                             if selection["items"] else {"items": [], "diagnostics": {
-                                 "status": "no_frames", "fresh_items": 0, "cached_items": 0}})
-            visuals = []
-            illustrations = materialize_illustrations(out, visual_result["items"])
-            for item in visual_result["items"]:
-                status = item["diagnostics"]["status"]
-                content = {**item["content"]}
-                content["illustrations"] = illustrations[item["id"]]
-                if status == "incomplete":
-                    # Failure explanations stay local; the clean status is sufficient evidence.
-                    content["unreadable"] = []
-                    descriptions = ["Не удалось получить корректное описание кадра."]
-                else:
+            visuals, assets = [], {}
+            request = {**model, "mode": vision_mode, "items": selection["items"]}
+            if chapters is not None:
+                chapters.start(evidence, request)
+
+            def accept(batch):
+                crops = materialize_illustrations(out, batch, assets=assets)
+                clean = []
+                for item in batch:
+                    status = item["diagnostics"]["status"]
+                    content = {**item["content"], "illustrations": crops[item["id"]]}
                     descriptions = content["unreadable"]
-                visuals.append({"id": item["id"], "timestamp": item["timestamp"],
-                                "status": status, **content})
-                for description in descriptions:
-                    diagnostics["warnings"].append({
-                        "id": f"issue_{len(diagnostics['warnings']):04d}",
-                        "description": description, "evidence_ids": [item["id"]],
-                    })
+                    if status == "incomplete":
+                        content["unreadable"] = []
+                        descriptions = ["Не удалось получить корректное описание кадра."]
+                    clean.append({"id": item["id"], "timestamp": item["timestamp"],
+                                  "status": status, **content})
+                    for description in descriptions:
+                        diagnostics["warnings"].append({
+                            "id": f"issue_{len(diagnostics['warnings']):04d}",
+                            "description": description, "evidence_ids": [item["id"]]})
+                visuals.extend(clean)
+                if chapters is not None:
+                    chapters.accept(clean, assets)
+
+            if not selection["items"]:
+                accept([])
+                visual_result = {"items": [], "diagnostics": {
+                    "status": "no_frames", "fresh_items": 0, "cached_items": 0}}
+            elif chapters is None:
+                visual_result = _vision_worker(out, request)
+                accept(visual_result["items"])
+            else:
+                visual_result = _vision_worker(out, request, on_batch=accept, log=chapters.progress.log,
+                                              on_status=chapters.vision_status)
+            if [item["id"] for item in visuals] != [item["id"] for item in selection["items"]]:
+                raise ValueError("Vision worker did not complete the selected frames in order")
+            write_json(out / "illustrations" / "manifest.json", {"version": 1, "assets": assets})
             evidence.update(schema_version=VIDEO_EVIDENCE_VERSION, visuals=visuals)
             diagnostics["vision"] = visual_result["diagnostics"]
             diagnostics["visuals"] = [{key: value for key, value in item.items() if key != "content"}
                                       for item in visual_result["items"]]
             diagnostics["evidence_fingerprint"] = fingerprint(evidence)
-        except Exception as error:
+        except BaseException as error:
             diagnostics["vision"] = {"status": "failed", "error": str(error)}
             write_json(out / "extraction-status.json", {**extraction_status, "state": "failed",
                                                        "error": str(error)})
