@@ -75,11 +75,13 @@ Bind readiness to the media, clip, plan, selection, vision settings and exact fr
 During overlap, the parent process owns two fixed `tqdm` rows on interactive stderr. Each row shows the worker, base chapter number and total chapters, and its current activity. A split adds the child label to the notes row. While notes are two chapters behind, the terminal might show
 
 ```text
-Vision  ch004  4/12          [██████░░░░]  60/100 frames
-Notes   ch002  2/12  part b  [████░░░░░░]   7/18 observations · coverage
+Vision  ch004  4/12 [chapter 02:15 | total 09:42] |██████    | 60/100 frames inspecting
+Notes  ch002  2/12  part 2/2 [chapter 01:08 | total 04:36] drafting (ch002_b_12345678)
 ```
 
-Count newly assigned vision frames once, including cache hits. A completed video batch advances by its frame count. For notes, show the phase and its completed units when known. A pending GPT response shows the drafting phase and elapsed time. Show waiting, retry, manual handoff and completion on the corresponding row. Leave the notes failure visible while the vision row advances.
+Each worker tracks its own elapsed time. `chapter` counts time spent processing the current base chapter, including retries and all split parts. `total` adds that time across chapters in the current lecture. While the notes worker waits for vision, its next chapter shows `00:00` and its total holds. The row keeps its final times when the worker finishes or stops for manual input.
+
+Count newly assigned vision frames once, including cache hits. A completed video batch advances by its frame count. For notes, show the phase and its completed units when known. A pending GPT response shows the drafting phase and its clocks keep running. Show waiting, retry, manual handoff and completion on the corresponding row. Leave the notes failure visible while the vision row advances.
 
 Use a dedicated event channel for progress. Route stdout, stderr, retry messages and subprocess logs through the parent during overlap. Print each log line once above the fixed rows and redraw them under the same terminal lock. Disable nested worker and verification bars in this mode. In redirected output, emit plain chapter and phase transitions plus warnings and errors. Attribute both workers' timings to the coordinator's combined job report and propagate the command's usage-accounting context to the notes thread. [Existing progress loops](../shad_helper/vision_worker.py#L278) · [Run diagnostics](../shad_helper/run_diagnostics.py) · [Request accounting](../shad_helper/openai_usage.py)
 

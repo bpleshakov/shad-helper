@@ -4,6 +4,8 @@ import json
 import os
 import pty
 import sys
+from contextlib import closing
+from io import StringIO
 from threading import Event, Thread, get_ident
 from unittest.mock import Mock
 
@@ -11,7 +13,13 @@ import pytest
 from PIL import Image
 
 from shad_helper import chapter_pipeline, extraction, notes, pipeline, rendering, vision_worker
-from shad_helper.chapter_progress import ChapterProgress
+from shad_helper.chapter_progress import (
+    ChapterCancelled,
+    ChapterProgress,
+    NotesCancellation,
+    notes_display,
+    notes_phase,
+)
 from shad_helper.jobs import read_json, sha256_file, write_json
 from shad_helper.openai_client import ResponseError
 from shad_helper.openai_usage import command_usage, track_request
@@ -154,6 +162,8 @@ def test_vision_finishes_while_first_notes_job_is_blocked(lecture, monkeypatch, 
     assert report["generation_requests"] == {"drafting": 3}
     assert 0 < report["chapter_worker_overlap_seconds"] < report["elapsed_seconds"]
     output = capsys.readouterr().err
+    summary = "Video frame filtering complete — 0 removed, 6 remaining for vision."
+    assert output.index(summary) < min(output.index("Vision  ch001"), output.index("Notes  ch001"))
     assert "Vision  ch001  1/3" in output and "Notes  ch002  2/3" in output
     assert "\x1b" not in output
     # Compare the actual prompts, attachment hashes and final content with standalone notes.
@@ -250,6 +260,95 @@ def test_two_rows_and_child_logs_over_dedicated_pipe():
         assert "Vision  ch002" in output and "Notes  ch001" in output and "\x1b[A" in output
     finally:
         os.close(master)
+
+
+@pytest.fixture
+def timed_progress(monkeypatch):
+    terminal = StringIO()
+    monkeypatch.setattr(terminal, "isatty", lambda: True)
+    clock = Mock(return_value=0.0)
+    monkeypatch.setattr("shad_helper.chapter_progress.monotonic", clock)
+    with closing(ChapterProgress(terminal)) as progress:
+        progress.start()
+        yield progress, clock
+
+
+@pytest.mark.parametrize("outcome", ["complete", "failed", "interrupted"])
+def test_vision_chapter_and_total_elapsed(timed_progress, outcome):
+    progress, clock = timed_progress
+    first, second = "ch001  1/2", "ch002  2/2"
+    vision = progress.rows["Vision"]
+
+    def show(seconds, chapter, phase, chapter_seconds, **counts):
+        clock.return_value = seconds
+        progress.update("Vision", chapter, phase, **counts)
+        line = str(vision)
+        assert f"[chapter 00:{chapter_seconds:02d} | total 00:{seconds:02d}]" in line
+        return line
+
+    show(0, first, "inspecting", 0, total=3, unit="frames")
+    assert "1/3 frames" in show(5, first, "inspecting", 5, done=1, total=3, unit="frames")
+    show(8, first, "cached f2", 8)
+    show(12, first, "retrying f3", 12)
+    assert "3/3 frames" in show(16, first, "inspecting", 16, done=3, total=3, unit="frames")
+    assert "0/2 frames" in show(16, second, "inspecting", 0, total=2, unit="frames")
+    finished = show(24, second, outcome, 8)
+    clock.return_value += 60
+    progress.update("Notes", second, "drafting")
+    progress.log("Notes still running")
+    assert str(vision) == finished
+
+
+@pytest.mark.parametrize("outcome", ["complete", "manual handoff"])
+def test_notes_elapsed_excludes_waits_and_keeps_split_parts_together(timed_progress, outcome):
+    progress, clock = timed_progress
+    first = "ch001  1/2"
+    second = "a" * 80 + "  2/2"
+    notes_row = progress.rows["Notes"]
+    progress.update("Vision", first, "inspecting")
+    progress.update("Notes", first, "waiting for vision")
+    clock.return_value = 10
+    assert "[chapter 00:00 | total 00:00]" in str(notes_row)
+    progress.update("Notes", first, "drafting")
+    clock.return_value = 16
+    part_one = first + "  part 1/2 (ch001_a_12345678)"
+    part_two = first + "  part 2/2 (ch001_b_12345678)"
+    progress.update("Notes", part_one, "retry 2/3")
+    assert "[chapter 00:06 | total 00:06]" in str(notes_row)
+    clock.return_value = 18
+    progress.update("Notes", part_one, "complete")
+    progress.update("Notes", part_two, "Illustration coverage", done=4, total=8, unit="observation")
+    clock.return_value = 25
+    line = str(notes_row)
+    assert "part 2/2" in line and "4/8 observation" in line and "coverage" in line
+    assert "[chapter 00:15 | total 00:15]" in line
+    assert "[chapter 00:25 | total 00:25]" in str(progress.rows["Vision"])
+
+    progress.update("Notes", part_two, "complete")
+    progress.update("Notes", second, "waiting for vision")
+    clock.return_value = 45
+    assert "[chapter 00:00 | total 00:15]" in str(notes_row)
+    progress.update("Notes", second, "drafting")
+    clock.return_value += 3602
+    assert "2/2" in str(notes_row) and "[chapter 1:00:02 | total 1:00:17]" in str(notes_row)
+    progress.update("Notes", second, outcome)
+    finished = str(notes_row)
+    clock.return_value += 60
+    progress.update("Vision", second, "inspecting")
+    progress.log("Vision still running")
+    assert str(notes_row) == finished
+
+
+def test_cancelled_notes_request_stops_its_clocks(timed_progress):
+    progress, clock = timed_progress
+    cancel = NotesCancellation()
+    with pytest.raises(ChapterCancelled), notes_display(progress, "ch001  1/2", cancel):
+        notes_phase("drafting")
+        clock.return_value = 15
+        cancel.set()
+        notes_phase("checking LaTeX")
+    clock.return_value = 90
+    assert "[chapter 00:15 | total 00:15]" in str(progress.rows["Notes"])
 
 
 def test_clip_plan_carries_last_slide_and_releases_empty_short_chapter():

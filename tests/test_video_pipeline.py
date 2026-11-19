@@ -226,10 +226,11 @@ def test_default_audio_or_attached_cover_stays_audio_only(pipeline, monkeypatch,
 ORIGINAL_PROBE_VIDEO = video.probe_video
 
 
-def test_video_without_frames_keeps_v5_without_loading_vision(pipeline, monkeypatch):
+def test_video_without_frames_keeps_v5_without_loading_vision(pipeline, monkeypatch, capsys):
     monkeypatch.setattr(extraction, "select_frames", lambda *args, **kwargs: {
         "items": [], "diagnostics": {"selected_frames": 0, "proxy_frames": 0}})
     evidence = run(pipeline)
+    assert "Video frame filtering complete — 0 removed, 0 remaining for vision." in capsys.readouterr().err
     assert evidence["schema_version"] == 5
     assert evidence["visuals"] == []
     assert read_json(pipeline.job / "extraction-config.json")["vision_model"] == "35b"
@@ -317,7 +318,7 @@ def test_board_regions_reduce_native_retrieval_and_inference_and_resume(pipeline
     pipeline.scan.assert_called_once()
 
 
-def test_novelty_filter_skips_inference_for_lecturer_motion_and_resumes(pipeline, monkeypatch):
+def test_novelty_filter_skips_inference_for_lecturer_motion_and_resumes(pipeline, monkeypatch, capsys):
     frames = []
     for step in range(80):
         gray = np.full((240, 400), 240, np.uint8)
@@ -340,6 +341,8 @@ def test_novelty_filter_skips_inference_for_lecturer_motion_and_resumes(pipeline
     candidates, _ = video._select_proxy_frames(frames)
     assert len(candidates) > 1
     evidence = read_json(extraction.extract(pipeline.media, pipeline.job, start=105, duration=40))
+    summary = f"Video frame filtering complete — {len(candidates) - 1} removed, 1 remaining for vision."
+    assert capsys.readouterr().err.splitlines().count(summary) == 1
     assert len(evidence["visuals"]) == 1
     pipeline.runtime.infer.assert_called_once()
     # Native candidates remain available for inspection even when inference is skipped.
@@ -348,6 +351,7 @@ def test_novelty_filter_skips_inference_for_lecturer_motion_and_resumes(pipeline
     assert selection["novelty"]["suppressed_frames"] == len(candidates) - 1
     assert read_json(extraction.extract(pipeline.media, pipeline.job,
                                         start=105, duration=40)) == evidence
+    assert capsys.readouterr().err.splitlines().count(summary) == 1
     assert read_json(pipeline.job / "extraction-diagnostics.json")["selection"]["novelty"]["cache_hit"]
     pipeline.runtime.infer.assert_called_once()
     factory.assert_called_once()

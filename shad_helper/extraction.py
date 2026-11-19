@@ -332,6 +332,9 @@ def extract(media: Path, out: Path, *, language: str = "ru", start: float = 0.0,
         try:
             selection = select_frames(media, out, start, end, media_hash, metadata=video_metadata)
             diagnostics["selection"] = selection["diagnostics"]
+            removed = selection["diagnostics"].get("novelty", {}).get("suppressed_frames", 0)
+            print(f"Video frame filtering complete — {removed} removed, "
+                  f"{len(selection['items'])} remaining for vision.", file=sys.stderr, flush=True)
             visuals, assets = [], {}
             request = {**model, "mode": vision_mode, "items": selection["items"]}
             if chapters is not None:

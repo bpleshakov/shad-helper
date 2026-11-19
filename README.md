@@ -61,8 +61,9 @@ Files run in the supplied order. For video, one Qwen worker inspects selected fr
 while one GPT worker drafts and verifies ready chapters in lecture order. Each chapter
 includes its neighboring evidence. For a first chapter ending at 15:00, notes can start
 when the selected frames through 16:00 and their crops are ready. Interactive terminals
-show one row per worker with the current chapter and activity. Redirected output records
-chapter and phase transitions. Audio-only runs proceed from transcription to notes.
+show each worker's current chapter, activity, and elapsed processing time for the chapter
+and the lecture so far. Redirected output records chapter and phase transitions.
+Audio-only runs proceed from transcription to notes.
 
 Once all chapters and extraction finish, the pipeline renders `JOB/notes/main.pdf` and
 generates `JOB/anki/deck.apkg`. If a notes chapter needs manual input, Qwen finishes the
