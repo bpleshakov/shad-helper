@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .jobs import read_json, sha256_file
 from .rendering import render_diagram_preview
+from .schemas import FIGURE_KINDS
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}\Z")
 
@@ -26,7 +27,7 @@ def load_figure_assets(job: Path, sources: dict | None) -> dict[str, dict]:
         return {}
     blocks = sources["blocks"]
     has_figures = any(block.get("illustration_id") or block.get("figure_asset")
-                      or block.get("kind") in {"diagram", "screenshot"}
+                      or block.get("kind") in FIGURE_KINDS
                       for block in blocks.values())
     if not (job / "notes/project.json").exists() and not has_figures:
         return {}
@@ -34,7 +35,8 @@ def load_figure_assets(job: Path, sources: dict | None) -> dict[str, dict]:
     if manifest.get("version") != 2:
         raise ValueError("Unsupported notes project for figure export")
     declared = {"diagram": set(manifest.get("tex_files", [])),
-                "screenshot": set(manifest.get("image_files", []))}
+                "screenshot": set(manifest.get("image_files", [])),
+                "illustration": set(manifest.get("image_files", []))}
     project_blocks = {block["id"]: block for block in manifest.get("source_blocks", [])}
     assets = {}
     for identifier, block in blocks.items():
@@ -44,12 +46,14 @@ def load_figure_assets(job: Path, sources: dict | None) -> dict[str, dict]:
         if illustration_id and not _ID.fullmatch(illustration_id):
             raise ValueError("Invalid illustration ID")
         expected = {"diagram": f"figures/diagram-{identifier}.tex"}
-        if illustration_id:
+        if block.get("kind") == "illustration":
+            expected = {"illustration": f"figures/generated-{identifier}.png"}
+        elif illustration_id:
             image_id = identifier if block.get("illustration_crop_id") else illustration_id
             expected["screenshot"] = f"figures/illustration-{image_id}.png"
         candidates = [(kind, path) for kind, path in expected.items() if path in declared[kind]]
         is_figure = (illustration_id or block.get("figure_asset")
-                     or block.get("kind") in {"diagram", "screenshot"})
+                     or block.get("kind") in FIGURE_KINDS)
         if not candidates and not is_figure:
             continue
         if len(candidates) != 1:
@@ -72,7 +76,7 @@ def load_figure_assets(job: Path, sources: dict | None) -> dict[str, dict]:
         assets[identifier] = {"block_id": identifier, "kind": kind,
                               "path": relative, "sha256": digest,
                               **{key: block[key] for key in
-                                 ("illustration_id", "illustration_crop_id") if block.get(key)}}
+                                 ("illustration_id", "illustration_crop_id", "generated_image_id") if block.get(key)}}
     return assets
 
 
@@ -88,7 +92,7 @@ def export_figure(job: Path, descriptor: dict, staging_dir: Path) -> Path:
     if descriptor["kind"] == "diagram":
         return render_diagram_preview(path.read_text(encoding="utf-8"),
                                       staging_dir / f"diagram-{digest}")
-    if descriptor["kind"] != "screenshot":
+    if descriptor["kind"] not in {"screenshot", "illustration"}:
         raise ValueError("Unsupported figure asset kind")
     import pymupdf
 

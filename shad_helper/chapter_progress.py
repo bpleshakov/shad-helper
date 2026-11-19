@@ -189,19 +189,23 @@ class NotesCancellation(Event):
     def __init__(self):
         super().__init__()
         self.lock = RLock()
-        self.client = None
+        self.interrupt = None
 
     def set(self):
         with self.lock:
             super().set()
-            client = self.client
-        if client is not None:
-            client.close()
+            interrupt = self.interrupt
+        if interrupt is not None:
+            interrupt()
+
+
+def notes_connection(client):
+    return cancel_on_interrupt(client.close)
 
 
 @contextmanager
-def notes_connection(client):
-    """Let the extraction owner close an active HTTP request during cancellation."""
+def cancel_on_interrupt(interrupt):
+    """Let the extraction owner interrupt a blocking notes request."""
     active = _active.get()
     if active is None:
         yield
@@ -210,12 +214,12 @@ def notes_connection(client):
     with cancel.lock:
         if cancel.is_set():
             raise ChapterCancelled
-        cancel.client = client
+        cancel.interrupt = interrupt
     try:
         yield
     finally:
         with cancel.lock:
-            cancel.client = None
+            cancel.interrupt = None
 
 
 def check_cancelled():

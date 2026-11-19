@@ -32,7 +32,11 @@ from .jobs import (
     verification_files,
     write_json,
 )
-from .openai_client import DEFAULT_REASONING_EFFORT, PlanClient, ResponseError
+from .openai_client import (
+    DEFAULT_REASONING_EFFORT,
+    PlanClient,
+    ResponseError,
+)
 from .rendering import RenderError, validate_chapter_latex
 from .run_diagnostics import timed_step
 
@@ -76,8 +80,8 @@ def chapter_plan(evidence, base, frames, batch_ends):
 def _policy():
     # Include changes to prompts, verification, retrieval and LaTeX checks on resume.
     modules = ("chapter_pipeline", "notes", "illustrations", "illustration_verification",
-               "illustration_crops", "crop_validation", "illustration_stitching",
-               "illustration_states", "illustration_matching", "rendering", "schemas")
+               "illustration_crops", "illustration_generation", "codex_images", "crop_validation",
+               "illustration_stitching", "illustration_states", "illustration_matching", "rendering", "schemas")
     return fingerprint([sha256_file(Path(__file__).with_name(name + ".py")) for name in modules])
 
 

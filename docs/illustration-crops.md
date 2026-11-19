@@ -51,11 +51,14 @@ The purpose is explicit and part of the cache key:
   mathematical geometry, relationships and labels remain observable. Occluded or
   missing mathematical content still fails.
 
-TikZ is rendered and compared independently to its verified source. A failed
-comparison or compilation gets one correction using the concrete defect, followed
-by another render and comparison. Only a pass accepts the reconstruction. A
-screenshot fallback must pass the stricter screenshot crop check separately;
-a crop accepted only for reconstruction cannot be reused directly for publication.
+For a hand-drawn figure, the image-generation tool receives the verified primary
+crop and up to three distinct views from its first continuous drawing interval.
+The request includes speech overlapping a 30-second margin around those observations
+and the selected frame, plus the exact speech segments cited by the figure block.
+A separate request checks the generated PNG against the same images and speech.
+It accepts changes in layout that preserve the teaching step. A failed or unavailable
+generation or check falls back to the stricter screenshot publication check.
+Explicitly imported TikZ diagrams retain their render-and-compare workflow.
 
 ## Publication, coverage and duplicates
 

@@ -17,6 +17,31 @@ _current_steps = ContextVar("run_diagnostic_steps", default=None)
 
 
 @contextmanager
+def record_requests(client, folder):
+    """Archive the exact requests for one model operation, including credential fallback."""
+    if not hasattr(client, "request_recorder"):
+        yield
+        return
+
+    def record(method, url, payload):
+        from .jobs import write_json
+
+        number = len(list(folder.glob("http-*.request.json"))) + 1
+        prefix = f"http-{number:03d}"
+        body_file = f"{prefix}.body.json" if payload is not None else None
+        if body_file:
+            (folder / body_file).write_bytes(payload)
+        write_json(folder / f"{prefix}.request.json", {"method": method, "url": url, "body": body_file})
+
+    previous = client.request_recorder
+    client.request_recorder = record
+    try:
+        yield
+    finally:
+        client.request_recorder = previous
+
+
+@contextmanager
 def request_operation(name):
     token = _request_kind.set(name)
     try:

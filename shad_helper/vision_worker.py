@@ -59,9 +59,12 @@ RETRY_PROMPT = r'''
 
 
 def parse_output(raw: str) -> dict:
-    """Accept exactly the evidence schema, optionally inside a single JSON fence."""
+    """Validate visual evidence, allowing an omitted list of unreadable regions."""
     fenced = re.fullmatch(r"\s*```(?:json)?\s*\n?(.*?)\n?```\s*", raw, re.DOTALL)
     content = json.loads(fenced.group(1) if fenced else raw)
+    unreadable_omitted = isinstance(content, dict) and "unreadable" not in content
+    if unreadable_omitted:
+        content["unreadable"] = []
     if (not isinstance(content, dict)
             or set(content) != {"kind", "text", "formulas", "diagrams", "illustrations", "unreadable"}
             or not isinstance(content["kind"], str)
@@ -86,6 +89,13 @@ def parse_output(raw: str) -> dict:
         raise ValueError("Invalid visual evidence illustrations")  # noqa: TRY004 - invalid wire format
     for illustration in content["illustrations"]:
         validate_illustration_observation(illustration)
+    if unreadable_omitted and content["kind"] == "whiteboard" and not content["illustrations"]:
+        # Keep an unlocalized drawing available for pixel inspection alongside the recovered text.
+        descriptions = [d["description"].strip() for d in content["diagrams"]
+                        if d["relationships"] and d["description"].strip()]
+        if descriptions:
+            content["illustrations"].append({"source_kind": "unknown", "box": [0, 0, 1, 1],
+                                             "description": " ".join(descriptions)})
     return content
 
 

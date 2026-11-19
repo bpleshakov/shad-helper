@@ -19,7 +19,7 @@ from .jobs import (
     validate_evidence,
     write_json,
 )
-from .run_diagnostics import record_run, request_operation, timed_step
+from .run_diagnostics import record_requests, record_run, request_operation, timed_step
 
 INSTRUCTIONS = r"""Ты составляешь компактный русский учебный конспект университетской лекции.
 Данные лекции переданы отдельным JSON-контекстом; схема задает формат ответа.
@@ -139,36 +139,36 @@ math — выражение LaTeX без \[\] и без $$; code — точны�
 математические подписи оформляй средствами LaTeX.
 В названиях лекции/глав, topic и caption описывай понятия словами, без формул.
 Обычный русский текст и пунктуацию сохраняй в UTF-8; точный код и его строки не меняй.
-diagram — полный tikzpicture, при необходимости с PGFPlots; никаких input,
+Для схемы без исходного изображения допустим diagram — полный tikzpicture, при необходимости с PGFPlots; никаких input,
 includegraphics, внешних файлов, shell-команд или Lua. Строй диаграммы только
 по явно описанным в источниках связям и подписям.
 Неизвестные данные графика не заменяй вымышленными: укажи schematic в подписи.
-Для source_kind=drawn восстанавливай рисунок как diagram по приложенному
-изображению, включая подписи, стрелки, оси и существенные взаимные положения.
+Для source_kind=drawn выбери kind=illustration. В content опиши, что происходит
+на рисунке и какую связь или шаг он объясняет. В evidence_ids включи исходный
+рисунок и ID реплик, в которых лектор объясняет его построение. По кадрам рисунка
+и этим словам отдельная модель создаст учебную иллюстрацию. Код TikZ не нужен.
 До выбора illustration_id сравни наблюдения одного рисунка во времени: выбери
 полный читаемый вид без рук и перекрытий. Обычное дорисовывание объединяй в один
 завершённый рисунок; самостоятельные учебные стадии сохраняй отдельно. Параметры,
 данные и смысл стадий должны совпадать; проекция может отставать от захвата экрана.
 При равном содержании предпочитай прямой захват экрана съёмке проектора.
 Для screenshot объясни в content конкретную учебную роль: какую связь, сравнение
-или шаг он показывает. Для diagram объясни это в caption или соседнем текстовом
-блоке; content оставь только для TikZ. Общая подпись «Иллюстрация к теме»
+или шаг он показывает. Общая подпись «Иллюстрация к теме»
 не заменяет объяснения. Фрагмент при прокрутке сам по себе не является новой стадией.
-Если точное восстановление сомнительно, используй screenshot исходного рисунка.
 Для source_kind=printed или unknown используй screenshot. Рукописные элементы
 на слайдах относятся к drawn. Не перерисовывай фотографии.
-В diagram и screenshot укажи illustration_id выбранного исходного изображения
-и включи его в evidence_ids. В screenshot content — краткое описание смысла,
+В illustration и screenshot укажи illustration_id выбранного исходного изображения
+и включи его в evidence_ids. В обоих случаях content — краткое описание смысла,
 caption — учебная подпись; путь и команды загрузки изображения добавит рендерер.
 Помещай рисунок рядом с абзацем, который его объясняет. В таком текстовом блоке
-задай figure_refs — список ID соответствующих блоков diagram/screenshot этой главы
+задай figure_refs — список ID соответствующих блоков с рисунками этой главы
 или prior_illustrations. Ссылайся на рисунки при объяснении их деталей и выводов,
 в том числе при повторном обращении к уже включённому рисунку. Не придумывай номера:
 рендерер добавит ссылки с правильной нумерацией. Не создавай отдельный раздел только
 для рисунка. В блоках без уместной ссылки и во всех нетекстовых блоках figure_refs=[].
 В рисунок входят только сама фигура, её оси, стрелки, подписи и полная легенда.
 Не включай соседние самостоятельные формулы, текст, код, человека и декорации.
-illustration_crop_id оставляй пустым: точную рамку по исходному кадру уточняет
+generated_image_id и illustration_crop_id оставляй пустыми: точную рамку по исходному кадру уточняет
 отдельный этап после выбора фигуры; он может восстановить обрезанную легенду.
 Для каждого ID из required_illustration_ids верни ровно одну запись
 illustration_coverage: {illustration_id, block_id, exclusion_reason}.
@@ -178,7 +178,7 @@ illustration_coverage: {illustration_id, block_id, exclusion_reason}.
 decoration (логотип/декор), lecturer_or_clothing (лектор/одежда), code_or_interface
 (код/интерфейс), text_or_formulas (только текст/формулы), no_instructional_visual
 (нет учебного изображения). Это явное решение, а не пропуск ID. Не исключай настоящий
-рисунок из-за неясных деталей, сложности, повтора или бюджета: сохрани снимок либо
+рисунок из-за неясных деталей, сложности, повтора или бюджета: создай блок его типа либо
 сошлись на уже включённую фигуру. Не создавай замечания review о ложных кандидатах.
 prior_illustrations — каталог ранее включённых рисунков всей лекции с описаниями;
 их исходные изображения могут не быть приложены. Для возвращения к тому же рисунку
@@ -365,8 +365,16 @@ def _validate_illustration_coverage(notes: dict, evidence: dict, previous: list[
             if source_id:
                 if source_id not in sources or source_id not in block["evidence_ids"]:
                     raise ValueError(f"Invalid illustration source in {block['id']}")
-                if block["kind"] == "diagram" and sources[source_id]["source_kind"] != "drawn":
-                    raise ValueError("Printed and unknown illustrations require screenshots")
+                source = sources[source_id]
+                if block["kind"] in {"diagram", "illustration"} and source["source_kind"] != "drawn":
+                    generated = (block["kind"] == "illustration" and source["source_kind"] == "unknown"
+                                 and block.get("illustration_crop_id") and block.get("generated_image_id"))
+                    if not generated:
+                        if finalized:
+                            raise ValueError(f"Figure {block['id']} requires a verified source screenshot")
+                        if block["kind"] == "diagram":
+                            block["content"] = block["caption"] or source["description"]
+                        block.update(kind="screenshot", generated_image_id="", illustration_crop_id="")
                 targets.add(block["id"])
             elif sources and block["kind"] == "diagram":
                 raise ValueError("Video drawings require an illustration source for verification")
@@ -391,14 +399,16 @@ def _validate_illustration_coverage(notes: dict, evidence: dict, previous: list[
 
 
 def _validate_figure_refs(notes: dict, previous: list[dict], *, finalized: bool) -> None:
+    from .schemas import FIGURE_KINDS
+
     targets = {block["id"] for part in previous for chapter in part["chapters"]
-               for block in chapter["blocks"] if block["kind"] in {"diagram", "screenshot"}}
+               for block in chapter["blocks"] if block["kind"] in FIGURE_KINDS}
     if finalized:
         targets.update(block["id"] for chapter in notes["chapters"] for block in chapter["blocks"]
-                       if block["kind"] in {"diagram", "screenshot"})
+                       if block["kind"] in FIGURE_KINDS)
     for chapter in sorted(notes["chapters"], key=lambda item: item["start"]):
         targets.update(block["id"] for block in chapter["blocks"]
-                       if block["kind"] in {"diagram", "screenshot"})
+                       if block["kind"] in FIGURE_KINDS)
         for block in chapter["blocks"]:
             if set(block.get("figure_refs", [])) - targets:
                 raise ValueError(f"Invalid figure references in {block['id']}")
@@ -521,16 +531,6 @@ def export_handoff(job: Path, evidence: dict, outline: dict, *, contexts: dict |
     return folder
 
 
-def _record_request(folder: Path, method: str, url: str, payload: bytes | None) -> None:
-    number = len(list(folder.glob("http-*.request.json"))) + 1
-    prefix = f"http-{number:03d}"
-    body_file = f"{prefix}.body.json" if payload is not None else None
-    if body_file:
-        (folder / body_file).write_bytes(payload)
-    write_json(folder / f"{prefix}.request.json",
-               {"method": method, "url": url, "body": body_file})
-
-
 def _validate_chapter_reply(reply: dict, evidence: dict, chapter: dict,
                             resolutions: dict | None = None, *,
                             previous: list[dict] | None = None) -> dict:
@@ -548,7 +548,7 @@ def _generate_chapter(client, text: str, evidence: dict, chapter: dict,
                       resolutions: dict, requests: Path, *, job: Path | None = None,
                       previous: list[dict] | None = None) -> dict:
     from .auth import PlanAccessError
-    from .openai_client import PlanClient, ResponseError
+    from .openai_client import ResponseError
     from .rendering import LatexCompilationError, RenderError, validate_chapter_latex
     from .schemas import LectureNotes
 
@@ -561,16 +561,20 @@ def _generate_chapter(client, text: str, evidence: dict, chapter: dict,
                                          "schema": schema, "model": client.model})
         if images:
             _export_images(job, evidence, context, folder)
-        recorder = client.request_recorder if isinstance(client, PlanClient) else None
-        if isinstance(client, PlanClient):
-            client.request_recorder = lambda method, url, payload, folder=folder: _record_request(
-                folder, method, url, payload)
         try:
-            reply = client.complete(INSTRUCTIONS, text, schema=schema,
-                                    **({"images": images} if images else {}))
+            with record_requests(client, folder):
+                reply = client.complete(INSTRUCTIONS, text, schema=schema,
+                                        **({"images": images} if images else {}))
             write_json(folder / "response.json", reply)
             result = _validate_chapter_reply(reply, evidence, chapter, resolutions, previous=previous)
-            if not _context_illustrations(context):
+            sources = _context_illustrations(context)
+            for block in result["chapters"][0]["blocks"]:
+                source = sources.get(block["illustration_id"])
+                if source and source["source_kind"] == "drawn":
+                    if block["kind"] == "diagram":
+                        block["content"] = block["caption"] or source["description"]
+                    block["kind"] = "illustration"
+            if not sources:
                 validate_chapter_latex(result, evidence, folder / "latex-check")
             write_json(folder / "status.json", {"status": "success"})
             return result
@@ -589,9 +593,6 @@ def _generate_chapter(client, text: str, evidence: dict, chapter: dict,
             print(f"Notes chapter {chapter['id']} failed: {exc}\n"
                   f"Retrying {chapter['id']} ({attempt + 1}/3) in {delay} seconds.", flush=True)
             retry_delay(delay, time.sleep)
-        finally:
-            if isinstance(client, PlanClient):
-                client.request_recorder = recorder
 
 
 @timed_step("chapter_merge")

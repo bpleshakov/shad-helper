@@ -1,10 +1,12 @@
 import json
 import shutil
+from io import BytesIO
 
 import pytest
 from PIL import Image
 
-from shad_helper import notes, rendering
+from shad_helper import anki_figures, notes, rendering
+from shad_helper.illustration_generation import DRAWING_CHECK, resolve_generated_image
 from shad_helper.illustrations import materialize_illustrations
 from shad_helper.jobs import read_json, sha256_file, write_json
 
@@ -60,7 +62,11 @@ class Client:
 
     def __init__(self, *, drawn=False, reuse=False, fail_once=False):
         self.drawn, self.reuse, self.fail_once = drawn, reuse, fail_once
-        self.calls, self.verifications = [], 0
+        self.calls, self.image_requests, self.verifications = [], [], 0
+
+    def generate_image(self, instructions, text, *, images):
+        self.image_requests.append((instructions, json.loads(text), images))
+        return images[0][1].read_bytes()
 
     def complete(self, instructions, text, schema=None, *, images=None):
         if "verdict" in schema.get("properties", {}):
@@ -83,7 +89,7 @@ def test_printed_illustrations_reach_notes_and_portable_assets(tmp_path):
     assert manifest["image_files"] == ["figures/illustration-f0_ill01.png"]
     source = tmp_path / "illustrations/f0_ill01.png"
     assert (tmp_path / "notes" / manifest["image_files"][0]).read_bytes() == source.read_bytes()
-    assert client.verifications == 0
+    assert client.verifications == 0 and not client.image_requests
     assert read_json(tmp_path / "review.json")["ready"]
     context, images = client.calls[0]
     assert context["required_illustration_ids"] == ["f0_ill01"]
@@ -92,6 +98,230 @@ def test_printed_illustrations_reach_notes_and_portable_assets(tmp_path):
     assert (root / "inputs/ch001/images/f0_ill01.png").read_bytes() == source.read_bytes()
     assert read_json(root / "inputs/ch001/context.json") == context
     assert not (root / "runs").exists()
+
+
+def test_generated_drawing_uses_its_views_and_speech_and_reaches_pdf_and_anki(tmp_path):
+    import pymupdf
+
+    evidence = prepare(tmp_path, times=(45, 80, 200, 410), source_kind="drawn", duration=500)
+    evidence["visuals"][2]["illustrations"][0]["source_kind"] = "printed"
+    evidence["segments"] = [{"id": key, "start": t, "end": t + 4, "text": words} for key, t, words in (
+        ("setup", 3, "Обозначим начало стрелки через A."), ("first", 38, "Начинаем в A."),
+        ("next", 76, "Направляем стрелку к B."), ("slide", 202, "Перейдём к таблице."),
+        ("revisit", 410, "Вернёмся к организационному вопросу."))]
+    write_json(tmp_path / "evidence.json", evidence)
+    output = BytesIO()
+    Image.new("RGB", (97, 53), "blue").save(output, format="PNG")
+
+    class DrawingClient(Client):
+        def complete(self, instructions, text, schema=None, *, images=None):
+            if instructions == DRAWING_CHECK:
+                assert images[-1][0] == "GENERATED" and images[-1][1].read_bytes() == output.getvalue()
+                assert evidence["segments"][2]["text"] in text
+            if instructions != notes.INSTRUCTIONS:
+                if "SOURCE_01" in schema["properties"]:
+                    return {key: {"verdict": "pass", "reason": "Тот же рисунок."}
+                            for key in schema["required"]}
+                return {"verdict": "pass", "reason": "Учебный смысл сохранён."}
+            reply = chapter_reply(json.loads(text))
+            chapter = reply["chapters"][0]
+            _, drawing, slide, _ = chapter["blocks"]
+            drawing.update(kind="illustration", content="Переход из A в B.")
+            drawing["evidence_ids"].append("setup")
+            chapter["blocks"] = [
+                {"id": "explanation", "kind": "text", "content": "Переход из A в B.",
+                 "evidence_ids": ["next"], "figure_refs": [drawing["id"]]}, drawing, slide]
+            for entry in chapter["illustration_coverage"]:
+                if entry["illustration_id"] != slide["illustration_id"]:
+                    entry["block_id"] = drawing["id"]
+            return reply
+
+        def generate_image(self, instructions, text, *, images):
+            self.image_requests.append((json.loads(text), images))
+            return output.getvalue()
+
+    client = DrawingClient()
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    assert len(client.image_requests) == 1
+    context, images = client.image_requests[0]
+    assert context["transcript"] == evidence["segments"][:3]
+    assert [(label.split()[0], path.read_bytes()) for label, path in images] == [
+        (role, (tmp_path / "illustrations" / name).read_bytes())
+        for role, name in [("PRIMARY", "f1_ill01.png"), ("VIEW", "f0_ill01.png")]]
+    project = tmp_path / "notes"
+    result = read_json(tmp_path / "notes.json")
+    prose, drawing, slide = result["chapters"][0]["blocks"]
+    assert (drawing["kind"], slide["kind"]) == ("illustration", "screenshot")
+    assert prose["figure_refs"] == [drawing["id"]] and not result["issues"]
+    source_blocks = read_json(project / "project.json")["source_blocks"]
+    assert resolve_generated_image(tmp_path, evidence, drawing).read_bytes() == output.getvalue()
+    with pytest.raises(ValueError, match="does not match its source"):
+        resolve_generated_image(tmp_path, evidence, {**drawing, "illustration_id": slide["illustration_id"]})
+    sources = {b["id"]: b for b in source_blocks}
+    if shutil.which("latexmk") and shutil.which("lualatex"):
+        pdf = rendering.render(tmp_path)
+        with pymupdf.open(pdf) as document:
+            pixmaps = [pymupdf.Pixmap(document, ref[0]) for page in document for ref in page.get_images()]
+            assert any(pix.width == 97 and pix.height == 53 and pix.pixel(0, 0) == (0, 0, 255)
+                       for pix in pixmaps)
+        sources = read_json(project / "source-map.json")["blocks"]
+    assets = anki_figures.load_figure_assets(tmp_path, {"blocks": sources})
+    assert anki_figures.export_figure(tmp_path, assets[drawing["id"]], tmp_path / "cards").read_bytes() == output.getvalue()
+    assert (project / assets[slide["id"]]["path"]).read_bytes() == (tmp_path / "illustrations/f2_ill01.png").read_bytes()
+
+    imported = tmp_path / "saved-reply.json"
+    write_json(imported, result)
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client, imported=imported)
+    assert len(client.image_requests) == 1
+    evidence["segments"][2]["text"] = "Теперь обратите внимание на направление."
+    write_json(tmp_path / "evidence.json", evidence)
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    assert len(client.image_requests) == 2
+    assert client.image_requests[-1][0]["transcript"][2]["text"] == evidence["segments"][2]["text"]
+
+
+def test_chapter_resume_checks_generated_pixels_before_reusing_them(tmp_path):
+    from shad_helper.chapter_pipeline import ChapterNotes
+
+    evidence = prepare(tmp_path, source_kind="drawn")
+    client = Client(drawn=True)
+    outline = notes.default_outline(evidence)
+
+    def run():
+        state = ChapterNotes(tmp_path, outline, client, {})
+        assert state.process(evidence, outline["chapters"][0], "same-plan")
+        return state.result["chapters"][0]["blocks"][0]
+
+    block = run()
+    image = resolve_generated_image(tmp_path, evidence, block)
+    assert block["kind"] == "illustration" and client.image_requests[0][1]["transcript"] == []
+    assert run() == block and len(client.image_requests) == 1
+    image.write_bytes(b"damaged cached image")
+    with pytest.raises(ValueError, match="pixels have changed"):
+        resolve_generated_image(tmp_path, evidence, block)
+    assert run() == block and len(client.image_requests) == 2 and len(client.calls) == 1
+    assert image.read_bytes() == (tmp_path / "illustrations/f0_ill01.png").read_bytes()
+
+
+def test_chapter_resume_retries_a_screenshot_saved_by_the_old_generator(tmp_path, monkeypatch):
+    from shad_helper import chapter_pipeline
+    from shad_helper.auth import PlanAccessError
+
+    evidence = prepare(tmp_path, source_kind="drawn")
+    client = Client(drawn=True)
+    outline = notes.default_outline(evidence)
+
+    def run():
+        state = chapter_pipeline.ChapterNotes(tmp_path, outline, client, {})
+        assert state.process(evidence, outline["chapters"][0], "same-plan")
+        return state.result["chapters"][0]["blocks"][0]
+
+    def unavailable(*args, **kwargs):
+        raise PlanAccessError("Unsupported image tool", status=400)
+
+    with monkeypatch.context() as old:
+        old.setattr(client, "generate_image", unavailable)
+        old.setattr(chapter_pipeline, "sha256_file", lambda p:
+                    "old-generator" if p.name == "codex_images.py" else sha256_file(p))
+        assert run()["kind"] == "screenshot"
+        assert not read_json(tmp_path / "checkpoints/chapter-pipeline/notes/ch001.json")["retry"]
+
+    block = run()
+    assert block["generated_image_id"] and run() == block
+    assert len(client.calls) == len(client.image_requests) == 1
+
+
+@pytest.mark.parametrize(("initial_verdict", "interrupt_recheck"), [("fail", False), ("uncertain", True)])
+def test_rejected_drawing_is_corrected_using_feedback_and_checked_again(
+        tmp_path, initial_verdict, interrupt_recheck):
+    evidence = prepare(tmp_path, source_kind="drawn")
+    evidence["segments"] = [{"id": "s1", "start": 9, "end": 12, "text": "Сравним три плотности."}]
+    write_json(tmp_path / "evidence.json", evidence)
+    rejection = {"verdict": initial_verdict, "reason": "Точка не лежит на третьей кривой."}
+    corrected = BytesIO()
+    Image.new("RGB", (16, 12), "blue").save(corrected, format="PNG")
+
+    class RepairClient(Client):
+        def generate_image(self, instructions, text, *, images):
+            original = super().generate_image(instructions, text, images=images)
+            return corrected.getvalue() if images[-1][0] == "REJECTED" else original
+
+        def complete(self, instructions, text, schema=None, *, images=None):
+            if instructions != DRAWING_CHECK:
+                return super().complete(instructions, text, schema, images=images)
+            self.verifications += 1
+            assert [label.split()[0] for label, _ in images] == ["PRIMARY", "GENERATED"]
+            assert rejection["reason"] not in text
+            if images[-1][1].read_bytes() == corrected.getvalue():
+                if interrupt_recheck and self.verifications == 2:
+                    raise RuntimeError("Temporary verification outage")
+                return {"verdict": "pass", "reason": "Точки лежат на своих кривых."}
+            return rejection
+
+    client = RepairClient(drawn=True)
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    result = read_json(tmp_path / "notes.json")
+    block, = result["chapters"][0]["blocks"]
+    assert block["kind"] == "illustration" and not result["issues"]
+    assert resolve_generated_image(tmp_path, evidence, block).read_bytes() == corrected.getvalue()
+    original, repair = client.image_requests
+    assert repair[1] == {**original[1], "verifier_feedback": rejection}
+    assert repair[1]["transcript"] == evidence["segments"]
+    assert repair[2][:-1] == original[2]
+    label, rejected_image = repair[2][-1]
+    assert label == "REJECTED" and rejected_image.read_bytes() == original[2][0][1].read_bytes()
+    assert repair[0] != original[0] and "verifier_feedback" in repair[0]
+    verification = tmp_path / "handoff/verification"
+    attempts = 2 if interrupt_recheck else 1
+    assert read_json(verification / "status.json") == {"attempts": attempts, "retry_needed": False}
+    archive = verification / f"attempt-{attempts:02d}/illustration-verification" / block["id"]
+    assert read_json(archive / "rejected.json")["reason"] == rejection["reason"]
+    assert (archive / "preview.png").read_bytes() == corrected.getvalue()
+    assert read_json(archive / "verdict.json")["verdict"] == "pass"
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    assert len(client.image_requests) == 2 and client.verifications == attempts + 1
+
+
+@pytest.mark.parametrize(("screenshot_ok", "repeat_image"), [(True, False), (False, False), (True, True)])
+def test_rejected_generated_figure_uses_only_a_publishable_source(
+        tmp_path, monkeypatch, screenshot_ok, repeat_image):
+    prepare(tmp_path, source_kind="drawn")
+    purposes = []
+    different = tmp_path / "second.png"
+    Image.new("RGB", (20, 10), "green").save(different)
+
+    def refine(job, evidence, block, client, folder):
+        purposes.append(block["kind"])
+        reason = "Руку лектора нельзя убрать из кадра." if block["kind"] == "screenshot" and not screenshot_ok else ""
+        return "", False, reason, False
+
+    class RejectImage(Client):
+        def generate_image(self, instructions, text, *, images):
+            original = super().generate_image(instructions, text, images=images)
+            return different.read_bytes() if len(self.image_requests) == 2 and not repeat_image else original
+
+        def complete(self, instructions, text, schema=None, *, images=None):
+            if instructions == DRAWING_CHECK:
+                self.verifications += 1
+                return {"verdict": "fail", "reason": "Направление стрелки изменено."}
+            return super().complete(instructions, text, schema, images=images)
+
+    monkeypatch.setattr("shad_helper.illustration_verification.refine_crop", refine)
+    client = RejectImage()
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    result = read_json(tmp_path / "notes.json")
+    chapter = result["chapters"][0]
+    assert purposes == ["illustration", "screenshot"] and len(client.image_requests) == 2
+    assert client.verifications == (1 if repeat_image else 2)
+    assert "Направление стрелки изменено" in result["issues"][0]["description"]
+    assert not read_json(tmp_path / "review.json")["ready"]
+    if screenshot_ok:
+        block, = chapter["blocks"]
+        assert block["kind"] == "screenshot" and not block["generated_image_id"]
+        assert chapter["illustration_coverage"][0]["block_id"] == block["id"]
+    else:
+        assert not chapter["blocks"]
+        assert chapter["illustration_coverage"][0]["exclusion_reason"] == "unresolved"
 
 
 def test_identical_crops_share_attachment_without_losing_coverage(tmp_path):
@@ -331,11 +561,12 @@ def test_unavailable_verification_retries_automatically_without_regenerating_not
         kwargs["imported"] = tmp_path / "reply.json"
     notes.generate_notes(tmp_path, tmp_path / "auth", client=client, **kwargs)
     first = read_json(tmp_path / "notes.json")
-    assert first["chapters"][0]["blocks"][0]["kind"] == "diagram"
+    assert first["chapters"][0]["blocks"][0]["kind"] == ("diagram" if imported else "illustration")
     assert not first["issues"] and read_json(tmp_path / "review.json")["ready"]
     assert read_json(tmp_path / "handoff/verification/status.json") == {
         "attempts": 2, "retry_needed": False}
     assert len(client.calls) == (0 if imported else 1) and client.verifications == 2
+    assert len(client.image_requests) == (0 if imported else 1)
     notes.generate_notes(tmp_path, tmp_path / "auth", client=client, **kwargs)
     assert client.verifications == 2
     assert read_json(tmp_path / "handoff/verification/status.json")["attempts"] == 1
@@ -503,6 +734,49 @@ def add_native_frames(job, evidence):
         paths.append(path)
     write_json(job / "evidence.json", evidence)
     return paths
+
+
+@pytest.mark.parametrize("extracted,verified,expected", [
+    ("unknown", "drawn", "illustration"), ("unknown", "printed", "screenshot"),
+    ("unknown", "unknown", "screenshot"), ("unknown", None, "screenshot"), ("printed", None, "screenshot"),
+])
+def test_model_drawing_proposal_uses_verified_source_without_retry(
+        tmp_path, monkeypatch, extracted, verified, expected):
+    from shad_helper import illustration_crops
+
+    evidence = prepare(tmp_path, source_kind=extracted)
+    evidence["segments"] = [{"id": "s1", "start": 8, "end": 12, "text": "Проведём стрелку к B."}]
+    add_native_frames(tmp_path, evidence)
+    monkeypatch.setattr("shad_helper.illustration_verification.refine_crop", illustration_crops.refine_crop)
+    monkeypatch.setattr(notes, "retry_delay", lambda *_: pytest.fail("Retried a valid chapter draft"))
+
+    class SourceClient(Client):
+        def complete(self, instructions, text, schema=None, *, images=None):
+            fields = schema["properties"]
+            if "checks" in fields:
+                assert ("source_kind" in fields) == (extracted == "unknown")
+                assert [label for label, _ in images][:3] == ["FULL_FRAME", "MARKED_FRAME", "CROP"]
+                return {"verdict": "pass", "checks": dict.fromkeys(fields["checks"]["required"], "pass"),
+                        "reason": "Верный фрагмент.", "defects": [], "repair": "none",
+                        **({"source_kind": verified} if verified else {})}
+            if "box" in fields:
+                return {"status": "cropped", "box": [2, 2, 158, 98], "reason": "Видны связи."}
+            reply = super().complete(instructions, text, schema, images=images)
+            if "chapters" in reply:
+                reply["chapters"][0]["blocks"][0].update(kind="illustration", content="Стрелка из A в B.")
+            return reply
+
+    client = SourceClient()
+    notes.generate_notes(tmp_path, tmp_path / "auth", client=client)
+    result = read_json(tmp_path / "notes.json")
+    block = result["chapters"][0]["blocks"][0]
+    assert block["kind"] == expected and block["content"] == "Стрелка из A в B."
+    assert block["illustration_crop_id"] and len(client.calls) == 1
+    assert len(client.image_requests) == (verified == "drawn")
+    if verified == "drawn":
+        assert client.image_requests[0][1]["transcript"] == evidence["segments"]
+        assert resolve_generated_image(tmp_path, evidence, block).is_file()
+    assert bool(result["issues"]) == (extracted == "unknown" and verified in ("unknown", None))
 
 
 def test_native_context_is_bounded_without_dropping_candidate_images(tmp_path):

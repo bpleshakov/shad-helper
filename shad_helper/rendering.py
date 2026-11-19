@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .jobs import check_job, fingerprint, read_json, sha256_file, write_json
 from .run_diagnostics import record_run, timed_step
-from .schemas import NoteBlock
+from .schemas import FIGURE_KINDS, NoteBlock
 
 
 class RenderError(RuntimeError):
@@ -368,7 +368,7 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
             block_ids.add(block_id)
             ordered_blocks.append((chapter, block))
     figure_ids = {block["id"] for _, block in ordered_blocks
-                  if block["kind"] in {"diagram", "screenshot"}}
+                  if block["kind"] in FIGURE_KINDS}
     for _, block in ordered_blocks:
         references = block.get("figure_refs", [])
         if not isinstance(references, list):
@@ -380,10 +380,10 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
             raise RenderError("Figure references must be unique figure block IDs on prose blocks")
     for index, (chapter, block) in enumerate(ordered_blocks):
         heading_block, heading_chapter = block, chapter
-        if block["kind"] in {"diagram", "screenshot"}:
+        if block["kind"] in FIGURE_KINDS:
             following = next(
                 ((candidate_chapter, candidate) for candidate_chapter, candidate
-                 in ordered_blocks[index + 1:] if candidate["kind"] not in {"diagram", "screenshot"}),
+                 in ordered_blocks[index + 1:] if candidate["kind"] not in FIGURE_KINDS),
                 None)
             heading_chapter, heading_block = following or (chapter, {"topic": ""})
             following_topic = (" ".join((heading_block.get("topic") or "").split())
@@ -411,7 +411,7 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
                 following_figures = []
                 for following in range(position + 1, len(blocks)):
                     candidate = blocks[following][1]
-                    if (candidate["kind"] not in {"diagram", "screenshot"}
+                    if (candidate["kind"] not in FIGURE_KINDS
                             or candidate["id"] not in block.get("figure_refs", [])):
                         break
                     following_figures.append(following)
@@ -437,19 +437,24 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
                 _write(root, relative, content + "\n")
                 tex_files.append(relative)
                 lines.append("\\begin{figure}[H]\n\\centering\n\\input{" + relative + "}\n\\caption{" + escape_text(block.get("caption", "Схема")) + "}\\label{fig:" + block_id + "}\n\\end{figure}\n")
-            elif kind == "screenshot":
+            elif kind in {"illustration", "screenshot"}:
                 import pymupdf
 
                 from .illustration_crops import resolve_crop
+                from .illustration_generation import resolve_generated_image
 
                 illustration_id = _identifier(block.get("illustration_id", ""))
                 crop_id = block.get("illustration_crop_id", "")
                 try:
                     evidence = read_json(job / "evidence.json")
-                    source = resolve_crop(asset_job or job, evidence, illustration_id, crop_id)
+                    if kind == "illustration":
+                        source = resolve_generated_image(asset_job or job, evidence, block)
+                        relative = f"figures/generated-{block_id}.png"
+                    else:
+                        source = resolve_crop(asset_job or job, evidence, illustration_id, crop_id)
+                        relative = f"figures/illustration-{block_id if crop_id else illustration_id}.png"
                 except (OSError, ValueError) as error:
                     raise RenderError(f"Cannot resolve illustration {illustration_id}: {error}") from error
-                relative = f"figures/illustration-{block_id if crop_id else illustration_id}.png"
                 destination = _confined(root, relative)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, destination)
@@ -484,7 +489,7 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
                 raise RenderError(f"Unsupported note block kind: {kind}")
             start = f"\\hypertarget{{shad-block-{block_id}}}{{}}"
             end = f"\\hypertarget{{shad-end-{block_id}}}{{}}"
-            if kind in {"diagram", "screenshot"}:
+            if kind in FIGURE_KINDS:
                 lines[-1] = lines[-1].replace("\\centering\n", "\\centering\n" + start, 1)
                 lines[-1] = lines[-1].replace("\\end{figure}", end + "\\end{figure}", 1)
             elif kind in {"definition", "theorem", "proof"}:
@@ -512,11 +517,13 @@ def write_project(job: Path, notes: dict, *, asset_job: Path | None = None) -> P
                                   "evidence_ids": block.get("evidence_ids", []),
                                   **({"figure_asset": {"path": relative,
                                                        "sha256": sha256_file(_confined(root, relative))}}
-                                     if kind in {"diagram", "screenshot"} else {}),
+                                     if kind in FIGURE_KINDS else {}),
                                   **({"figure_refs": block["figure_refs"]}
                                      if block.get("figure_refs") else {}),
                                   **({"illustration_id": block["illustration_id"]}
                                      if block.get("illustration_id") else {}),
+                                  **({"generated_image_id": block["generated_image_id"]}
+                                     if block.get("generated_image_id") else {}),
                                   **({"illustration_crop_id": block["illustration_crop_id"]}
                                      if block.get("illustration_crop_id") else {})})
         relative = f"chapters/section-{number:03}.tex"
@@ -626,7 +633,7 @@ def _validate_project(root: Path, manifest: dict) -> None:
         if not _confined(root, relative).is_file() or not relative.startswith("code/"):
             raise RenderError("Missing or invalid verbatim code asset")
     for relative in image_files:
-        if not re.fullmatch(r"figures/illustration-[A-Za-z0-9][A-Za-z0-9_-]{0,79}\.png", relative):
+        if not re.fullmatch(r"figures/(?:illustration|generated)-[A-Za-z0-9][A-Za-z0-9_-]{0,79}\.png", relative):
             raise RenderError("Invalid illustration image asset")
         path = _confined(root, relative)
         if not path.is_file():
@@ -661,7 +668,7 @@ def validate_chapter_latex(notes: dict, evidence: dict, folder: Path, *,
     # from this isolated compile without changing the accepted notes.
     notes = deepcopy(notes)
     local_figures = {block["id"] for chapter in notes["chapters"] for block in chapter["blocks"]
-                     if block["kind"] in {"diagram", "screenshot"}}
+                     if block["kind"] in FIGURE_KINDS}
     for chapter in notes["chapters"]:
         for block in chapter["blocks"]:
             if block.get("figure_refs"):

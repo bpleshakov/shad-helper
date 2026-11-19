@@ -855,6 +855,30 @@ def test_distinct_or_uncertain_observation_gets_separate_crop_and_mapping(exampl
     assert read_json(archive / "accepted-block.json") == blocks[1]
 
 
+def test_distinct_drawn_stage_recovered_from_coverage_gets_its_own_generated_image(example):
+    job, evidence, _, _ = example
+    add_aliased_observation(example)
+    evidence["segments"] = [{"id": "speech", "start": 3, "end": 5, "text": "Добавим вторую стрелку."}]
+
+    class DrawingClient(Client):
+        def generate_image(self, instructions, text, *, images):
+            assert json.loads(text)["transcript"] == evidence["segments"]
+            assert [path.name for _, path in images] == ["v02_ill01.png"]
+            return png(job / "generated.png", 70).read_bytes()
+
+        def complete(self, instructions, text, schema, *, images):
+            if instructions == verification.DRAWING_CHECK:
+                return {"verdict": "pass", "reason": "Добавленная стрелка показана верно."}
+            return {"verdict": "fail", "reason": "Это другая стадия."}
+
+    accepted, retry = finalize(example, DrawingClient())
+    first, second = accepted["chapters"][0]["blocks"]
+    assert (first["kind"], second["kind"]) == ("screenshot", "illustration")
+    assert not retry and not accepted["issues"]
+    assert verification.resolve_generated_image(job, evidence, second).read_bytes() == (job / "generated.png").read_bytes()
+    assert read_json(job / "attempt/illustration-coverage/v02_ill01/accepted-block.json") == second
+
+
 @pytest.mark.parametrize("outcome", [
     "unusable", "uncertain", "occluded", "offline", "invalid", "correctable",
 ])
@@ -1150,8 +1174,9 @@ def test_consolidation_checks_refined_pixels_even_when_original_hashes_match(exa
 
 
 def test_failed_consolidation_refines_new_fallback_before_accepting_it(example, monkeypatch):
-    job, _, _, _ = example
+    job, evidence, _, _ = example
     add_aliased_observation(example)
+    evidence["visuals"][1]["illustrations"][0]["source_kind"] = "printed"
     calls = []
 
     def refine(job, evidence, selected, client, folder):

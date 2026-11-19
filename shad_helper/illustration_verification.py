@@ -14,6 +14,13 @@ from . import rendering
 from .auth import PlanAccessError
 from .chapter_progress import notes_phase, progress_items, retry_delay
 from .illustration_crops import refine_crop, resolve_crop
+from .illustration_generation import (
+    DRAWING_CHECK,
+    accept_generated_image,
+    drawing_candidate,
+    drawing_inputs,
+    resolve_generated_image,
+)
 from .illustration_matching import (
     MATCHING_SETTINGS,
     VisualMatcher,
@@ -28,8 +35,9 @@ from .illustration_states import (
 )
 from .illustrations import illustration_index
 from .jobs import fingerprint, read_json, sha256_file, write_json
-from .openai_client import DEFAULT_REASONING_EFFORT, PlanClient, ResponseError
-from .run_diagnostics import request_operation, timed_step
+from .openai_client import DEFAULT_REASONING_EFFORT, ResponseError
+from .run_diagnostics import record_requests, request_operation, timed_step
+from .schemas import FIGURE_KINDS
 
 VERIFICATION_POLICY_VERSION = 2
 VERIFICATION_INSTRUCTIONS = """Compare a lecture illustration with its LaTeX reconstruction.
@@ -95,7 +103,7 @@ RECONSTRUCTION is right. Compare both complete figures and their captions.
 Return relation=same for equivalent views, left_contains_right when left preserves
 right and adds missing content, and right_contains_left for the converse.
 For same, prefer left (the earlier figure) unless right is demonstrably clearer or
-more complete; prefer an accepted editable diagram over an equally faithful screenshot.
+more complete; prefer a verified teaching illustration over an equally faithful board screenshot.
 For containment, prefer the complete, readable view. Do not substitute a different
 dataset or model condition for the original, or lose an independently meaningful
 state. Additional comparison panels are allowed when the complete figure still
@@ -243,10 +251,22 @@ def _issue(notes, block, reason, *, append=False):
 
 
 def _fallback(block):
+    if block["kind"] == "diagram":
+        block["content"] = block.get("caption") or "Иллюстрация из лекции"
     block["kind"] = "screenshot"
+    block.pop("generated_image_id", None)
     if not block.get("caption"):
         block["caption"] = "Иллюстрация из лекции"
-    block["content"] = block["caption"]
+
+
+def _select_figure_kind(job, observation, block, crop_id):
+    source_kind = observation["source_kind"]
+    if source_kind == "unknown" and crop_id and block["kind"] == "screenshot":
+        record = read_json(Path(job) / "illustration-crops" / crop_id / "crop.json")
+        source_kind = record["verification"]["result"].get("source_kind", "unknown")
+        if source_kind == "drawn":
+            block["kind"] = "illustration"
+    return source_kind
 
 
 def _cached_verdict(cache, validator=_valid_verdict):
@@ -281,18 +301,13 @@ def _compare(client, source, preview, description, folder, *, instructions=None,
     write_json(folder / "call.json", {
         "instructions": instructions, "text": text,
         "schema": schema, "model": getattr(client, "model", None),
-        "images": [{"label": label, "file": path.name, "sha256": sha256_file(path)}
+        "images": [{"label": label, "file": str(path.absolute().relative_to(folder.absolute(), walk_up=True)),
+                    "sha256": sha256_file(path)}
                    for label, path in images],
     })
     if client is None:
         raise RuntimeError("Visual verification client is unavailable")
-    recorder = client.request_recorder if isinstance(client, PlanClient) else None
-    if isinstance(client, PlanClient):
-        from .notes import _record_request
-
-        client.request_recorder = lambda method, url, payload: _record_request(
-            folder, method, url, payload)
-    try:
+    with record_requests(client, folder):
         for attempt in range(4 if retry else 1):
             try:
                 response = client.complete(instructions, text, schema, images=images)
@@ -310,17 +325,17 @@ def _compare(client, source, preview, description, folder, *, instructions=None,
                 notes_phase("retrying illustration comparison")
                 print(f"Retrying illustration comparison ({attempt + 1}/3) in {delay} seconds.", flush=True)
                 retry_delay(delay, time.sleep)
-    finally:
-        if isinstance(client, PlanClient):
-            client.request_recorder = recorder
 
 
 def _consolidation_request(observation, block, job, evidence, client, *, source_block=None,
                            source_path=None):
     source = source_path or resolve_crop(job, evidence, observation["id"],
                                          (source_block or {}).get("illustration_crop_id", ""))
-    representative = resolve_crop(job, evidence, block["illustration_id"],
-                                  block.get("illustration_crop_id", ""))
+    if block.get("generated_image_id"):
+        representative = resolve_generated_image(job, evidence, block)
+    else:
+        representative = resolve_crop(job, evidence, block["illustration_id"],
+                                      block.get("illustration_crop_id", ""))
     source_hash, representative_hash = sha256_file(source), sha256_file(representative)
     figure = {key: block.get(key, "") for key in ("caption", "content")}
     signature = fingerprint({"source": source_hash,
@@ -673,7 +688,8 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
                               + fingerprint(observation["id"])[:16])
                 topic = representative.get("topic", "")
                 caption = representative.get("caption") or "Иллюстрация из лекции"
-                fallback = {"id": identifier, "kind": "screenshot",
+                fallback = {"id": identifier,
+                            "kind": "illustration" if observation["source_kind"] == "drawn" else "screenshot",
                             "illustration_id": observation["id"],
                             "content": caption, "caption": caption, "topic": topic,
                             "evidence_ids": [observation["id"]],
@@ -689,6 +705,7 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
                     continue
                 if crop_id:
                     fallback["illustration_crop_id"] = crop_id
+                source_kind = _select_figure_kind(job, observation, fallback, crop_id)
                 retry_needed |= crop_retry
                 if crop_id:
                     candidates = _matching_figures(fallback, [item for item in blocks.values()
@@ -726,7 +743,7 @@ def _finalize_coverage(notes, evidence, job, folder, client, previous, unpublish
                         prose["figure_refs"].append(identifier)
                 if crop_reason:
                     unpublished[identifier] = (fallback, crop_reason, unusable)
-                elif observation["source_kind"] != "printed":
+                elif source_kind == "unknown":
                     _issue(notes, fallback, "Наблюдение сохранено отдельным снимком. "
                            + verdict["reason"])
                 write_json(archive / "accepted-block.json", fallback)
@@ -767,6 +784,77 @@ def _recover_coverage(notes, evidence, job, folder, client, previous, unpublishe
     return retry_needed
 
 
+def _checked_drawing(job, block, client, context, images, archive, *, rejected=None):
+    cache, image = drawing_candidate(job, block, client, context, images, VERIFICATION_SCHEMA,
+                                     archive, rejected=rejected)
+    shutil.copyfile(image, archive / "preview.png")
+    try:
+        saved = read_json(cache / "verdict.json")
+    except (OSError, ValueError):
+        saved = {}
+    if rejected is not None and image.stem == rejected[0].stem:
+        verdict = rejected[1]  # Identical bytes cannot correct the reported defect.
+    elif (isinstance(saved, dict) and saved.get("image_sha256") == image.stem
+          and _valid_verdict(saved.get("result"))):
+        return cache, image, saved["result"]
+    else:
+        verdict = _compare(client, images[0][1], image, json.dumps(context, ensure_ascii=False),
+                           cache / "verification", instructions=DRAWING_CHECK,
+                           images=[*images, ("GENERATED", image)])
+    write_json(cache / "verdict.json", {"result": verdict, "image_sha256": image.stem})
+    return cache, image, verdict
+
+
+@timed_step("drawing_generation")
+def _generate_drawings(notes, evidence, job, folder, client, observations, unpublished):
+    coverage = {}
+    for chapter in notes["chapters"]:
+        for item in chapter.get("illustration_coverage", []):
+            coverage.setdefault(item["block_id"], []).append(item["illustration_id"])
+    drawings = [block for chapter in notes["chapters"] for block in chapter["blocks"]
+                if block["kind"] == "illustration" and block["id"] not in unpublished]
+    retry_needed = False
+    with closing(progress_items(drawings, desc="Generating drawings", unit="figure",
+                                dynamic_ncols=True, disable=not drawings)) as progress:
+        for block in progress:
+            archive = Path(folder) / "illustration-verification" / block["id"]
+            archive.mkdir(parents=True, exist_ok=True)
+            transient = False
+            try:
+                context, images = drawing_inputs(job, evidence, block, observations, coverage.get(block["id"], []))
+                cache, image, verdict = _checked_drawing(job, block, client, context, images, archive)
+                if verdict["verdict"] != "pass":
+                    write_json(archive / "rejected.json", {"request_id": cache.name,
+                                                          "image_sha256": image.stem, **verdict})
+                    (archive / "preview.png").replace(archive / "rejected.png")
+                    cache, image, verdict = _checked_drawing(job, block, client, context, images,
+                                                             archive, rejected=(image, verdict))
+                if verdict["verdict"] == "pass":
+                    block["generated_image_id"] = accept_generated_image(cache, image, verdict)
+            except (OSError, ValueError, RuntimeError, httpx.HTTPError) as error:
+                transient = (getattr(error, "code", None) != "model_unavailable"
+                             and getattr(error, "status", None) not in (400, 401, 403))
+                verdict = {"verdict": "uncertain", "reason": "Генерация или проверка иллюстрации недоступна."}
+                write_json(archive / "error.json", {"type": type(error).__name__, "message": str(error)})
+            if verdict["verdict"] != "pass":
+                _fallback(block)
+                _issue(notes, block, "Сгенерированная иллюстрация не принята. " + verdict["reason"])
+                block.pop("illustration_crop_id", None)
+                crop, retry, reason, unusable = refine_crop(job, evidence, block, client, archive / "screenshot-crop")
+                if crop:
+                    block["illustration_crop_id"] = crop
+                transient |= retry
+                if reason:
+                    unpublished[block["id"]] = (block, reason, unusable)
+            write_json(archive / "accepted.json", block)
+            write_json(archive / "verdict.json", {**verdict, "retry_needed": transient})
+            recovered = Path(folder) / "illustration-coverage" / block["illustration_id"] / "accepted-block.json"
+            if recovered.is_file():
+                write_json(recovered, None if block["id"] in unpublished else block)
+            retry_needed |= transient
+    return retry_needed
+
+
 @timed_step("illustration_verification")
 @request_operation("verification")
 def finalize_illustrations(notes: dict, evidence: dict, job: Path, folder: Path,
@@ -782,13 +870,16 @@ def finalize_illustrations(notes: dict, evidence: dict, job: Path, folder: Path,
     retry_needed = False
     unpublished = {}
     figures = [block for chapter in result["chapters"] for block in chapter["blocks"]
-               if block.get("illustration_id") and block["kind"] in {"diagram", "screenshot"}]
+               if block.get("illustration_id") and block["kind"] in FIGURE_KINDS]
     with closing(progress_items(figures, desc="Illustration verification", unit="figure",
               dynamic_ncols=True, disable=not figures)) as progress:
         for block in progress:
             identifier = block["illustration_id"]
             observation = observations[identifier]
             candidate = deepcopy(block)
+            block.pop("generated_image_id", None)
+            if block["kind"] == "illustration" and observation["source_kind"] != "drawn":
+                _fallback(block)
             archive = Path(folder) / "illustration-verification" / block["id"]
             archive.mkdir(parents=True, exist_ok=True)
             write_json(archive / "candidate.json", candidate)
@@ -797,17 +888,21 @@ def finalize_illustrations(notes: dict, evidence: dict, job: Path, folder: Path,
             block.pop("illustration_crop_id", None)
             if crop_id:
                 block["illustration_crop_id"] = crop_id
+            source_kind = _select_figure_kind(job, observation, block, crop_id)
             source = resolve_crop(job, evidence, identifier, block.get("illustration_crop_id", ""))
             shutil.copyfile(source, archive / "source.png")
             transient = crop_retry
             if crop_reason:
                 verdict = {"verdict": "uncertain", "reason": crop_reason}
                 unpublished[block["id"]] = (block, crop_reason, unusable)
+            elif block["kind"] == "illustration":
+                # Coverage below identifies which views show this drawing and stage.
+                retry_needed |= transient
+                continue
             elif block["kind"] == "screenshot":
                 verdict = {"verdict": "source", "reason": "Использован исходный снимок."}
-                if observation["source_kind"] != "printed":
-                    _issue(result, block, "Рисунок сохранён снимком; надёжная реконструкция "
-                           "LaTeX не предоставлена.")
+                if source_kind != "printed":
+                    _issue(result, block, "Для рисунка выбран исходный снимок. Проверьте его учебное содержание.")
             else:
                 signature = fingerprint({
                     "source": sha256_file(source), "content": block["content"],
@@ -878,6 +973,7 @@ def finalize_illustrations(notes: dict, evidence: dict, job: Path, folder: Path,
             retry_needed |= transient
     retry_needed |= _finalize_coverage(result, evidence, job, folder, client, previous or [],
                                       unpublished, matcher)
+    retry_needed |= _generate_drawings(result, evidence, job, folder, client, observations, unpublished)
     retry_needed |= _recover_coverage(result, evidence, job, folder, client, previous or [],
                                      unpublished, matcher)
     accepted_ids = {block["id"] for part in [*(previous or []), result]
@@ -970,9 +1066,10 @@ def _publication_preview(job, block):
 def _reconcile_pair(left, right, observations, job, evidence, folder, client, *, direct=False):
     source = resolve_crop(job, evidence, left["illustration_id"], left.get("illustration_crop_id", ""))
     preview = resolve_crop(job, evidence, right["illustration_id"], right.get("illustration_crop_id", ""))
-    if direct and right["kind"] == "diagram":
+    if direct and right["kind"] in {"diagram", "illustration"}:
         try:
-            preview = _publication_preview(job, right)
+            preview = (resolve_generated_image(job, evidence, right) if right["kind"] == "illustration"
+                       else _publication_preview(job, right))
         except (rendering.RenderError, OSError, ValueError) as error:
             verdict = {"relation": "uncertain", "preferred": "neither", "reason": str(error)}
             write_json(folder / "verdict.json", {**verdict, "retry_needed": True})
@@ -983,6 +1080,8 @@ def _reconcile_pair(left, right, observations, job, evidence, folder, client, *,
                     observations[left["illustration_id"]]["description"]
                     == observations[right["illustration_id"]]["description"]))
     same_representation = (left["kind"] == right["kind"] == "screenshot" or
+                           left["kind"] == right["kind"] == "illustration"
+                           and left["generated_image_id"] == right["generated_image_id"] or
                            left["kind"] == right["kind"] == "diagram" and left["content"] == right["content"])
     if same_intent and same_representation and source_hash == preview_hash:
         prefer_right = (right["kind"] == "diagram" and left["kind"] != "diagram"

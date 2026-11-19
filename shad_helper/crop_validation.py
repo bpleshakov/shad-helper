@@ -75,12 +75,25 @@ CROP_VERIFICATION_SCHEMA = {
     "required": ["verdict", "checks", "defects", "repair", "reason"],
     "additionalProperties": False,
 }
+SOURCE_KIND_SCHEMA = {
+    **CROP_VERIFICATION_SCHEMA,
+    "properties": {**CROP_VERIFICATION_SCHEMA["properties"],
+                   "source_kind": {"type": "string", "enum": ["drawn", "printed", "unknown"]}},
+    "required": [*CROP_VERIFICATION_SCHEMA["required"], "source_kind"],
+}
+SOURCE_KIND_INSTRUCTIONS = """
+Classify the intended figure in the verified crop from its pixels. Use drawn for a
+hand-drawn instructional figure, including a meaningful hand-drawn annotation on a slide.
+Use printed for a typeset or computer-rendered figure or a photograph. Use unknown
+if its origin is unclear. Handwriting elsewhere on the board does not classify the figure."""
 
 
-def valid_crop_verdict(value) -> bool:
+def valid_crop_verdict(value, *, classify=False) -> bool:
     """Require a complete, internally consistent independent judgment."""
+    schema = SOURCE_KIND_SCHEMA if classify else CROP_VERIFICATION_SCHEMA
     if (not isinstance(value, dict)
-            or set(value) != {"verdict", "checks", "defects", "repair", "reason"}
+            or set(value) != set(schema["required"])
+            or classify and value["source_kind"] not in schema["properties"]["source_kind"]["enum"]
             or value["verdict"] not in _VERDICTS
             or not isinstance(value["checks"], dict) or set(value["checks"]) != set(_CHECKS)
             or any(check not in _VERDICTS for check in value["checks"].values())

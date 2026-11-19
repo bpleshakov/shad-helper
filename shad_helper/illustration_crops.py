@@ -12,8 +12,8 @@ from . import crop_validation, illustration_stitching
 from .auth import PlanAccessError
 from .illustrations import illustration_index, native_frames, resolve_illustration
 from .jobs import fingerprint, read_json, sha256_file, write_json
-from .openai_client import DEFAULT_REASONING_EFFORT, PlanClient, ResponseError
-from .run_diagnostics import request_operation, timed_step
+from .openai_client import DEFAULT_REASONING_EFFORT, ResponseError
+from .run_diagnostics import record_requests, request_operation, timed_step
 
 CROP_POLICY_VERSION = 4
 MAX_CROP_REPAIRS = 2
@@ -184,7 +184,8 @@ def resolve_crop(job: Path, evidence: dict, identifier: str, crop_id: str = "") 
             frames = ([inputs["reference_frame"], *inputs["nearby_frames"]]
                       if record["version"] == 2 else inputs["stitched_frames"])
             if (record["frame"] not in frames
-                    or not crop_validation.valid_crop_verdict(verification["result"])
+                    or not crop_validation.valid_crop_verdict(verification["result"], classify=(
+                        inputs.get("verification_schema") == crop_validation.SOURCE_KIND_SCHEMA))
                     or verification["result"]["verdict"] != "pass"
                     or verification["image_sha256"] != record["image_sha256"]
                     or verification["frame_sha256"] != record["frame"]["sha256"]
@@ -269,17 +270,8 @@ def _request(client, instructions, context, schema, images, folder):
     })
     if client is None:
         raise RuntimeError("Crop verification client is unavailable")
-    recorder = client.request_recorder if isinstance(client, PlanClient) else None
-    if isinstance(client, PlanClient):
-        from .notes import _record_request
-
-        client.request_recorder = lambda method, url, payload: _record_request(
-            folder, method, url, payload)
-    try:
+    with record_requests(client, folder):
         response = client.complete(instructions, text, schema, images=images)
-    finally:
-        if isinstance(client, PlanClient):
-            client.request_recorder = recorder
     write_json(folder / "response.json", response)
     return response
 
@@ -374,16 +366,19 @@ def _verify(client, inputs, frame, box, folder):
               ("CROP", verification / "crop.png")]
     if (verification / "original-frame.png").exists():
         images.append(("ORIGINAL_FRAME", verification / "original-frame.png"))
-    instructions = crop_validation.CROP_VERIFICATION_INSTRUCTIONS
+    instructions = inputs["verification_instructions"]
     if "stitch" in frame:
         for index in (1, 2):
             images.append((f"SOURCE_FRAME_{index}", verification / f"source-frame-{index:02d}.png"))
         instructions += "\n" + STITCH_INSTRUCTIONS
     context = {key: inputs[key] for key in ("description", "figure", "purpose")}
     context.update(box=box, frame=frame, original_frame=inputs["reference_frame"], warnings=warnings)
-    verdict = _request(client, instructions, context,
-                       crop_validation.CROP_VERIFICATION_SCHEMA, images, verification)
-    if not crop_validation.valid_crop_verdict(verdict):
+    schema = inputs["verification_schema"]
+    verdict = _request(client, instructions, context, schema, images, verification)
+    classify = schema == crop_validation.SOURCE_KIND_SCHEMA
+    if classify and isinstance(verdict, dict):
+        verdict.setdefault("source_kind", "unknown")
+    if not crop_validation.valid_crop_verdict(verdict, classify=classify):
         raise ValueError("Invalid crop verification response")
     write_json(verification / "verdict.json", verdict)
     return verdict
@@ -503,7 +498,7 @@ def refine_crop(job: Path, evidence: dict, block: dict, client,
             "reference_frame": reference, "nearby_frames": [item[1] for item in nearby],
             "source_box": observation["box"], "description": observation["description"],
             "figure": {key: block.get(key, "") for key in ("caption", "content")},
-            "purpose": "reconstruction" if block.get("kind") == "diagram" else "screenshot",
+            "purpose": "reconstruction" if block.get("kind") in {"diagram", "illustration"} else "screenshot",
             "instructions": CROP_INSTRUCTIONS, "schema": CROP_SCHEMA,
             "verification_instructions": crop_validation.CROP_VERIFICATION_INSTRUCTIONS,
             "verification_schema": crop_validation.CROP_VERIFICATION_SCHEMA,
@@ -513,6 +508,9 @@ def refine_crop(job: Path, evidence: dict, block: dict, client,
             "selection_instructions": SOURCE_SELECTION_INSTRUCTIONS,
             "selection_schema": SOURCE_SELECTION_SCHEMA,
         }
+        if observation["source_kind"] == "unknown" and inputs["purpose"] == "screenshot":
+            inputs["verification_instructions"] += crop_validation.SOURCE_KIND_INSTRUCTIONS
+            inputs["verification_schema"] = crop_validation.SOURCE_KIND_SCHEMA
         crop_id = fingerprint(inputs)
         cache = _confined(job, Path("illustration-crops") / crop_id)
         shutil.copyfile(reference_path, attempt / "frame.png")

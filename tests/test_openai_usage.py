@@ -82,6 +82,11 @@ def test_missing_usage_or_unknown_pricing_is_not_zero(change):
     assert response_cost(response(**change), DEFAULT_MODEL) is None
 
 
+def test_image_tool_cost_is_unpriced_even_when_text_model_has_rates():
+    result = response(model="gpt-6-astra", output=[{"type": "image_generation_call"}])
+    assert response_cost(result, "gpt-6-astra") is None
+
+
 @pytest.mark.parametrize("field,value", [
     ("input_tokens", -1), ("input_tokens", True), ("output_tokens", "100"),
     ("output_tokens", float("nan")), ("input_tokens_details", None),

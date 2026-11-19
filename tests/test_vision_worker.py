@@ -22,6 +22,23 @@ def response(content=CONTENT, **metrics):
 
 
 class ParseOutputTests(unittest.TestCase):
+    def test_missing_unreadable_keeps_whiteboard_content_and_unlocalized_figure(self):
+        content = {**CONTENT, "kind": "whiteboard", "illustrations": []}
+        del content["unreadable"]
+        parsed = vision_worker.parse_output(json.dumps(content))
+        self.assertEqual(parsed["unreadable"], [])
+        self.assertEqual(parsed["diagrams"], content["diagrams"])
+        self.assertEqual(parsed["formulas"], content["formulas"])
+        self.assertEqual(parsed["illustrations"], [{"source_kind": "unknown", "box": [0, 0, 1, 1],
+                         "description": content["diagrams"][0]["description"]}])
+        localized = {**content, "illustrations": CONTENT["illustrations"]}
+        self.assertEqual(vision_worker.parse_output(json.dumps(localized)), {**localized, "unreadable": []})
+        complete = {**content, "unreadable": []}
+        self.assertEqual(vision_worker.parse_output(json.dumps(complete)), complete)
+        del content["formulas"]
+        with self.assertRaises(ValueError):
+            vision_worker.parse_output(json.dumps(content))
+
     def test_json_and_single_fence_preserve_formulas(self):
         raw, _ = response()
         self.assertEqual(vision_worker.parse_output(raw), CONTENT)

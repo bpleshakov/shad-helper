@@ -17,6 +17,8 @@ def response_cost(response, requested_model) -> Decimal | None:
     try:
         if response.get("model", requested_model) != "gpt-6-astra":
             return None
+        if any(item.get("type") == "image_generation_call" for item in response.get("output", [])):
+            return None  # Image tool charges are additional to the text model's tokens.
         multiplier = {"default": Decimal(1), "flex": Decimal("0.5"),
                       "priority": Decimal(2), "fast": Decimal(2)}.get(
                           response.get("service_tier") or "default")

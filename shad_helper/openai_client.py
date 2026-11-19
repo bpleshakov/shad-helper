@@ -9,12 +9,13 @@ import httpx
 
 from shad_helper.auth import RESOURCE, PlanAccessError, access_token, http_error
 from shad_helper.chapter_progress import check_cancelled, notes_connection
+from shad_helper.codex_images import generate_drawing
 from shad_helper.network import openai_http_client, resolve_openai_proxy
 from shad_helper.openai_config import load_api_key
 from shad_helper.openai_usage import track_request
 
-DEFAULT_MODEL = "gpt-6.1-sol"
-DEFAULT_REASONING_EFFORT = "low"
+DEFAULT_MODEL = "gpt-6.2-astra"
+DEFAULT_REASONING_EFFORT = "medium"
 MAX_PDF_BYTES = 500_000_000
 MAX_IMAGE_ENCODED_BYTES = 400_000_000
 CREDIT_EXHAUSTED_CODES = {"credit_balance_exhausted", "insufficient_quota"}
@@ -199,6 +200,31 @@ class PlanClient:
     def complete(self, instructions: str, text: str, schema: dict | None = None,
                  *, pdf: Path | None = None,
                  images: list[tuple[str, Path]] | None = None) -> dict:
+        raw = self._request(instructions, text, schema=schema, pdf=pdf, images=images)
+        try:
+            value = json.loads(raw)
+        except ValueError as exc:
+            raise ResponseError("OpenAI returned invalid JSON.") from exc
+        if not isinstance(value, dict):
+            raise ResponseError("OpenAI output must be a JSON object.")
+        return value
+
+    def generate_image(self, instructions: str, text: str, *, images: list[tuple[str, Path]]) -> bytes:
+        import pymupdf
+
+        data = generate_drawing(instructions, text, _image_data(images)[0], model=self.model,
+                                effort=DEFAULT_REASONING_EFFORT, proxy=self.proxy)
+        try:
+            # The decoder also accepts a truncated PNG missing its terminal IEND chunk.
+            if (not data.startswith(b"\x89PNG\r\n\x1a\n")
+                    or not data.endswith(b"\0\0\0\0IEND\xae\x42\x60\x82")):
+                raise ValueError("Incomplete PNG")
+            pymupdf.Pixmap(data)
+        except (ValueError, RuntimeError, pymupdf.mupdf.FzErrorBase) as exc:
+            raise ResponseError("Codex returned an invalid PNG illustration.") from exc
+        return data
+
+    def _request(self, instructions, text, *, schema=None, pdf=None, images=None):
         content = [{"type": "input_text", "text": text}]
         if pdf is not None:
             pdf = Path(pdf)
@@ -252,17 +278,10 @@ class PlanClient:
                     response.read()
                     raise http_error(response, api_key=bool(self._api_key))
                 try:
-                    raw = _stream_text(response, api_key=bool(self._api_key),
-                                       usage_recorder=usage_recorder)
+                    return _stream_text(response, api_key=bool(self._api_key),
+                                        usage_recorder=usage_recorder)
                 except (KeyError, TypeError, AttributeError) as exc:
                     raise ResponseError("OpenAI returned malformed response content.") from exc
         except httpx.HTTPError as exc:
             source = "OpenAI API" if self._api_key else "ChatGPT"
             raise PlanAccessError(f"{source} connection was interrupted; partial output was discarded.") from exc
-        try:
-            value = json.loads(raw)
-        except ValueError as exc:
-            raise ResponseError("OpenAI returned invalid JSON.") from exc
-        if not isinstance(value, dict):
-            raise ResponseError("OpenAI output must be a JSON object.")
-        return value

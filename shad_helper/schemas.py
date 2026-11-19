@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Identifier = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")]
+FIGURE_KINDS = {"diagram", "screenshot", "illustration"}
 
 
 class StrictModel(BaseModel):
@@ -43,7 +44,7 @@ class UncertainFragment(StrictModel):
 class NoteBlock(StrictModel):
     id: Identifier
     kind: Literal[
-        "text", "definition", "theorem", "proof", "math", "code", "diagram", "screenshot", "clarification", "uncertain",
+        "text", "definition", "theorem", "proof", "math", "code", "diagram", "screenshot", "illustration", "clarification", "uncertain",
     ]
     content: str = Field(min_length=1)
     topic: str = ""
@@ -52,6 +53,7 @@ class NoteBlock(StrictModel):
     language: str = ""
     illustration_id: Identifier | Literal[""] = ""
     illustration_crop_id: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+    generated_image_id: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     figure_refs: list[Identifier] = Field(default_factory=list)
     uncertain_fragments: list[UncertainFragment] = Field(default_factory=list)
 
@@ -65,9 +67,11 @@ class NoteBlock(StrictModel):
             raise ValueError("Figure references are supported only in prose blocks")
         if self.illustration_crop_id and not self.illustration_id:
             raise ValueError("Refined crops require an illustration ID")
-        if self.kind == "screenshot" and not self.illustration_id:
-            raise ValueError("Screenshots require an illustration ID")
-        if self.illustration_id and self.kind not in {"diagram", "screenshot"}:
+        if self.kind in {"screenshot", "illustration"} and not self.illustration_id:
+            raise ValueError("Raster figures require an illustration ID")
+        if self.generated_image_id and self.kind != "illustration":
+            raise ValueError("Only generated illustrations may select a generated image")
+        if self.illustration_id and self.kind not in FIGURE_KINDS:
             raise ValueError("Only illustration blocks may select a source crop")
         if not self.uncertain_fragments:
             return self

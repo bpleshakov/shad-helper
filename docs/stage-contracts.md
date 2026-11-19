@@ -10,7 +10,7 @@ This contract describes the current implementation. It covers audio-only version
 and import, review, and rendering. Video extraction adds local frame selection
 and recognition of slides, physical or digital whiteboards, and notebook theory.
 Version 5 supplies clean evidence and labeled source crops to synthesis; recognition
-diagnostics stay local. Drawings use visually verified TikZ/PGFPlots, with source
+diagnostics stay local. Hand-drawn figures use visually verified generated PNGs, with source
 crops as the fallback. Importing original slide or notebook files is unsupported.
 The version 4 field tables below describe the retained legacy format; version 5
 extends them as specified in the following section.
@@ -49,34 +49,39 @@ A text citation alone does not preserve a real illustration. Repeated views shar
 a block; meaningful stages remain separate. Full-frame fallbacks undergo the same
 classification and are not automatically included.
 
-`diagram` and new `screenshot` blocks select their source using `illustration_id`
-and cite it in `evidence_ids`. Screenshot content is a description, not a path or
-TeX command. Printed/unknown sources use screenshots; drawn sources prefer TikZ.
+`illustration` and `screenshot` blocks select their source using `illustration_id`
+and cite it in `evidence_ids`. Their content describes the teaching step. Printed
+and unknown sources use screenshots. For drawn sources, the chapter model also
+cites the speech explaining the drawing and leaves `generated_image_id` empty.
 The chapter model receives labeled PNG attachments (`input_image`, high detail).
 Prior catalog images are attached only when already visible or byte-identical to
 current context; proposed reuse is checked separately using both source images.
 Identical hashes share one attachment; `images.json` records all its observation
 IDs and the relative PNG filename in handoffs and current request records.
 
-Before accepting a drawing, the pipeline compiles an isolated preview and compares
-it with the source in a separate model call. Only `pass` preserves TikZ; `fail`,
-`uncertain`, compilation failure, or unavailable verification preserves a source
-screenshot and opens a review issue. Consolidation of different source hashes also
+After coverage checks, the image-generation tool receives the primary drawing,
+up to three distinct views of its construction and the actual timestamped speech.
+An independent comparison with those inputs must pass before the pipeline assigns
+`generated_image_id` and publishes the PNG. On failure, the pipeline opens a review
+issue and checks the source for screenshot publication. Consolidation of different source hashes also
 requires visual verification focused on the figure and integral labels, ignoring
 unrelated surrounding text, formulas, code, people and decoration. A failed match
 tries retained alternative representatives from its group before creating another
 crop block. Excluded candidates skip reconstruction and consolidation checks.
-Imported drawings receive the same checks. Candidates, exact credential-free model
-requests, previews, verdicts, and accepted blocks are saved in the current handoff diagnostics.
+Explicitly imported TikZ diagrams still undergo compilation and visual comparison.
+The handoff records the candidates, previews, verdicts and accepted blocks. A
+generated figure's `generation.json` identifies its request in
+`illustration-verification/generated/`, including the transcript and image hashes.
 
 Candidate chapters use `checkpoints/notes_candidates/`; completed chapter compilation
-uses `checkpoints/notes_final/`. Verification caches bind source pixels, drawing code,
-rendering/verifier policies, model settings, and preview hashes. Temporary verifier
+uses `checkpoints/notes_final/`. Generated illustration caches bind source pixels,
+transcript, prompts, model settings, and the returned PNG hash. Temporary verifier
 failures are retried on rerun from the cached candidate. Ordinary legacy chapters
 retain `checkpoints/notes/`.
 
 The version 2 project manifest adds optional `image_files`. The renderer copies
-selected PNGs into `notes/figures/illustration-<ID>.png`, emits confined
+screenshots into `notes/figures/illustration-<ID>.png` and generated images into
+`notes/figures/generated-<block ID>.png`, emits confined
 `includegraphics` references, and preserves source anchors. The copied project
 renders without original crops. Model-authored drawing code cannot load files.
 Chapter checks accept the original asset job as their asset source.
@@ -1396,6 +1401,8 @@ the source-label mapping is computed locally for project generation.
 | `math` | Prompt requests a bare LaTeX expression without display delimiters or Markdown | At least one permitted evidence ID; wrapped as display math unless already a supported display form |
 | `code` | Literal code without Markdown fences | At least one permitted evidence ID; written to a text asset and displayed verbatim |
 | `diagram` | Prompt requests a complete `tikzpicture`; PGFPlots may be embedded | At least one permitted evidence ID; diagram commands are validated and written to a TeX asset |
+| `illustration` | Description of the teaching step in a hand-drawn figure | Drawn source ID and relevant speech IDs. The final block links a verified generated PNG |
+| `screenshot` | Description of a figure from the lecture | Source ID linking the managed image or its verified crop |
 | `clarification` | Legacy explanatory prose, with supported inline math | May have no evidence IDs; rendered as plain prose without a label; new responses use `text` |
 | `uncertain` | Legacy tentative prose, with supported inline math | At least one permitted evidence ID; colored with a compact timestamp footnote and generates an open issue; new responses use fragments |
 
@@ -1425,9 +1432,9 @@ accurately represents the evidence.
 The instructions prohibit inventing formulas, labels, code, execution results,
 or graph values absent from the sources. Notebook concepts and theory remain
 ordinary text; notebook code, arrays, service output, and UI are excluded, and
-theory must not be inferred from code alone. Diagram blocks use editable TikZ
-or PGFPlots based on the described labels and relationships, without raster
-fallback. Captions should identify a schematic plot when actual data are missing.
+theory must not be inferred from code alone. Schematics based on text alone can
+use editable TikZ or PGFPlots. Hand-drawn source figures use the generated-image
+workflow described above. Captions should identify a schematic plot when actual data are missing.
 Unreadable or missing details require marking only when essential to the selected
 study material; discarded diagnostics do not become notes. Those content rules
 require review; they are not semantic facts that the JSON validator can establish.

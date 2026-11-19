@@ -3,7 +3,7 @@
 A CLI that turns Russian lecture recordings into detailed, evidence-grounded LaTeX
 notes and PDF. Audio files and video soundtracks share local transcription;
 video frames also supply text, formulas, and cropped instructional illustrations.
-Notes include equations, code, TikZ/PGFPlots diagrams, timestamps, and review items.
+Notes include equations, code, generated teaching illustrations, timestamps, and review items.
 
 Video extraction uses a configurable local Qwen model. Handwritten formulas
 and diagram relationships can still be wrong and need review. See
@@ -41,6 +41,9 @@ one check does not prevent the other. Catalog checks never fall back from the AP
 to login, start login, or generate notes. Local checks determine the command's exit status.
 
 ## Run the complete pipeline
+
+For hand-drawn illustrations, install the Codex CLI on `PATH` and sign in to
+ChatGPT with `codex login`. You can check that login with `codex login status`.
 
 After installing dependencies, configuring an API key or signing in, and setting the OpenAI proxy, run:
 
@@ -275,10 +278,9 @@ The process environment takes precedence. The file supports plain or quoted valu
 comments, and an optional `export` prefix; it is read without executing shell code.
 The key file is ignored by Git. The key is never written to request archives or logs.
 
-All OpenAI generation requests (`notes`, `anki`, and `run`, including illustration
-verification) prefer the API key. When OpenAI reports `credit_balance_exhausted`
-or the legacy `insufficient_quota` error, the client retries the same request with
-the app's saved ChatGPT login and keeps using login for that client's remaining
+Notes, Anki, and visual verification prefer the API key. When OpenAI reports
+`credit_balance_exhausted` or the legacy `insufficient_quota` error, the client
+retries the same request with the app's saved ChatGPT login and keeps using login for that client's remaining
 requests. A new client tries the API key again, allowing topped-up credits to be used.
 There is no dollar-balance check or $5 threshold. Other errors, including ordinary
 rate limits, invalid keys, and network failures, do not switch authentication.
@@ -288,6 +290,10 @@ Run `shad-helper login` once to prepare the fallback. If no key is configured,
 requests use login as before. Fallback never opens a browser automatically; without
 saved login credentials it asks you to run `login`. Set an explicitly empty
 `OPENAI_API_KEY` to use login even when the file contains a key.
+
+Drawing generation uses the Codex CLI's own ChatGPT login. The pipeline starts
+a read-only `codex exec` session for each uncached drawing and passes the
+`--openai-proxy` or `SHAD_HELPER_OPENAI_PROXY` setting to the subprocess.
 
 Every CLI command prints a spending summary to the console (stderr) when it ends,
 including failures and keyboard interrupts. For example:
@@ -312,7 +318,8 @@ totals; account-specific prices and future rate changes can differ. See
 [cache accounting](https://developers.openai.com/api/docs/guides/prompt-caching).
 Missing or malformed usage, interrupted streams, unsupported models, and unsupported
 tiers produce an explicitly unknown total with a known subtotal, rather than a zero
-charge. Each command starts a fresh total; no billing queries are made.
+charge. Each Codex drawing invocation counts as one ChatGPT-plan request.
+Commands start a fresh total without querying the billing API.
 
 Every app-owned OpenAI request requires an explicit HTTP/HTTPS proxy:
 
@@ -427,13 +434,20 @@ range. Detailed uncertainty explanations remain in local review JSON instead of
 large “Требует проверки” passages. Missing essential formula/diagram details must
 be flagged rather than invented. Notebook visuals
 contribute theory, formulas and explanatory comments, not executable code.
-Drawings become editable TikZ/PGFPlots and undergo a separate visual comparison
-between the rendered drawing and its source crop. Only an explicit pass accepts
-the reconstruction. A failed reconstruction gets one correction using the verified
-source and concrete visual/compiler defect, then a fresh render and comparison.
-A source may contain harmless surrounding clutter when its required mathematical
-content is fully visible. Screenshot publication has stricter cleanliness checks;
-a failed reconstruction must pass those checks separately before using its crop.
+For a hand-drawn figure, the notes model identifies the teaching step and cites
+the lecturer’s explanation. Codex's built-in image-generation tool receives the
+selected drawing, up to three distinct views of its construction, and the relevant
+timestamped transcript. A visual check compares the generated PNG with the drawing
+and speech. A failed or uncertain verdict triggers one correction. Codex receives
+the rejected PNG, the verifier’s reason, and the original evidence. The verifier
+checks the new PNG against the board and speech. Only a passing illustration goes
+into the notes. If a verified illustration is unavailable, the pipeline checks the
+source crop for screenshot publication and opens a review issue. Printed figures
+use their original pixels. When Vision
+leaves a figure unclassified, the crop verifier checks its source type. A confirmed
+hand drawing goes to image generation. An ambiguous figure keeps its verified
+screenshot and a review issue.
+[Codex image generation](https://learn.chatgpt.com/docs/image-generation).
 Completed drawings and meaningful intermediate stages are preserved. The notes
 model first checks candidate pixels: logos, decoration, lecturer/clothing, code/UI,
 and handwriting or formulas without a figure are excluded with an explicit reason.
@@ -668,9 +682,9 @@ The default input is `JOB/notes/main.pdf`. The command sends the complete PDF to
 `gpt-6-astra` using the API key or ChatGPT login described above and the explicit
 OpenAI proxy. It includes text and page images. For generated lecture PDFs it also
 sends a catalog of the saved note blocks and their PDF page ranges to identify
-sources. Figures reference their original figure block IDs: screenshots reuse
-the exact managed PNGs embedded in the notes, and drawings are rendered from
-the same TikZ source. Missing or changed assets stop export rather than falling
+sources. Figures reference their original figure block IDs. Generated illustrations
+and screenshots reuse the exact managed PNGs embedded in the notes. Existing TikZ
+diagrams render from their saved source. Missing or changed assets stop export rather than falling
 back to PDF crops. Raw transcripts, recording paths, timestamps, and pipeline diagnostics
 are not model inputs. The PDF must be
 unencrypted and smaller than 50,000,000 bytes. If the model cannot process the
