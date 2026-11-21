@@ -29,7 +29,7 @@ from .anki_sources import (
     write_sources_report,
 )
 from .auth import PlanAccessError
-from .jobs import fingerprint, read_json, remove_artifacts, write_json
+from .jobs import export_stem, fingerprint, read_json, remove_artifacts, rendered_pdf, write_json
 from .openai_client import (
     DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORT,
@@ -114,8 +114,8 @@ def _field_html(value: str) -> str:
     return html.escape(value, quote=False).replace("\n", "<br>")
 
 
-def _publish(staging: Path, folder: Path) -> None:
-    names = ("notes.json", "report.json", "sources.md", "deck.apkg")
+def _publish(staging: Path, folder: Path, package_name: str) -> None:
+    names = ("notes.json", "report.json", "sources.md", package_name)
     backup = staging / "previous"
     backup.mkdir()
     for name in names:
@@ -126,6 +126,14 @@ def _publish(staging: Path, folder: Path) -> None:
         for name in names:
             os.replace(staging / name, folder / name)
             published.append(name)
+        legacy = folder / "deck.apkg"
+        if package_name != legacy.name and legacy.is_file():
+            package = folder / package_name
+            if not legacy.is_symlink() and legacy.samefile(package):
+                # Replacing deck.apkg can retain its spelling on a case-insensitive volume.
+                legacy.rename(package)
+            else:
+                legacy.unlink()
     except OSError:
         for name in reversed(published):
             if (backup / name).exists():
@@ -206,7 +214,7 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
         remove_artifacts(job, ("checkpoints/anki.json", "anki", "diagnostics/anki"))
     if type(minimum_position) is not int or minimum_position < 1:
         raise ValueError("minimum_position must be a positive integer")
-    source = Path(pdf) if pdf is not None else job / "notes" / "main.pdf"
+    source = Path(pdf) if pdf is not None else rendered_pdf(job)
     if not source.is_file():
         raise ValueError(f"Anki requires a finished PDF: {source}. Run render or use --pdf.")
     with source.open("rb") as stream:
@@ -222,6 +230,7 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
     figure_assets = load_figure_assets(job, lecture_sources)
     folder = job / "anki"
     folder.mkdir(parents=True, exist_ok=True)
+    package_name = f"{export_stem(job)}.apkg"
     model = client.model if client is not None else DEFAULT_MODEL
     signature = fingerprint({"pdf_sha256": pdf_hash, "model": model,
         "reasoning_effort": DEFAULT_REASONING_EFFORT, "prompt_version": PROMPT_VERSION,
@@ -236,7 +245,8 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
         with tempfile.TemporaryDirectory(prefix=".build-", dir=folder) as temporary:
             staging = Path(temporary)
             # Freeze the source bytes so the request, provenance and crops always agree.
-            frozen_pdf = staging / source.name
+            frozen_pdf = staging / ("main.pdf" if pdf is None or lecture_sources is not None
+                                    else source.name)
             frozen_pdf.write_bytes(data)
             with timed_step("anki_generation") as step:
                 cached = read_json(cache_path) if cache_path.exists() else {}
@@ -272,7 +282,7 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
                 note["positions"] = positions
                 source_note["positions"] = positions
             with timed_step("anki_packaging"):
-                write_package(staging / "deck.apkg", deck_id=identity["deck_id"],
+                write_package(staging / package_name, deck_id=identity["deck_id"],
                               deck_name=identity["deck_name"], notes=notes, media_files=media)
             report = {"schema_version": 2, **identity, "source_pdf": str(source.resolve()),
                 "pdf_sha256": pdf_hash, "page_count": len(document), "model": model,
@@ -283,7 +293,7 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
                 "note_count": len(notes), "card_count": sum(len(n["positions"]) for n in notes),
                 "warnings": response.warnings, "notes": provenance,
                 "cards": card_records(response, provenance, lecture_sources),
-                "import_instructions": "Import deck.apkg. New card gather order: Ascending "
+                "import_instructions": f"Import {package_name}. New card gather order: Ascending "
                     "position; New card sort order: Order gathered. Sibling cards share one "
                     "position. Positions start after the live collection allocation cursor "
                     "at export time. Reimport preserves existing positions and review schedules "
@@ -294,7 +304,7 @@ def generate_anki(job: Path, state_dir: Path, *, pdf: Path | None = None,
             (folder / "media").mkdir(exist_ok=True)
             for path in media:
                 os.replace(path, folder / "media" / path.name)
-            _publish(staging, folder)
+            _publish(staging, folder, package_name)
     print(f"Anki: {report['note_count']} notes, {report['card_count']} cards; "
           f"deck {identity['deck_name']}", flush=True)
-    return folder / "deck.apkg"
+    return folder / package_name

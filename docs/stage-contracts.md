@@ -133,7 +133,7 @@ Existing time splitting and complete manual handoff handle oversized contexts.
 | Render | `render` | Existing LaTeX project, manifest, current evidence | PDF, page previews, report and compiler files | PDF compilation and page preview generation both complete |
 
 The main stage boundary is `evidence.json` → `notes.json` → the files declared
-by `notes/project.json` → `notes/main.pdf`. The worker files and checkpoints
+by `notes/project.json` → `notes/<name>.pdf`. The worker files and checkpoints
 support extraction and resume. Transcript copies support inspection. The handoff
 files provide an alternative way to obtain the same note response format.
 
@@ -215,7 +215,7 @@ JOB/
     ├── chapters/section-001.tex
     ├── figures/diagram-ch001_diagram.tex      # diagram blocks only
     ├── code/ch001_code.txt                    # code blocks only
-    ├── main.pdf                              # successful compiler output
+    ├── <name>.pdf                            # published lecture PDF
     ├── render-report.json
     ├── compiler-output.log
     ├── main.log                              # compiler diagnostic log
@@ -1868,9 +1868,12 @@ has a 600-second timeout. Existing output paths are checked for confinement
 before invoking the compiler.
 The PDF render requested by `notes --rebuild` adds `-gg` for a clean compilation.
 
-### notes/main.pdf
+### `notes/<name>.pdf`
 
-This is the compiled PDF. It includes a compact title, broad topical sections,
+The published PDF and the Anki package use the filename stem of `evidence.json`'s
+`media.path`, or the job directory name when there is no recording path.
+After validating the compiler output, rendering publishes it under this name.
+The PDF includes a compact title, broad topical sections,
 and optional glossary, without a standalone title/contents page or review appendix.
 Definitions and theorems are numbered within each section; proofs have their own
 environment. Processing chapter intervals are not printed. Highlighted uncertain

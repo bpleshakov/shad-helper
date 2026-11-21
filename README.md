@@ -68,8 +68,12 @@ show each worker's current chapter, activity, and elapsed processing time for th
 and the lecture so far. Redirected output records chapter and phase transitions.
 Audio-only runs proceed from transcription to notes.
 
-Once all chapters and extraction finish, the pipeline renders `JOB/notes/main.pdf` and
-generates `JOB/anki/deck.apkg`. If a notes chapter needs manual input, Qwen finishes the
+Once all chapters and extraction finish, the pipeline renders `JOB/notes/<name>.pdf` and
+generates `JOB/anki/<name>.apkg`. Both use the recording's filename without its last
+extension, preserving spaces, punctuation, and case. For example, `Lecture 2.1.mp4`
+produces `notes/Lecture 2.1.pdf` and `anki/Lecture 2.1.apkg` inside its job directory.
+Jobs without a recorded media path use the job directory name.
+If a notes chapter needs manual input, Qwen finishes the
 lecture and the job saves a complete handoff. The batch then advances to the next input.
 The final summary reports completed and failed jobs. Any failure sets exit status 1.
 [Chapter scheduling, progress and resume](docs/chapter-pipeline.md)
@@ -621,7 +625,7 @@ Resolutions survive imports only while issue and evidence match.
 Review commands resolve note issues only; they do not edit evidence or extraction
 warnings. Editing the diagnostic report does not invalidate notes or rendering.
 
-Rendering preserves sources and produces `notes/main.pdf`, `notes/qa/` page
+Rendering preserves sources and produces `notes/<name>.pdf`, `notes/qa/` page
 previews, and `notes/render-report.json`. Inspect previews for clipped text,
 labels, equations, and glyphs. Compilation errors retain logs and sources.
 Changed evidence requires regeneration/import before rendering.
@@ -678,7 +682,8 @@ any project failed. Options apply to every project; `--pdf` requires a single
 project. Repeated destinations, including symlink aliases, are rejected before
 generation starts.
 
-The default input is `JOB/notes/main.pdf`. The command sends the complete PDF to
+The default input is `JOB/notes/<name>.pdf`. Older jobs with `JOB/notes/main.pdf`
+also work. The command sends the complete PDF to
 `gpt-6-astra` using the API key or ChatGPT login described above and the explicit
 OpenAI proxy. It includes text and page images. For generated lecture PDFs it also
 sends a catalog of the saved note blocks and their PDF page ranges to identify
@@ -700,7 +705,7 @@ Raw responses and validation errors are retained locally in
 The terminal prints the diagnostic path on failure. These files are not sent
 to the model on retries.
 
-Import `JOB/anki/deck.apkg` into Anki. Each job has a distinct, persistent deck
+Import `JOB/anki/<name>.apkg` into Anki. Each job has a distinct, persistent deck
 name ending in a short job ID. The package reuses the four existing note types
 `Basic`, `Multistep definition`, `Theorem Full proof`, and `Theorem step by step`,
 with their original fields, model IDs, and template order. It includes the

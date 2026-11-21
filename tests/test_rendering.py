@@ -496,6 +496,8 @@ class RenderingTests(unittest.TestCase):
 
 
     def test_manual_tex_edits_are_preserved_and_report_is_written(self):
+        write_json(self.job / "evidence.json", {"schema_version": 3, "title": "Lecture",
+                   "media": {"path": "/recordings/Лекция 2.1 (осень).mp4"}, "segments": []})
         root, _ = self.project()
         source = root / "chapters/section-001.tex"
         corrected = source.read_text() + "\nИсправленная формулировка.\n"
@@ -511,7 +513,10 @@ class RenderingTests(unittest.TestCase):
             return subprocess.CompletedProcess(arguments, 0)
 
         with patch.object(rendering.shutil, "which", return_value="/bin/test"), patch.object(rendering.subprocess, "run", side_effect=compiler), patch.object(rendering, "_qa", return_value=3), patch("shad_helper.pdf_sources.write_source_map"):
-            self.assertEqual(rendering.render(self.job), root / "main.pdf")
+            pdf = rendering.render(self.job)
+        self.assertEqual(pdf, root / "Лекция 2.1 (осень).pdf")
+        self.assertEqual(pdf.read_bytes(), b"mocked compiler output")
+        self.assertFalse((root / "main.pdf").exists())
         self.assertEqual(source.read_text(), corrected)
         report = json.loads((root / "render-report.json").read_text())
         self.assertEqual(report["pages"], 3)
@@ -537,11 +542,12 @@ class RenderingTests(unittest.TestCase):
                 patch.object(rendering.subprocess, "run", side_effect=compiler) as run, \
                 patch.object(rendering, "_qa", return_value=1), \
                 patch("shad_helper.pdf_sources.write_source_map"):
-            self.assertEqual(rendering.render(self.job, rebuild=True), root / "main.pdf")
+            pdf = rendering.render(self.job, rebuild=True)
 
         run.assert_called_once()
+        self.assertEqual(pdf, root / f"{self.job.name}.pdf")
         self.assertEqual((root / "main.tex").read_bytes(), original)
-        self.assertEqual((root / "main.pdf").read_bytes(), b"rebuilt output")
+        self.assertEqual(pdf.read_bytes(), b"rebuilt output")
 
     def test_rebuild_rejects_symlinked_compiler_artifact_before_running_latex(self):
         root, _ = self.project()
@@ -797,6 +803,8 @@ class RenderingTests(unittest.TestCase):
         self.assertNotIn("Источники:", text)
         self.assertNotIn("Аудио 00:01:05", text)
         self.assertNotIn("Вопросы и замечания", text)
+        self.assertEqual(rendering.render(self.job), pdf)
+        self.assertEqual(hashlib.sha256(pdf.read_bytes()).hexdigest(), mapping["pdf_sha256"])
         self.assertNotIn("Неясный индекс", text)
 
 

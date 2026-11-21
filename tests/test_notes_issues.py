@@ -163,5 +163,5 @@ def test_diagnostics_do_not_invalidate_cache_resolutions_review_or_render(
     monkeypatch.setattr(rendering.subprocess, "run", compile_pdf)
     monkeypatch.setattr(rendering, "_qa", lambda pdf: 1)
     monkeypatch.setattr("shad_helper.pdf_sources.write_source_map", lambda *args: None)
-    assert rendering.render(tmp_path) == tmp_path / "notes/main.pdf"
+    assert rendering.render(tmp_path) == tmp_path / "notes" / f"{tmp_path.name}.pdf"
     assert read_json(tmp_path / "notes/render-report.json")["status"] == "rendered"

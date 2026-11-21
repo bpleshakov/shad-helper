@@ -7,6 +7,8 @@ import re
 from collections import Counter
 from pathlib import Path
 
+from shad_helper.jobs import rendered_pdf
+
 
 def digest(value):
     return hashlib.sha256(value).hexdigest()
@@ -59,7 +61,7 @@ def locate(roots, name):
 def snapshot(job):
     notes = read_json(job / "notes.json")
     source_map = read_json(job / "notes/source-map.json")
-    pdf_hash = file_digest(job / "notes/main.pdf")
+    pdf_hash = file_digest(rendered_pdf(job))
     if pdf_hash != source_map["pdf_sha256"]:
         raise ValueError(f"PDF/source-map mismatch: {job}")
     pairs = re.findall(r"\\newlabel\{fig:([^}]+)\}\{\{(\d+)\}",

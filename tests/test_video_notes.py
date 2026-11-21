@@ -192,6 +192,6 @@ def test_video_diagram_remains_editable_and_render_preserves_its_source(tmp_path
     monkeypatch.setattr(rendering.subprocess, "run", compile_pdf)
     monkeypatch.setattr(rendering, "_qa", lambda pdf: 1)
     monkeypatch.setattr("shad_helper.pdf_sources.write_source_map", lambda *args: None)
-    assert rendering.render(tmp_path) == tmp_path / "notes/main.pdf"
+    assert rendering.render(tmp_path) == tmp_path / "notes" / f"{tmp_path.name}.pdf"
     assert source.read_text() == corrected
     assert not list((tmp_path / "notes").rglob("*.png"))

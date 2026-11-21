@@ -161,6 +161,23 @@ def read_json(path: Path) -> Any:
     return value
 
 
+def export_stem(job: Path) -> str:
+    """Use the recorded media filename, or the job name for standalone projects."""
+    try:
+        recording = read_json(job / "evidence.json")["media"]["path"]
+    except (OSError, ValueError, KeyError, TypeError):
+        # A separately supplied PDF does not require valid extraction evidence.
+        recording = None
+    stem = Path(recording).stem if isinstance(recording, str) else ""
+    return stem or job.resolve().name
+
+
+def rendered_pdf(job: Path) -> Path:
+    pdf = job / "notes" / f"{export_stem(job)}.pdf"
+    legacy = pdf.with_name("main.pdf")
+    return legacy if not pdf.is_file() and legacy.is_file() else pdf
+
+
 def write_json(path: Path, value: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

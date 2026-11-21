@@ -10,7 +10,7 @@ import subprocess
 from copy import deepcopy
 from pathlib import Path
 
-from .jobs import check_job, fingerprint, read_json, sha256_file, write_json
+from .jobs import check_job, export_stem, fingerprint, read_json, sha256_file, write_json
 from .run_diagnostics import record_run, timed_step
 from .schemas import FIGURE_KINDS, NoteBlock
 
@@ -811,8 +811,13 @@ def render(job: Path, *, rebuild: bool = False) -> Path:
             raise RenderError("Evidence changed after these notes were generated; regenerate notes or import corrected notes before rendering")
         _validate_project(root, manifest)
         _confined(root, "source-map.json").unlink(missing_ok=True)
-        for extension in ("pdf", "log", "aux", "out", "toc", "fls", "fdb_latexmk", "synctex.gz"):
+        pdf = _confined(root, "main.pdf")
+        final_pdf = _confined(root, f"{export_stem(job)}.pdf")
+        for extension in ("log", "aux", "out", "toc", "fls", "fdb_latexmk", "synctex.gz"):
             _confined(root, f"main.{extension}")
+        # latexmk checks for main.pdf even when all source files are unchanged.
+        if not rebuild and not pdf.exists() and final_pdf.is_file():
+            shutil.copy2(final_pdf, pdf)
         completed = _run_latex(root, rebuild=True) if rebuild else _run_latex(root)
         log = log_path.read_text(encoding="utf-8", errors="replace")
         if (root / "main.log").is_file():
@@ -833,8 +838,9 @@ def render(job: Path, *, rebuild: bool = False) -> Path:
                 write_source_map(pdf, manifest)
             except ValueError as error:
                 raise RenderError(str(error)) from error
+        pdf.replace(final_pdf)
         report["status"] = "rendered"
-        return pdf
+        return final_pdf
     except (OSError, subprocess.TimeoutExpired) as error:
         report["error"] = str(error)
         raise RenderError(f"Rendering failed; compiler logs are retained: {error}") from error

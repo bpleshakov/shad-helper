@@ -8,12 +8,13 @@ from urllib.parse import quote
 from .anki_models import get_models
 from .anki_schema import note_fields
 from .illustrations import illustration_index
-from .jobs import fingerprint, read_json
+from .jobs import fingerprint, read_json, rendered_pdf
 
 
 def load_lecture_sources(job: Path, pdf: Path, pdf_hash: str) -> dict | None:
     # A separately supplied PDF has no implied relationship to this job's video.
-    if pdf.resolve() != (job / "notes/main.pdf").resolve():
+    source = pdf.resolve()
+    if source != (job / "notes/main.pdf").resolve() and source != rendered_pdf(job).resolve():
         return None
     path = job / "notes/source-map.json"
     if not path.exists():

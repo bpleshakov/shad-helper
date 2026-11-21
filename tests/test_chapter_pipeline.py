@@ -443,12 +443,13 @@ def test_completed_chapters_publish_renderable_pdf(lecture, monkeypatch):
     simulate_vision(monkeypatch, illustration=True)
     monkeypatch.setattr(pipeline, "render", rendering.render)
     def anki(job, state, *, pdf, **kwargs):
+        assert pdf == job / "notes" / f"{media.stem}.pdf"
         assert pdf.read_bytes().startswith(b"%PDF")
         write_json(job / "anki/report.json", {"end_position": 1})
-        return job / "anki/deck.apkg"
+        return job / "anki" / f"{media.stem}.apkg"
     monkeypatch.setattr(pipeline, "generate_anki", anki)
     assert pipeline.run_pipeline([media], out, out)
-    assert (job / "notes/main.pdf").is_file()
+    assert (job / "notes" / f"{media.stem}.pdf").is_file()
 
 
 def test_manual_failure_is_reported_while_qwen_continues_and_next_file_runs(lecture, monkeypatch):

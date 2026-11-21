@@ -177,7 +177,7 @@ def test_missing_nested_source_is_rejected_and_raw_reply_is_retained(job, respon
     assert len(attempts) == 4
     assert all(read_json(path) == reply for path in attempts)
     assert all(read_json(path.with_name("status.json"))["status"] == "failed" for path in attempts)
-    assert not (job / "anki/deck.apkg").exists()
+    assert not list((job / "anki").glob("*.apkg"))
 
 
 def test_stage_exports_all_types_in_pdf_order_with_shared_note_positions(job, response, client):
@@ -236,6 +236,7 @@ def mapped_lecture(job, response):
 
 def test_report_resolves_each_proof_step_locally_and_matches_exported_cards(job, client, response):
     mapped_lecture(job, response)
+    pdf = (job / "notes/main.pdf").rename(job / "notes/PRIVATE_RECORDING.pdf")
     response["notes"] = [response["notes"][3]]
     note = response["notes"][0]
     note["card_sources"][2].update(page=1, block_ids=["b1"])
@@ -244,8 +245,13 @@ def test_report_resolves_each_proof_step_locally_and_matches_exported_cards(job,
     note["review_flags"] = ["Проверить дополнение"]
     client.complete.return_value = sourced_reply(response)
     package = anki.generate_anki(job, job / "auth", client=client)
+    assert package == job / "anki/PRIVATE_RECORDING.apkg"
+    report = read_json(job / "anki/report.json")
+    assert report["source_pdf"] == str(pdf)
+    assert package.name in report["import_instructions"]
+    assert client.complete.call_args.kwargs["pdf"].name == "main.pdf"
     rows, _ = inspect_package(package)
-    cards = read_json(job / "anki/report.json")["cards"]
+    cards = report["cards"]
     assert {(card["guid"], card["ordinal"]) for card in cards} == {
         (row[0], row[2]) for row in rows}
     by_field = {card["field"]: card for card in cards}
@@ -320,7 +326,7 @@ def test_unknown_illustration_source_does_not_borrow_its_frame_time(job, client,
     with pytest.raises(ValueError, match="Lecture block b1 has no valid timed evidence"):
         anki.generate_anki(job, job / "auth", client=client)
 
-    assert not (job / "anki/deck.apkg").exists()
+    assert not list((job / "anki").glob("*.apkg"))
     assert not (job / "anki/sources.md").exists()
     assert not (job / "checkpoints/anki.json").exists()
 
@@ -342,7 +348,7 @@ def test_invalid_card_sources_do_not_publish(job, client, response, error):
         write_json(job / "notes/source-map.json", mapping)
     with pytest.raises(ValueError):
         anki.generate_anki(job, job / "auth", client=client)
-    assert not (job / "anki/deck.apkg").exists()
+    assert not list((job / "anki").glob("*.apkg"))
     assert not (job / "anki/sources.md").exists()
     assert not (job / "checkpoints/anki.json").exists()
 
@@ -457,7 +463,7 @@ def test_missing_collection_aborts_before_model_without_position_fallback(
         anki.generate_anki(job, job / "auth", client=client)
 
     client.complete.assert_not_called()
-    assert not (job / "anki" / "deck.apkg").exists()
+    assert not list((job / "anki").glob("*.apkg"))
     assert not (job / "checkpoints" / "anki.json").exists()
 
 
@@ -546,9 +552,10 @@ def test_source_pdf_bytes_are_authoritative_and_frozen_for_model(job, client, tm
 
 def test_standalone_pdf_job_can_be_repeated_offline_and_rebuilt(tmp_path, client, monkeypatch):
     source = write_pdf(tmp_path / "standalone.pdf")
-    job = tmp_path / "new-job"
+    job = tmp_path / "New job.v2"
     assert not job.exists()
     package = anki.generate_anki(job, tmp_path / "auth", pdf=source, client=client)
+    assert package == job / "anki/New job.v2.apkg"
     identity = read_json(job / "anki" / "identity.json")
     monkeypatch.setattr(anki, "PlanClient", Mock(side_effect=AssertionError("Unexpected auth")))
 
@@ -567,16 +574,20 @@ def test_standalone_pdf_job_can_be_repeated_offline_and_rebuilt(tmp_path, client
         "anki_generation", "anki_note_preparation", "anki_latex_rendering", "anki_packaging"}
 
 
-def test_cache_repackages_without_model_or_auth_and_keeps_identity(job, client, monkeypatch):
+@pytest.mark.parametrize("job_name", ["lecture", "Deck"])
+def test_cache_repackages_without_model_or_auth_and_keeps_identity(
+        tmp_path, job_name, client, monkeypatch):
+    job = make_job(tmp_path / job_name)
     package = anki.generate_anki(job, job / "auth", client=client)
     first_guids = {row[0] for row in inspect_package(package)[0]}
     identity = read_json(job / "anki" / "identity.json")
-    package.unlink()
+    package.rename(job / "anki/deck.apkg")
     monkeypatch.setattr(anki, "PlanClient", Mock(side_effect=AssertionError("Unexpected auth")))
 
     regenerated = anki.generate_anki(job, job / "unavailable-auth")
 
-    assert regenerated.is_file()
+    assert regenerated == job / "anki" / f"{job_name}.apkg"
+    assert list((job / "anki").glob("*.apkg")) == [regenerated]
     assert {row[0] for row in inspect_package(regenerated)[0]} == first_guids
     assert read_json(job / "anki" / "identity.json") == identity
     client.complete.assert_called_once()
@@ -606,7 +617,7 @@ def test_rebuild_deletes_checkpoint_before_generation_and_replaces_it(job, clien
 
 @pytest.mark.parametrize("failure", ["missing_pdf", "invalid_pdf", "minimum_position", "collection"])
 def test_rebuild_clears_all_anki_artifacts_before_checks(job, client, collection_reader, failure):
-    for name in ("checkpoints/anki.json", "anki/identity.json", "anki/deck.apkg",
+    for name in ("checkpoints/anki.json", "anki/identity.json", "anki/lecture.apkg", "anki/deck.apkg",
                  "anki/notes.json", "anki/report.json", "anki/sources.md", "anki/media/old.png",
                  "anki/figures/old.png", "anki/.build-stale/partial", "diagnostics/anki/old/status.json"):
         path = job / name
@@ -717,7 +728,7 @@ def test_bad_source_fails_before_model_and_does_not_publish(job, client, monkeyp
     with pytest.raises((ValueError, RuntimeError)):
         anki.generate_anki(job, job / "auth", client=client)
     client.complete.assert_not_called()
-    assert not (job / "anki" / "deck.apkg").exists()
+    assert not list((job / "anki").glob("*.apkg"))
     assert not (job / "checkpoints" / "anki.json").exists()
 
 
@@ -761,7 +772,7 @@ def test_failed_regeneration_preserves_previous_artifacts_only_without_rebuild(
         not rebuild or failure not in {"invalid_json", "response_error"})
     if rebuild:
         assert all(not (job / "anki" / name).exists()
-                   for name in ("notes.json", "report.json", "sources.md", "deck.apkg"))
+                   for name in ("notes.json", "report.json", "sources.md", "lecture.apkg"))
         identity = job / "anki/identity.json"
         if identity.exists():
             assert identity.read_bytes() != previous["identity.json"]
@@ -778,7 +789,10 @@ def test_failed_final_package_publication_rolls_back_sidecars(tmp_path, monkeypa
     folder, staging = tmp_path / "anki", tmp_path / "staging"
     folder.mkdir()
     staging.mkdir()
-    names = ("notes.json", "report.json", "sources.md", "deck.apkg")
+    package_name = "Lecture 2.1.apkg"
+    names = ("notes.json", "report.json", "sources.md", package_name)
+    legacy = folder / "deck.apkg"
+    legacy.write_bytes(b"previous export")
     for name in names:
         (staging / name).write_bytes(f"new {name}".encode())
         if existing:
@@ -787,16 +801,17 @@ def test_failed_final_package_publication_rolls_back_sidecars(tmp_path, monkeypa
     failures = []
 
     def fail_package_once(source, destination):
-        if Path(source) == staging / "deck.apkg" and not failures:
+        if Path(source) == staging / package_name and not failures:
             failures.append(destination)
             raise OSError("Package replacement failed")
         return original_replace(source, destination)
 
     monkeypatch.setattr(anki.os, "replace", fail_package_once)
     with pytest.raises(OSError, match="Package replacement failed"):
-        anki._publish(staging, folder)
+        anki._publish(staging, folder, package_name)
 
-    assert failures == [folder / "deck.apkg"]
+    assert failures == [folder / package_name]
+    assert legacy.read_bytes() == b"previous export"
     for name in names:
         if existing:
             assert (folder / name).read_bytes() == f"old {name}".encode()
@@ -816,7 +831,7 @@ def test_terminal_model_errors_do_not_retry(job, client, no_retry_wait, error):
         anki.generate_anki(job, job / "auth", client=client)
     client.complete.assert_called_once()
     no_retry_wait.assert_not_called()
-    assert not (job / "anki" / "deck.apkg").exists()
+    assert not list((job / "anki").glob("*.apkg"))
 
 
 def test_valid_reply_after_retry_is_cached_and_published(job, client, response, no_retry_wait):
@@ -921,7 +936,7 @@ def test_lecture_figures_cannot_select_unknown_prose_or_pdf_crops(job, client, r
         else [{"field": "Back", "block_id": target}])
     with pytest.raises(ValueError, match="Figure must reference|Lecture figures require"):
         anki.generate_anki(job, job / "auth", client=client)
-    assert not (job / "anki/deck.apkg").exists()
+    assert not list((job / "anki").glob("*.apkg"))
     assert not (job / "checkpoints/anki.json").exists()
 
 
@@ -935,14 +950,14 @@ def test_missing_or_changed_original_figure_fails_before_model(job, client, resp
     with pytest.raises(ValueError, match="missing|changed"):
         anki.generate_anki(job, job / "auth", client=client)
     client.complete.assert_not_called()
-    assert not (job / "anki/deck.apkg").exists()
+    assert not list((job / "anki").glob("*.apkg"))
 
 
 def test_source_figure_reference_requires_lecture_assets(job, client, response):
     response["notes"][0]["figures"] = [{"field": "Back", "block_id": "fig1"}]
     with pytest.raises(ValueError, match="Figure must reference"):
         anki.generate_anki(job, job / "auth", client=client)
-    assert not (job / "anki/deck.apkg").exists()
+    assert not list((job / "anki").glob("*.apkg"))
 
 
 @pytest.mark.parametrize(("index", "update"), [

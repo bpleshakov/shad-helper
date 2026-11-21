@@ -53,7 +53,7 @@ def parser() -> argparse.ArgumentParser:
     anki.add_argument("jobs", nargs="+", type=Path, metavar="JOB",
                       help="Project directories to process sequentially, in order")
     anki.add_argument("--pdf", type=Path,
-                      help="Input PDF for a single project (default: JOB/notes/main.pdf)")
+                      help="Input PDF for a single project (defaults to the rendered lecture PDF)")
     anki.add_argument("--rebuild", action="store_true",
                       help="Delete all Anki artifacts before generating a fresh deck")
     anki.add_argument("--anki-collection", type=Path,

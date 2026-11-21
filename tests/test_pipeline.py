@@ -11,7 +11,7 @@ import pymupdf
 import pytest
 
 from shad_helper import anki, pipeline
-from shad_helper.jobs import read_json, write_json
+from shad_helper.jobs import read_json, rendered_pdf, write_json
 from shad_helper.run_diagnostics import record_run
 
 
@@ -240,12 +240,13 @@ def test_batch_exports_real_independent_packages_with_disjoint_positions(
     ]}
     client = SimpleNamespace(model=anki.DEFAULT_MODEL, complete=Mock(return_value=response))
     monkeypatch.setattr(anki, "PlanClient", lambda state, **kwargs: client)
-    monkeypatch.setattr(pipeline, "extract", lambda source, job, **kwargs: None)
+    monkeypatch.setattr(pipeline, "extract", lambda source, job, **kwargs:
+                        write_json(job / "evidence.json", {"media": {"path": str(source)}}))
     monkeypatch.setattr(pipeline, "generate_notes",
                         lambda job, state, **kwargs: job / "notes" / "main.tex")
 
     def render(job):
-        pdf = job / "notes" / "main.pdf"
+        pdf = rendered_pdf(job)
         pdf.parent.mkdir(parents=True)
         with pymupdf.open() as document:
             document.new_page().insert_text((24, 24), "Lecture notes")
@@ -255,8 +256,8 @@ def test_batch_exports_real_independent_packages_with_disjoint_positions(
     monkeypatch.setattr(pipeline, "render", render)
     assert pipeline.run_pipeline(media[:2], tmp_path / "out", tmp_path / "auth",
                                  anki_collection=collection)
-    packages = sorted((tmp_path / "out").glob("*/anki/deck.apkg"))
-    assert len(packages) == 2
+    packages = sorted((tmp_path / "out").glob("*/anki/*.apkg"))
+    assert [package.name for package in packages] == ["lecture-0.apkg", "lecture-1.apkg"]
     decks, guids, ranges = [], [], []
     for package in packages:
         report = read_json(package.with_name("report.json"))

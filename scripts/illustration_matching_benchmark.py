@@ -15,7 +15,7 @@ from shad_helper.illustration_matching import (
     visually_plausible,
 )
 from shad_helper.illustrations import illustration_index
-from shad_helper.jobs import fingerprint, read_json, sha256_file, write_json
+from shad_helper.jobs import fingerprint, read_json, rendered_pdf, sha256_file, write_json
 
 
 def replay(job, destination):
@@ -121,7 +121,7 @@ def main():
         parser.error("Benchmark output must be outside every source job.")
     reports = []
     for job in args.jobs:
-        if not (job / "notes/main.pdf").is_file():
+        if not rendered_pdf(job).is_file():
             continue
         if not list((job / "handoff/verification").glob("attempt-*")):
             continue
